@@ -3,12 +3,13 @@ use warp_core::ui::Icon;
 use warpui::{
     elements::{
         resizable_state_handle, ConstrainedBox, Container, CrossAxisAlignment, DragBarSide,
-        Element, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement,
+        Element, Flex, Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement,
         Resizable, ResizableStateHandle, Shrinkable, Text,
     },
     fonts::{Properties, Weight},
     platform::Cursor,
-    AppContext, SingletonEntity, View, ViewContext,
+    ui_components::components::UiComponent,
+    AppContext, Entity, SingletonEntity, View, ViewContext,
 };
 
 use crate::appearance::Appearance;
@@ -155,18 +156,25 @@ impl ActionsPanelView {
             .with_color(text_color.into_solid())
             .finish();
 
-        Container::new(text)
-            .with_padding_left(6.)
-            .with_padding_right(6.)
-            .with_padding_top(4.)
-            .with_padding_bottom(4.)
-            .on_click({
-                move |ctx, _, _| {
-                    ctx.dispatch_action(ActionsPanelAction::SetTab(tab));
-                }
-            })
-            .with_cursor(Cursor::PointingHand)
-            .finish()
+        let mouse_state = match tab {
+            ActionsPanelTab::Actions => self.actions_tab_mouse_state.clone(),
+            ActionsPanelTab::Triggers => self.triggers_tab_mouse_state.clone(),
+            ActionsPanelTab::Workspaces => self.workspaces_tab_mouse_state.clone(),
+        };
+
+        Hoverable::new(mouse_state, move |_| {
+            Container::new(text)
+                .with_padding_left(6.)
+                .with_padding_right(6.)
+                .with_padding_top(4.)
+                .with_padding_bottom(4.)
+                .finish()
+        })
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(ActionsPanelAction::SetTab(tab));
+        })
+        .with_cursor(Cursor::PointingHand)
+        .finish()
     }
 
     fn render_actions_tab(&self, actions: &[Action], appearance: &Appearance) -> Box<dyn Element> {
@@ -215,7 +223,7 @@ impl ActionsPanelView {
             .with_tooltip(move || tooltip)
             .build()
             .on_click(move |ctx, _, _| {
-                ctx.dispatch_action(ActionsPanelAction::RunAction(action_id));
+                ctx.dispatch_typed_action(ActionsPanelAction::RunAction(action_id));
             })
             .with_cursor(Cursor::PointingHand)
             .finish()
@@ -293,7 +301,7 @@ impl ActionsPanelView {
             .with_tooltip(move || tooltip)
             .build()
             .on_click(move |ctx, _, _| {
-                ctx.dispatch_action(ActionsPanelAction::RunTrigger(trigger_id));
+                ctx.dispatch_typed_action(ActionsPanelAction::RunTrigger(trigger_id));
             })
             .with_cursor(Cursor::PointingHand)
             .finish()
@@ -341,7 +349,7 @@ impl ActionsPanelView {
             .with_tooltip(move || tooltip)
             .build()
             .on_click(move |ctx, _, _| {
-                ctx.dispatch_action(ActionsPanelAction::SaveWorkspace);
+                ctx.dispatch_typed_action(ActionsPanelAction::SaveWorkspace);
             })
             .with_cursor(Cursor::PointingHand)
             .finish()
@@ -414,7 +422,7 @@ impl ActionsPanelView {
             .with_tooltip(move || tooltip)
             .build()
             .on_click(move |ctx, _, _| {
-                ctx.dispatch_action(ActionsPanelAction::RestoreWorkspace(workspace_id));
+                ctx.dispatch_typed_action(ActionsPanelAction::RestoreWorkspace(workspace_id));
             })
             .with_cursor(Cursor::PointingHand)
             .finish()
@@ -474,6 +482,10 @@ pub enum ActionsPanelAction {
 
 // ── View impl ─────────────────────────────────────────────────────────────────
 
+impl Entity for ActionsPanelView {
+    type Event = ();
+}
+
 impl View for ActionsPanelView {
     fn ui_name() -> &'static str {
         "ActionsPanelView"
@@ -532,16 +544,16 @@ impl warpui::TypedActionView for ActionsPanelView {
                 self.set_active_tab(*tab, ctx);
             }
             ActionsPanelAction::RunAction(id) => {
-                ctx.dispatch_typed_action(WorkspaceAction::RunActionInActiveTerminal(*id));
+                ctx.dispatch_typed_action(&WorkspaceAction::RunActionInActiveTerminal(*id));
             }
             ActionsPanelAction::RunTrigger(id) => {
-                ctx.dispatch_typed_action(WorkspaceAction::RunTrigger(*id));
+                ctx.dispatch_typed_action(&WorkspaceAction::RunTrigger(*id));
             }
             ActionsPanelAction::SaveWorkspace => {
-                ctx.dispatch_typed_action(WorkspaceAction::SaveCurrentWorkspace);
+                ctx.dispatch_typed_action(&WorkspaceAction::SaveCurrentWorkspace);
             }
             ActionsPanelAction::RestoreWorkspace(id) => {
-                ctx.dispatch_typed_action(WorkspaceAction::RestoreWorkspace(*id));
+                ctx.dispatch_typed_action(&WorkspaceAction::RestoreWorkspace(*id));
             }
         }
     }

@@ -16723,7 +16723,7 @@ impl Workspace {
             icons::Icon::XCircle,
             false,
             self.mouse_states.kill_all_icon.clone(),
-            icon_color,
+            Fill::Solid(icon_color),
         )
         .with_tooltip(move || tooltip)
         .build()
@@ -20385,8 +20385,10 @@ impl TypedActionView for Workspace {
                 let triggers = config.triggers().to_vec();
                 drop(config);
                 if let Some(trigger) = triggers.iter().find(|t| t.id == *trigger_id) {
-                    let workspace_handle = ctx.handle();
-                    TriggerRunner::run(trigger, &actions, &workspace_handle, ctx);
+                    let weak_handle = ctx.handle();
+                    if let Some(workspace_handle) = weak_handle.upgrade(ctx) {
+                        TriggerRunner::run(trigger, &actions, &workspace_handle, ctx);
+                    }
                 }
             }
             SaveCurrentWorkspace => {
