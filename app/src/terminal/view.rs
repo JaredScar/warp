@@ -7052,6 +7052,16 @@ impl TerminalView {
         ctx.emit(Event::ShutdownPty);
     }
 
+    /// Sends a Ctrl+C interrupt to the running process without tearing down the PTY.
+    pub fn send_interrupt(&mut self, ctx: &mut ViewContext<Self>) {
+        self.user_write_ctrl_c_to_pty(ctx);
+    }
+
+    /// Clears the full terminal output buffer (equivalent to Cmd+K).
+    pub fn clear_all_output(&mut self, ctx: &mut ViewContext<Self>) {
+        self.clear_buffer(ctx);
+    }
+
     fn user_write_ctrl_c_to_pty(&mut self, ctx: &mut ViewContext<Self>) {
         self.write_user_bytes_to_pty(vec![escape_sequences::C0::ETX], ctx);
     }

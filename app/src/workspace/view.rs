@@ -16711,6 +16711,29 @@ impl Workspace {
         .finish()
     }
 
+    fn render_kill_all_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let icon_color = appearance.theme().ansi_fg_red();
+        let ui_builder = appearance.ui_builder().clone();
+        let tooltip = ui_builder
+            .tool_tip("Kill all processes and clear terminal output".to_string())
+            .build()
+            .finish();
+        icon_button_with_color(
+            appearance,
+            icons::Icon::XCircle,
+            false,
+            self.mouse_states.kill_all_icon.clone(),
+            icon_color,
+        )
+        .with_tooltip(move || tooltip)
+        .build()
+        .on_click(|ctx, _, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::KillAndClearAllTerminals);
+        })
+        .with_cursor(warpui::platform::Cursor::PointingHand)
+        .finish()
+    }
+
     fn render_tools_panel_button(
         &self,
         appearance: &Appearance,
@@ -17282,6 +17305,7 @@ impl Workspace {
             HeaderToolbarItemKind::ActionsAndTriggers => {
                 self.render_actions_panel_button(appearance, ctx)
             }
+            HeaderToolbarItemKind::KillAll => self.render_kill_all_button(appearance),
         };
         Some(
             Container::new(
@@ -19005,7 +19029,8 @@ impl Workspace {
                 Some(ChildView::new(&self.right_panel_view).finish())
             }
             HeaderToolbarItemKind::AgentManagement
-            | HeaderToolbarItemKind::NotificationsMailbox => None,
+            | HeaderToolbarItemKind::NotificationsMailbox
+            | HeaderToolbarItemKind::KillAll => None,
             HeaderToolbarItemKind::ActionsAndTriggers => {
                 if !pane_group.actions_panel_open {
                     return None;
@@ -20415,6 +20440,22 @@ impl TypedActionView for Workspace {
                             ctx,
                         );
                     }
+                }
+            }
+            KillAndClearAllTerminals => {
+                let count = self.tab_count();
+                let groups: Vec<_> = (0..count)
+                    .filter_map(|i| self.get_pane_group_view(i).cloned())
+                    .collect();
+                for group_handle in groups {
+                    group_handle.update(ctx, |group, group_ctx| {
+                        for terminal_handle in group.terminal_views(group_ctx) {
+                            terminal_handle.update(group_ctx, |terminal, term_ctx| {
+                                terminal.send_interrupt(term_ctx);
+                                terminal.clear_all_output(term_ctx);
+                            });
+                        }
+                    });
                 }
             }
             #[cfg(feature = "local_fs")]

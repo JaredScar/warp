@@ -33,6 +33,7 @@ pub enum HeaderToolbarItemKind {
     CodeReview,
     NotificationsMailbox,
     ActionsAndTriggers,
+    KillAll,
 }
 
 impl HeaderToolbarItemKind {
@@ -44,6 +45,7 @@ impl HeaderToolbarItemKind {
             Self::CodeReview => "Code Review",
             Self::NotificationsMailbox => "Notifications",
             Self::ActionsAndTriggers => "Actions & Triggers",
+            Self::KillAll => "Kill All",
         }
     }
 
@@ -55,6 +57,7 @@ impl HeaderToolbarItemKind {
             Self::CodeReview => Icon::Diff,
             Self::NotificationsMailbox => Icon::Inbox,
             Self::ActionsAndTriggers => Icon::Lightning,
+            Self::KillAll => Icon::XCircle,
         }
     }
 
@@ -80,6 +83,7 @@ impl HeaderToolbarItemKind {
             Self::CodeReview => cfg!(feature = "local_fs"),
             Self::NotificationsMailbox => FeatureFlag::HOANotifications.is_enabled(),
             Self::ActionsAndTriggers => true,
+            Self::KillAll => true,
         }
     }
 
@@ -93,6 +97,7 @@ impl HeaderToolbarItemKind {
             Self::CodeReview => *TabSettings::as_ref(app).show_code_review_button.value(),
             Self::NotificationsMailbox => *AISettings::as_ref(app).show_agent_notifications,
             Self::ActionsAndTriggers => true,
+            Self::KillAll => true,
             _ => true,
         }
     }
@@ -111,6 +116,7 @@ impl HeaderToolbarItemKind {
             Self::TabsPanel,
             Self::ToolsPanel,
             Self::ActionsAndTriggers,
+            Self::KillAll,
             Self::AgentManagement,
         ]
     }
@@ -125,6 +131,7 @@ impl HeaderToolbarItemKind {
             Self::TabsPanel,
             Self::ToolsPanel,
             Self::ActionsAndTriggers,
+            Self::KillAll,
             Self::AgentManagement,
             Self::CodeReview,
             Self::NotificationsMailbox,

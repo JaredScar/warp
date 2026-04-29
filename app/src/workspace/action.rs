@@ -279,6 +279,8 @@ pub enum WorkspaceAction {
     SaveCurrentWorkspace,
     /// Restore a previously saved workspace by ID.
     RestoreWorkspace(Uuid),
+    /// Sends Ctrl+C to every terminal pane across all open tabs and clears their output.
+    KillAndClearAllTerminals,
     /// Opens the code review panel (right panel) without toggling. If already open,
     /// switches to the target pane's repo. Used by vertical tabs diff stats chip.
     OpenCodeReviewPanel(PaneViewLocator),
@@ -853,6 +855,7 @@ impl WorkspaceAction {
             | RunTrigger(_)
             | SaveCurrentWorkspace
             | RestoreWorkspace(_)
+            | KillAndClearAllTerminals
             | OpenCodeReviewPanel(..)
             | ToggleVerticalTabsSettingsPopup
             | SetVerticalTabsDisplayGranularity(_)
