@@ -4,6 +4,7 @@ pub mod util;
 #[cfg_attr(target_family = "wasm", path = "wasm.rs")]
 mod imp;
 
+use crate::actions::model::{Action, SavedWorkspace, Trigger};
 use crate::tab_configs::{TabConfig, TabConfigError};
 use crate::themes::theme::WarpThemeConfig;
 use crate::{
@@ -72,6 +73,9 @@ pub enum WarpConfigUpdateEvent {
     /// A previously-errored settings reload succeeded with no errors.
     #[cfg_attr(not(feature = "local_fs"), expect(dead_code))]
     SettingsErrorsCleared,
+    /// Actions, triggers, or saved workspaces on disk changed.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    ActionsAndTriggers,
 }
 
 /// Singleton model containing user configurable file entities like themes, launch configs, and
@@ -89,6 +93,12 @@ pub struct WarpConfig {
     tab_config_errors: Vec<TabConfigError>,
     theme_config: WarpThemeConfig,
     local_user_workflows: Vec<Workflow>,
+    /// User-authored actions loaded from `~/.warp/actions/*.toml`.
+    actions: Vec<Action>,
+    /// User-authored triggers loaded from `~/.warp/triggers/*.toml`.
+    triggers: Vec<Trigger>,
+    /// User-saved workspace snapshots loaded from `~/.warp/workspaces/*.toml`.
+    saved_workspaces: Vec<SavedWorkspace>,
 }
 
 /// Platform-independent parts of WarpConfig.
@@ -118,6 +128,18 @@ impl WarpConfig {
 
     pub fn local_user_workflows(&self) -> &Vec<Workflow> {
         &self.local_user_workflows
+    }
+
+    pub fn actions(&self) -> &[Action] {
+        &self.actions
+    }
+
+    pub fn triggers(&self) -> &[Trigger] {
+        &self.triggers
+    }
+
+    pub fn saved_workspaces(&self) -> &[SavedWorkspace] {
+        &self.saved_workspaces
     }
 
     /// Saving the newly created launch configuration to the WarpConfig that we currently
@@ -192,6 +214,24 @@ pub fn launch_configs_dir() -> PathBuf {
 #[cfg_attr(target_family = "wasm", expect(dead_code))]
 pub fn tab_configs_dir() -> PathBuf {
     base_dir().join("tab_configs")
+}
+
+/// Returns the path to the directory containing the user's actions.
+#[cfg_attr(target_family = "wasm", expect(dead_code))]
+pub fn actions_dir() -> PathBuf {
+    base_dir().join("actions")
+}
+
+/// Returns the path to the directory containing the user's triggers.
+#[cfg_attr(target_family = "wasm", expect(dead_code))]
+pub fn triggers_dir() -> PathBuf {
+    base_dir().join("triggers")
+}
+
+/// Returns the path to the directory containing the user's saved workspaces.
+#[cfg_attr(target_family = "wasm", expect(dead_code))]
+pub fn saved_workspaces_dir() -> PathBuf {
+    base_dir().join("workspaces")
 }
 
 /// Returns the path to the directory containing the built-in default tab configs.

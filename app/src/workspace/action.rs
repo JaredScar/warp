@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 use warp_util::path::LineAndColumnArg;
 
 use crate::ai::agent::api::ServerConversationToken;
@@ -267,6 +269,16 @@ pub enum WorkspaceAction {
     OpenWarpDrive,
     /// Toggles the right panel. This happens as an explicit action from the user.
     ToggleRightPanel,
+    /// Toggles the Actions & Triggers panel. This happens as an explicit action from the user.
+    ToggleActionsPanel,
+    /// Run a single action by ID in the active terminal of the current tab.
+    RunActionInActiveTerminal(Uuid),
+    /// Run a trigger by ID across its configured terminal targets.
+    RunTrigger(Uuid),
+    /// Snapshot the current window layout and prompt for a name to save it.
+    SaveCurrentWorkspace,
+    /// Restore a previously saved workspace by ID.
+    RestoreWorkspace(Uuid),
     /// Opens the code review panel (right panel) without toggling. If already open,
     /// switches to the target pane's repo. Used by vertical tabs diff stats chip.
     OpenCodeReviewPanel(PaneViewLocator),
@@ -836,6 +848,11 @@ impl WorkspaceAction {
             | OpenWarpDrive
             | ClosePanel
             | ToggleRightPanel
+            | ToggleActionsPanel
+            | RunActionInActiveTerminal(_)
+            | RunTrigger(_)
+            | SaveCurrentWorkspace
+            | RestoreWorkspace(_)
             | OpenCodeReviewPanel(..)
             | ToggleVerticalTabsSettingsPopup
             | SetVerticalTabsDisplayGranularity(_)

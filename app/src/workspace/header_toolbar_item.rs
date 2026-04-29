@@ -32,6 +32,7 @@ pub enum HeaderToolbarItemKind {
     AgentManagement,
     CodeReview,
     NotificationsMailbox,
+    ActionsAndTriggers,
 }
 
 impl HeaderToolbarItemKind {
@@ -42,6 +43,7 @@ impl HeaderToolbarItemKind {
             Self::AgentManagement => "Agent Management",
             Self::CodeReview => "Code Review",
             Self::NotificationsMailbox => "Notifications",
+            Self::ActionsAndTriggers => "Actions & Triggers",
         }
     }
 
@@ -52,6 +54,7 @@ impl HeaderToolbarItemKind {
             Self::AgentManagement => Icon::Grid,
             Self::CodeReview => Icon::Diff,
             Self::NotificationsMailbox => Icon::Inbox,
+            Self::ActionsAndTriggers => Icon::Lightning,
         }
     }
 
@@ -76,6 +79,7 @@ impl HeaderToolbarItemKind {
             }
             Self::CodeReview => cfg!(feature = "local_fs"),
             Self::NotificationsMailbox => FeatureFlag::HOANotifications.is_enabled(),
+            Self::ActionsAndTriggers => true,
         }
     }
 
@@ -88,6 +92,7 @@ impl HeaderToolbarItemKind {
         match self {
             Self::CodeReview => *TabSettings::as_ref(app).show_code_review_button.value(),
             Self::NotificationsMailbox => *AISettings::as_ref(app).show_agent_notifications,
+            Self::ActionsAndTriggers => true,
             _ => true,
         }
     }
@@ -95,11 +100,19 @@ impl HeaderToolbarItemKind {
     /// Whether this item opens a side panel (as opposed to replacing the content
     /// area or opening a popover).
     pub fn is_panel(&self) -> bool {
-        matches!(self, Self::TabsPanel | Self::ToolsPanel | Self::CodeReview)
+        matches!(
+            self,
+            Self::TabsPanel | Self::ToolsPanel | Self::CodeReview | Self::ActionsAndTriggers
+        )
     }
 
     pub fn default_left() -> Vec<Self> {
-        vec![Self::TabsPanel, Self::ToolsPanel, Self::AgentManagement]
+        vec![
+            Self::TabsPanel,
+            Self::ToolsPanel,
+            Self::ActionsAndTriggers,
+            Self::AgentManagement,
+        ]
     }
 
     pub fn default_right() -> Vec<Self> {
@@ -111,6 +124,7 @@ impl HeaderToolbarItemKind {
         vec![
             Self::TabsPanel,
             Self::ToolsPanel,
+            Self::ActionsAndTriggers,
             Self::AgentManagement,
             Self::CodeReview,
             Self::NotificationsMailbox,
