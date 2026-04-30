@@ -1038,6 +1038,14 @@ pub struct Workspace {
     tab_config_action_sidecar_item: Option<SidecarItemKind>,
     tab_config_action_sidecar_mouse_states: crate::tab_configs::action_sidecar::SidecarMouseStates,
     remove_tab_config_confirmation_dialog: ViewHandle<RemoveTabConfigConfirmationDialog>,
+
+    /// Sequential trigger execution queue.  Each item is either a "open a new
+    /// terminal tab" sentinel or a "send this command to the current terminal"
+    /// payload.  Populated by `TriggerRunner` and drained one step at a time
+    /// as each command's `PendingCommandCompleted` event fires.
+    pub(crate) trigger_queue: std::collections::VecDeque<crate::actions::runner::TriggerQueueItem>,
+    /// The terminal that is currently being driven by the trigger queue.
+    trigger_active_terminal: Option<ViewHandle<TerminalView>>,
 }
 
 impl Workspace {
@@ -1334,6 +1342,60 @@ impl Workspace {
         ctx.dispatch_global_action("workspace:save_app", ());
         ctx.notify();
     }
+
+    // ── Trigger sequential execution ──────────────────────────────────────
+
+    /// Advance the trigger execution queue by one step.
+    ///
+    /// Called:
+    /// - at the start of trigger execution (to kick off the first step), and
+    /// - by the `PendingCommandCompleted` subscription on the active terminal
+    ///   (so each command waits for the previous one to finish).
+    pub(crate) fn advance_trigger_queue(&mut self, ctx: &mut ViewContext<Self>) {
+        use crate::actions::runner::TriggerQueueItem;
+
+        loop {
+            let Some(item) = self.trigger_queue.pop_front() else {
+                self.trigger_active_terminal = None;
+                return;
+            };
+
+            match item {
+                TriggerQueueItem::OpenNewTab => {
+                    // Open a fresh terminal tab and find its TerminalView handle.
+                    self.add_terminal_tab(true, ctx);
+                    let group = self.active_tab_pane_group().clone();
+                    let terminal_handle: Option<ViewHandle<TerminalView>> =
+                        group.read(ctx, |g, ctx| {
+                            g.terminal_views(ctx).into_iter().next()
+                        });
+                    if let Some(terminal) = terminal_handle {
+                        self.trigger_active_terminal = Some(terminal.clone());
+                        // Subscribe so the next queue item fires after each
+                        // command in this terminal finishes.
+                        ctx.subscribe_to_view(&terminal, |me, _, event, ctx| {
+                            if matches!(event, terminal::Event::PendingCommandCompleted) {
+                                me.advance_trigger_queue(ctx);
+                            }
+                        });
+                        // Fall through the loop to consume the first command.
+                    }
+                }
+                TriggerQueueItem::SendCommand(cmd) => {
+                    if let Some(terminal) = self.trigger_active_terminal.clone() {
+                        terminal.update(ctx, |t, ctx| {
+                            t.execute_command_or_set_pending(&cmd, ctx);
+                        });
+                    }
+                    // Stop here; the subscription will call us again after
+                    // the command's block completes.
+                    return;
+                }
+            }
+        }
+    }
+
+    // ── Tab rename ────────────────────────────────────────────────────────
 
     fn cancel_tab_rename(&mut self, ctx: &mut ViewContext<Self>) {
         if self.current_workspace_state.is_tab_being_renamed() {
@@ -3171,6 +3233,8 @@ impl Workspace {
             tab_config_action_sidecar_mouse_states: Default::default(),
             remove_tab_config_confirmation_dialog:
                 Self::build_remove_tab_config_confirmation_dialog(ctx),
+            trigger_queue: Default::default(),
+            trigger_active_terminal: None,
         };
 
         ws.configure_new_workspace(workspace_setting, ctx);
@@ -20428,7 +20492,7 @@ impl TypedActionView for Workspace {
                 let triggers = config.triggers().to_vec();
                 let _ = config;
                 if let Some(trigger) = triggers.iter().find(|t| t.id == *trigger_id) {
-                    TriggerRunner::run(trigger, &actions, self, ctx);
+                    TriggerRunner::build_queue(trigger, &actions, self, ctx);
                 }
             }
             CloseAllTerminals => {
