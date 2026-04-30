@@ -275,6 +275,8 @@ pub enum WorkspaceAction {
     RunActionInActiveTerminal(Uuid),
     /// Run a trigger by ID across its configured terminal targets.
     RunTrigger(Uuid),
+    /// Cancel any currently-running trigger execution immediately.
+    StopTrigger,
     /// Close every open terminal tab.
     CloseAllTerminals,
     /// Send SIGINT to every running terminal process across all tabs.
@@ -875,6 +877,7 @@ impl WorkspaceAction {
             | ToggleActionsPanel
             | RunActionInActiveTerminal(_)
             | RunTrigger(_)
+            | StopTrigger
             | CloseAllTerminals
             | KillAllTerminalProcesses
             | SaveCurrentWorkspace

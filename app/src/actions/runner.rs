@@ -71,6 +71,7 @@ impl TriggerRunner {
         }
 
         workspace.trigger_queue = queue;
+        workspace.trigger_running_name = Some(trigger.name.clone());
         workspace.advance_trigger_queue(ctx);
     }
 

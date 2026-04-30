@@ -1044,6 +1044,9 @@ pub struct Workspace {
     /// payload.  Populated by `TriggerRunner` and drained one step at a time
     /// as each command's `PendingCommandCompleted` event fires.
     pub(crate) trigger_queue: std::collections::VecDeque<crate::actions::runner::TriggerQueueItem>,
+    /// Human-readable name of the trigger that is currently executing.
+    /// `None` when no trigger is running.
+    pub(crate) trigger_running_name: Option<String>,
     /// The terminal that is currently being driven by the trigger queue.
     trigger_active_terminal: Option<ViewHandle<TerminalView>>,
     /// Stable `EntityId` of `trigger_active_terminal`.  Stored separately so
@@ -1386,6 +1389,8 @@ impl Workspace {
                 self.trigger_active_terminal = None;
                 self.trigger_active_terminal_id = None;
                 self.trigger_queue_waiting = false;
+                self.trigger_running_name = None;
+                ctx.notify();
                 return;
             };
 
@@ -3293,6 +3298,7 @@ impl Workspace {
             remove_tab_config_confirmation_dialog:
                 Self::build_remove_tab_config_confirmation_dialog(ctx),
             trigger_queue: Default::default(),
+            trigger_running_name: None,
             trigger_active_terminal: None,
             trigger_active_terminal_id: None,
             trigger_queue_waiting: false,
@@ -16877,7 +16883,7 @@ impl Workspace {
         ctx: &AppContext,
     ) -> Box<dyn Element> {
         let is_active = self.active_tab_pane_group().as_ref(ctx).actions_panel_open;
-        self.render_tab_bar_icon_button(
+        let icon_btn = self.render_tab_bar_icon_button(
             appearance,
             icons::Icon::Lightning,
             &self.mouse_states.actions_panel_icon,
@@ -16887,7 +16893,126 @@ impl Workspace {
             is_active,
             false,
         )
-        .finish()
+        .finish();
+
+        // When a trigger is running, overlay a pulsing red "stop" dot badge on
+        // the icon so the user knows something is happening.  Clicking it stops
+        // the trigger immediately.
+        if self.trigger_running_name.is_some() {
+            let theme = appearance.theme();
+            let badge = EventHandler::new(
+                ConstrainedBox::new(
+                    Rect::new()
+                        .with_background(Fill::Solid(theme.ansi_fg_red()))
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+                        .finish(),
+                )
+                .with_width(8.)
+                .with_height(8.)
+                .finish(),
+            )
+            .on_left_mouse_down(|ctx, _, _| {
+                ctx.dispatch_typed_action(WorkspaceAction::StopTrigger);
+                DispatchEventResult::StopPropagation
+            })
+            .finish();
+
+            // Position the badge at the top-right corner of the icon button.
+            let mut badge_stack = Stack::new();
+            badge_stack.add_child(icon_btn);
+            badge_stack.add_positioned_overlay_child(
+                badge,
+                OffsetPositioning::offset_from_parent(
+                    vec2f(0., 0.),
+                    ParentOffsetBounds::WindowByPosition,
+                    ParentAnchor::TopRight,
+                    ChildAnchor::TopRight,
+                ),
+            );
+            badge_stack.finish()
+        } else {
+            icon_btn
+        }
+    }
+
+    /// Render the full-screen overlay that blocks interaction while a trigger
+    /// is executing.  Shows the trigger name and a Stop button.
+    fn render_trigger_running_overlay(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+        let trigger_name = self
+            .trigger_running_name
+            .as_deref()
+            .unwrap_or("Trigger")
+            .to_string();
+
+        let title = Text::new("Trigger Running", font, 16.)
+            .with_style(Properties::default().weight(warpui::fonts::Weight::Semibold))
+            .with_color(Fill::Solid(ColorU::new(255, 255, 255, 230)).into_solid())
+            .finish();
+
+        let subtitle = Text::new(trigger_name, font, 12.)
+            .with_color(Fill::Solid(ColorU::new(200, 200, 200, 200)).into_solid())
+            .finish();
+
+        let stop_btn = appearance
+            .ui_builder()
+            .button(
+                ButtonVariant::Secondary,
+                self.mouse_states.stop_trigger_button.clone(),
+            )
+            .with_style(warpui::ui_components::components::UiComponentStyles {
+                font_size: Some(13.),
+                padding: Some(warpui::ui_components::components::Coords {
+                    top: 7.,
+                    bottom: 7.,
+                    left: 20.,
+                    right: 20.,
+                }),
+                ..Default::default()
+            })
+            .with_text_label("Stop Trigger".to_string())
+            .build()
+            .on_click(|ctx, _, _| ctx.dispatch_typed_action(WorkspaceAction::StopTrigger))
+            .with_cursor(warpui::platform::Cursor::PointingHand)
+            .finish();
+
+        let card = Container::new(
+            Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_spacing(10.)
+                .with_child(title)
+                .with_child(subtitle)
+                .with_child(
+                    Container::new(stop_btn)
+                        .with_margin_top(8.)
+                        .finish(),
+                )
+                .finish(),
+        )
+        .with_background(theme.surface_1())
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+        .with_uniform_padding(28.)
+        .finish();
+
+        let centered_card = Align::new(card).finish();
+
+        let scrim = Rect::new()
+            .with_background(Fill::Solid(ColorU::new(0, 0, 0, 180)))
+            .finish();
+
+        let mut overlay_stack = Stack::new();
+        overlay_stack.add_child(scrim);
+        overlay_stack.add_child(centered_card);
+        let overlay = overlay_stack.finish();
+
+        // Block all pointer interaction with the underlying workspace.
+        EventHandler::new(overlay)
+            .on_left_mouse_down(|_, _, _| DispatchEventResult::StopPropagation)
+            .on_right_mouse_down(|_, _, _| DispatchEventResult::StopPropagation)
+            .on_scroll_wheel(|_, _, _, _| DispatchEventResult::StopPropagation)
+            .finish()
     }
 
     fn render_kill_all_button(&self, appearance: &Appearance) -> Box<dyn Element> {
@@ -20556,6 +20681,14 @@ impl TypedActionView for Workspace {
                     TriggerRunner::build_queue(trigger, &actions, self, ctx);
                 }
             }
+            StopTrigger => {
+                self.trigger_queue.clear();
+                self.trigger_active_terminal = None;
+                self.trigger_active_terminal_id = None;
+                self.trigger_queue_waiting = false;
+                self.trigger_running_name = None;
+                ctx.notify();
+            }
             CloseAllTerminals => {
                 // Open one fresh terminal tab first so the window always has at
                 // least one tab while we close the old ones (the UI requires ≥1
@@ -22501,6 +22634,11 @@ impl View for Workspace {
                 .with_uniform_padding(WORKSPACE_PADDING)
                 .finish(),
         );
+
+        // Trigger-running overlay: blocks all interaction and shows a stop button.
+        if self.trigger_running_name.is_some() {
+            stack.add_child(self.render_trigger_running_overlay(appearance));
+        }
 
         if !use_simplified_wasm_tab_bar
             && FeatureFlag::VerticalTabs.is_enabled()
