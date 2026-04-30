@@ -303,6 +303,13 @@ pub enum WorkspaceAction {
     OpenActionFile(Uuid),
     /// Open the TOML source file for a trigger in a new editor tab.
     OpenTriggerFile(Uuid),
+    /// Toggle the Actions command-palette overlay (searches across all actions,
+    /// triggers, and workspaces with a centre-screen modal).
+    ToggleActionPalette,
+    /// Toggle the `pinned` flag on an action by ID.
+    ToggleActionPin(Uuid),
+    /// Toggle the `pinned` flag on a trigger by ID.
+    ToggleTriggerPin(Uuid),
     /// Sends Ctrl+C to every terminal pane across all open tabs and clears their output.
     KillAndClearAllTerminals,
     /// Opens the code review panel (right panel) without toggling. If already open,
@@ -891,6 +898,9 @@ impl WorkspaceAction {
             | DeleteTrigger(_)
             | OpenActionFile(_)
             | OpenTriggerFile(_)
+            | ToggleActionPalette
+            | ToggleActionPin(_)
+            | ToggleTriggerPin(_)
             | KillAndClearAllTerminals
             | OpenCodeReviewPanel(..)
             | ToggleVerticalTabsSettingsPopup

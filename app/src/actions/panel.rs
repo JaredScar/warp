@@ -54,6 +54,8 @@ enum PanelMode {
     EditTrigger(Option<Uuid>),
     /// Naming/renaming a workspace.  `None` = new workspace; `Some(id)` = rename existing.
     EditWorkspaceName(Option<Uuid>),
+    /// Command-palette: full-panel fuzzy search across actions, triggers, and workspaces.
+    Palette,
 }
 
 // ── Per-row stable mouse state ─────────────────────────────────────────────
@@ -62,6 +64,7 @@ struct RowMouseStates {
     primary: MouseStateHandle,
     secondary: MouseStateHandle,
     delete: MouseStateHandle,
+    pin: MouseStateHandle,
 }
 
 impl Default for RowMouseStates {
@@ -70,6 +73,7 @@ impl Default for RowMouseStates {
             primary: Default::default(),
             secondary: Default::default(),
             delete: Default::default(),
+            pin: Default::default(),
         }
     }
 }
@@ -91,6 +95,7 @@ pub struct ActionsPanelView {
     actions_tab_mouse_state: MouseStateHandle,
     triggers_tab_mouse_state: MouseStateHandle,
     workspaces_tab_mouse_state: MouseStateHandle,
+    palette_tab_mouse_state: MouseStateHandle,
     // ── list tab buttons ──
     save_workspace_mouse_state: MouseStateHandle,
     new_action_mouse_state: MouseStateHandle,
@@ -106,6 +111,14 @@ pub struct ActionsPanelView {
     edit_desc_editor: ViewHandle<EditorView>,
     /// Optional tab name to use when this action's trigger opens a new terminal tab.
     edit_tab_name_editor: ViewHandle<EditorView>,
+    /// Optional group/folder name for organising the action in the list.
+    edit_group_editor: ViewHandle<EditorView>,
+    /// Optional timeout in seconds (numeric string).
+    edit_timeout_editor: ViewHandle<EditorView>,
+    /// Optional keyboard shortcut label.
+    edit_hotkey_editor: ViewHandle<EditorView>,
+    /// Hotkey editor for triggers.
+    edit_trigger_hotkey_editor: ViewHandle<EditorView>,
     /// One single-line editor per command, each paired with a stable UUID for mouse-state keying.
     edit_command_editors: Vec<(Uuid, ViewHandle<EditorView>)>,
     /// Per-command delete-button mouse states, keyed by the command's stable UUID.
@@ -128,6 +141,13 @@ pub struct ActionsPanelView {
     edit_selected_remove_states: RefCell<HashMap<Uuid, MouseStateHandle>>,
     save_form_state: MouseStateHandle,
     cancel_form_state: MouseStateHandle,
+    // ── command palette ──
+    /// Search query for the command-palette mode.
+    palette_query: String,
+    /// Single-line editor for the command-palette search box.
+    palette_search_editor: ViewHandle<EditorView>,
+    /// Mouse state for the palette open/close toggle button in the header.
+    palette_button_state: MouseStateHandle,
 }
 
 impl ActionsPanelView {
@@ -150,7 +170,17 @@ impl ActionsPanelView {
             ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
         let edit_tab_name_editor =
             ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
+        let edit_group_editor =
+            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
+        let edit_timeout_editor =
+            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
+        let edit_hotkey_editor =
+            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
+        let edit_trigger_hotkey_editor =
+            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
         let trigger_search_editor =
+            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
+        let palette_search_editor =
             ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
 
         edit_name_editor.update(ctx, |editor, ctx| {
@@ -162,8 +192,23 @@ impl ActionsPanelView {
         edit_tab_name_editor.update(ctx, |editor, ctx| {
             editor.set_placeholder_text("Tab name (optional)", ctx);
         });
+        edit_group_editor.update(ctx, |editor, ctx| {
+            editor.set_placeholder_text("e.g. Dev, Backend, Deploy…", ctx);
+        });
+        edit_timeout_editor.update(ctx, |editor, ctx| {
+            editor.set_placeholder_text("Seconds (default: 5)", ctx);
+        });
+        edit_hotkey_editor.update(ctx, |editor, ctx| {
+            editor.set_placeholder_text("e.g. ⌘⇧R", ctx);
+        });
+        edit_trigger_hotkey_editor.update(ctx, |editor, ctx| {
+            editor.set_placeholder_text("e.g. ⌘⇧T", ctx);
+        });
         trigger_search_editor.update(ctx, |editor, ctx| {
             editor.set_placeholder_text("Search actions…", ctx);
+        });
+        palette_search_editor.update(ctx, |editor, ctx| {
+            editor.set_placeholder_text("Search actions, triggers, workspaces…", ctx);
         });
 
         // Keep trigger_search_query in sync with the search editor text.
@@ -171,6 +216,16 @@ impl ActionsPanelView {
             if matches!(event, EditorEvent::Edited(_)) {
                 me.trigger_search_query = me
                     .trigger_search_editor
+                    .read(ctx, |e, ctx| e.buffer_text(ctx));
+                ctx.notify();
+            }
+        });
+
+        // Keep palette_query in sync with the palette search editor.
+        ctx.subscribe_to_view(&palette_search_editor, |me, _, event, ctx| {
+            if matches!(event, EditorEvent::Edited(_)) {
+                me.palette_query = me
+                    .palette_search_editor
                     .read(ctx, |e, ctx| e.buffer_text(ctx));
                 ctx.notify();
             }
@@ -187,6 +242,7 @@ impl ActionsPanelView {
             actions_tab_mouse_state: Default::default(),
             triggers_tab_mouse_state: Default::default(),
             workspaces_tab_mouse_state: Default::default(),
+            palette_tab_mouse_state: Default::default(),
             save_workspace_mouse_state: Default::default(),
             new_action_mouse_state: Default::default(),
             new_trigger_mouse_state: Default::default(),
@@ -198,6 +254,10 @@ impl ActionsPanelView {
             edit_name_editor,
             edit_desc_editor,
             edit_tab_name_editor,
+            edit_group_editor,
+            edit_timeout_editor,
+            edit_hotkey_editor,
+            edit_trigger_hotkey_editor,
             edit_command_editors: Vec::new(),
             edit_command_remove_states: Default::default(),
             add_command_state: Default::default(),
@@ -211,6 +271,9 @@ impl ActionsPanelView {
             edit_selected_remove_states: Default::default(),
             save_form_state: Default::default(),
             cancel_form_state: Default::default(),
+            palette_query: String::new(),
+            palette_search_editor,
+            palette_button_state: Default::default(),
         }
     }
 
@@ -246,15 +309,18 @@ impl ActionsPanelView {
         let action = action_id.and_then(|id| config.actions().iter().find(|a| a.id == id).cloned());
         drop(config);
 
-        let (name, desc, tab_name, commands) = if let Some(a) = action {
+        let (name, desc, tab_name, group, timeout, hotkey, commands) = if let Some(a) = action {
             (
                 a.name.clone(),
                 a.description.clone().unwrap_or_default(),
                 a.tab_name.clone().unwrap_or_default(),
+                a.group.clone().unwrap_or_default(),
+                a.timeout_secs.map(|t| t.to_string()).unwrap_or_default(),
+                a.hotkey.clone().unwrap_or_default(),
                 a.commands.clone(),
             )
         } else {
-            (String::new(), String::new(), String::new(), vec![String::new()])
+            (String::new(), String::new(), String::new(), String::new(), String::new(), String::new(), vec![String::new()])
         };
 
         self.edit_name_editor.update(ctx, |e, ctx| {
@@ -265,6 +331,15 @@ impl ActionsPanelView {
         });
         self.edit_tab_name_editor.update(ctx, |e, ctx| {
             e.set_buffer_text_with_base_buffer(&tab_name, ctx);
+        });
+        self.edit_group_editor.update(ctx, |e, ctx| {
+            e.set_buffer_text_with_base_buffer(&group, ctx);
+        });
+        self.edit_timeout_editor.update(ctx, |e, ctx| {
+            e.set_buffer_text_with_base_buffer(&timeout, ctx);
+        });
+        self.edit_hotkey_editor.update(ctx, |e, ctx| {
+            e.set_buffer_text_with_base_buffer(&hotkey, ctx);
         });
 
         // Build one editor per command (at least one empty row for new actions).
@@ -289,14 +364,15 @@ impl ActionsPanelView {
             .and_then(|id| config.triggers().iter().find(|t| t.id == id).cloned());
         drop(config);
 
-        let (name, desc, ordered_ids) = if let Some(t) = trigger {
+        let (name, desc, hotkey, ordered_ids) = if let Some(t) = trigger {
             (
                 t.name.clone(),
                 t.description.clone().unwrap_or_default(),
+                t.hotkey.clone().unwrap_or_default(),
                 t.action_ids.clone(),
             )
         } else {
-            (String::new(), String::new(), Vec::new())
+            (String::new(), String::new(), String::new(), Vec::new())
         };
 
         self.edit_selected_action_ids = ordered_ids;
@@ -307,6 +383,9 @@ impl ActionsPanelView {
         });
         self.edit_desc_editor.update(ctx, |e, ctx| {
             e.set_buffer_text_with_base_buffer(&desc, ctx);
+        });
+        self.edit_trigger_hotkey_editor.update(ctx, |e, ctx| {
+            e.set_buffer_text_with_base_buffer(&hotkey, ctx);
         });
         self.trigger_search_editor.update(ctx, |e, ctx| {
             e.set_buffer_text_with_base_buffer("", ctx);
@@ -329,16 +408,16 @@ impl ActionsPanelView {
 
     // ── Per-row mouse state helpers ────────────────────────────────────────
 
-    fn action_states(&self, id: Uuid) -> (MouseStateHandle, MouseStateHandle, MouseStateHandle) {
+    fn action_states(&self, id: Uuid) -> (MouseStateHandle, MouseStateHandle, MouseStateHandle, MouseStateHandle) {
         let mut map = self.action_row_states.borrow_mut();
         let s = map.entry(id).or_insert_with(RowMouseStates::default);
-        (s.primary.clone(), s.secondary.clone(), s.delete.clone())
+        (s.primary.clone(), s.secondary.clone(), s.delete.clone(), s.pin.clone())
     }
 
-    fn trigger_states(&self, id: Uuid) -> (MouseStateHandle, MouseStateHandle, MouseStateHandle) {
+    fn trigger_states(&self, id: Uuid) -> (MouseStateHandle, MouseStateHandle, MouseStateHandle, MouseStateHandle) {
         let mut map = self.trigger_row_states.borrow_mut();
         let s = map.entry(id).or_insert_with(RowMouseStates::default);
-        (s.primary.clone(), s.secondary.clone(), s.delete.clone())
+        (s.primary.clone(), s.secondary.clone(), s.delete.clone(), s.pin.clone())
     }
 
     fn workspace_states(&self, id: Uuid) -> (MouseStateHandle, MouseStateHandle, MouseStateHandle) {
@@ -370,7 +449,10 @@ impl ActionsPanelView {
     // ── Header ────────────────────────────────────────────────────────────
 
     fn render_header(&self, appearance: &Appearance) -> Box<dyn Element> {
-        // In editing mode show a back arrow + form title instead of tabs.
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+
+        // In editing / palette mode show a back arrow + form title instead of tabs.
         let left_side: Box<dyn Element> = match &self.panel_mode {
             PanelMode::List => {
                 let tab_row = Flex::row()
@@ -381,17 +463,49 @@ impl ActionsPanelView {
                     .with_child(self.render_tab_button(appearance, "Workspaces", ActionsPanelTab::Workspaces))
                     .with_main_axis_size(MainAxisSize::Min)
                     .finish();
-                Shrinkable::new(1.0, tab_row).finish()
+                // Also render the palette search icon to the right.
+                let search_btn = Hoverable::new(self.palette_button_state.clone(), |_| {
+                    Container::new(
+                        Text::new("⌕", font, 14.)
+                            .with_color(theme.sub_text_color(theme.background()).into_solid())
+                            .finish()
+                    )
+                    .with_padding_left(6.)
+                    .with_padding_right(4.)
+                    .finish()
+                })
+                .on_click(|ctx, _, _| ctx.dispatch_typed_action(ActionsPanelAction::EnterPaletteMode))
+                .with_cursor(warpui::platform::Cursor::PointingHand)
+                .finish();
+                Shrinkable::new(
+                    1.0,
+                    Flex::row()
+                        .with_main_axis_size(MainAxisSize::Max)
+                        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(tab_row)
+                        .with_child(search_btn)
+                        .finish(),
+                )
+                .finish()
+            }
+            PanelMode::Palette => {
+                Shrinkable::new(
+                    1.0,
+                    Text::new("Search", font, 13.)
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .with_color(theme.main_text_color(theme.background()).into_solid())
+                        .finish(),
+                )
+                .finish()
             }
             PanelMode::EditAction(id) => {
                 let title = if id.is_some() { "Edit Action" } else { "New Action" };
                 Shrinkable::new(
                     1.0,
-                    Text::new(title, appearance.ui_font_family(), 13.)
+                    Text::new(title, font, 13.)
                         .with_style(Properties::default().weight(Weight::Semibold))
-                        .with_color(
-                            appearance.theme().main_text_color(appearance.theme().background()).into_solid(),
-                        )
+                        .with_color(theme.main_text_color(theme.background()).into_solid())
                         .finish(),
                 )
                 .finish()
@@ -400,11 +514,9 @@ impl ActionsPanelView {
                 let title = if id.is_some() { "Edit Trigger" } else { "New Trigger" };
                 Shrinkable::new(
                     1.0,
-                    Text::new(title, appearance.ui_font_family(), 13.)
+                    Text::new(title, font, 13.)
                         .with_style(Properties::default().weight(Weight::Semibold))
-                        .with_color(
-                            appearance.theme().main_text_color(appearance.theme().background()).into_solid(),
-                        )
+                        .with_color(theme.main_text_color(theme.background()).into_solid())
                         .finish(),
                 )
                 .finish()
@@ -413,11 +525,9 @@ impl ActionsPanelView {
                 let title = if id.is_some() { "Rename Workspace" } else { "Save Workspace" };
                 Shrinkable::new(
                     1.0,
-                    Text::new(title, appearance.ui_font_family(), 13.)
+                    Text::new(title, font, 13.)
                         .with_style(Properties::default().weight(Weight::Semibold))
-                        .with_color(
-                            appearance.theme().main_text_color(appearance.theme().background()).into_solid(),
-                        )
+                        .with_color(theme.main_text_color(theme.background()).into_solid())
                         .finish(),
                 )
                 .finish()
@@ -551,6 +661,21 @@ impl ActionsPanelView {
 
     // ── List tabs ─────────────────────────────────────────────────────────
 
+    fn render_group_header(&self, label: &str, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        Container::new(
+            Text::new(label.to_string(), appearance.ui_font_family(), 10.)
+                .with_style(Properties::default().weight(Weight::Semibold))
+                .with_color(theme.sub_text_color(theme.background()).into_solid())
+                .finish(),
+        )
+        .with_padding_left(10.)
+        .with_padding_right(10.)
+        .with_padding_top(8.)
+        .with_padding_bottom(2.)
+        .finish()
+    }
+
     fn render_actions_tab(&self, actions: &[Action], appearance: &Appearance) -> Box<dyn Element> {
         let new_button = {
             let ui_builder = appearance.ui_builder().clone();
@@ -576,6 +701,36 @@ impl ActionsPanelView {
         .with_padding_bottom(4.)
         .finish();
 
+        // User-facing actions (non-builtin). Split into pinned / unpinned.
+        let user_actions: Vec<&Action> = actions
+            .iter()
+            .filter(|a| !crate::actions::model::is_builtin_action(&a.id))
+            .collect();
+        let pinned: Vec<&Action> = user_actions.iter().filter(|a| a.pinned).copied().collect();
+
+        // Group unpinned user actions by their `group` field.
+        let mut groups: Vec<(Option<String>, Vec<&Action>)> = Vec::new();
+        for action in user_actions.iter().filter(|a| !a.pinned) {
+            let group_label = action.group.clone();
+            if let Some(entry) = groups.iter_mut().find(|(g, _)| g == &group_label) {
+                entry.1.push(action);
+            } else {
+                groups.push((group_label, vec![action]));
+            }
+        }
+        // Sort groups: ungrouped first, then alphabetically.
+        groups.sort_by(|(a, _), (b, _)| match (a, b) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(a), Some(b)) => a.cmp(b),
+        });
+
+        let builtin: Vec<&Action> = actions
+            .iter()
+            .filter(|a| crate::actions::model::is_builtin_action(&a.id))
+            .collect();
+
         let list: Box<dyn Element> = if actions.is_empty() {
             let empty_state_mouse = {
                 let mut map = self.action_row_states.borrow_mut();
@@ -595,9 +750,37 @@ impl ActionsPanelView {
             .finish()
         } else {
             let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
-            for action in actions {
-                col = col.with_child(self.render_action_row(action, appearance));
+
+            // ── Built-ins ─────────────────────────────────────────────────
+            if !builtin.is_empty() {
+                col = col.with_child(self.render_group_header("BUILT-IN", appearance));
+                for action in &builtin {
+                    col = col.with_child(self.render_action_row(action, appearance));
+                }
             }
+
+            // ── Pinned ────────────────────────────────────────────────────
+            if !pinned.is_empty() {
+                col = col.with_child(self.render_group_header("PINNED", appearance));
+                for action in &pinned {
+                    col = col.with_child(self.render_action_row(action, appearance));
+                }
+            }
+
+            // ── Grouped user actions ──────────────────────────────────────
+            for (group_label, group_actions) in &groups {
+                if !group_actions.is_empty() {
+                    if let Some(label) = group_label {
+                        col = col.with_child(self.render_group_header(label, appearance));
+                    } else if !pinned.is_empty() || !builtin.is_empty() {
+                        col = col.with_child(self.render_group_header("OTHER", appearance));
+                    }
+                    for action in group_actions {
+                        col = col.with_child(self.render_action_row(action, appearance));
+                    }
+                }
+            }
+
             Shrinkable::new(1.0, col.finish()).finish()
         };
 
@@ -697,8 +880,19 @@ impl ActionsPanelView {
             ))
             .finish()
         } else {
+            let pinned: Vec<&Trigger> = triggers.iter().filter(|t| t.pinned).collect();
+            let unpinned: Vec<&Trigger> = triggers.iter().filter(|t| !t.pinned).collect();
             let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
-            for trigger in triggers {
+            if !pinned.is_empty() {
+                col = col.with_child(self.render_group_header("PINNED", appearance));
+                for trigger in &pinned {
+                    col = col.with_child(self.render_trigger_row(trigger, appearance));
+                }
+                if !unpinned.is_empty() {
+                    col = col.with_child(self.render_group_header("OTHER", appearance));
+                }
+            }
+            for trigger in unpinned {
                 col = col.with_child(self.render_trigger_row(trigger, appearance));
             }
             Shrinkable::new(1.0, col.finish()).finish()
@@ -780,27 +974,61 @@ impl ActionsPanelView {
     fn render_action_row(&self, action: &Action, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
         let font = appearance.ui_font_family();
+        let sub_color = theme.sub_text_color(theme.background()).into_solid();
+        let sub_fill = theme.sub_text_color(theme.background());
 
-        let name = Text::new(action.name.clone(), font, 13.)
+        let action_id = action.id;
+        let is_builtin = is_builtin_action(&action_id);
+        let (run_state, edit_state, delete_state, pin_state) = self.action_states(action_id);
+
+        // Name row: name + optional hotkey badge
+        let name_text = Text::new(action.name.clone(), font, 13.)
             .with_style(Properties::default().weight(Weight::Medium))
             .with_color(theme.main_text_color(theme.background()).into_solid())
             .finish();
 
-        let action_id = action.id;
-        let is_builtin = is_builtin_action(&action_id);
-        let (run_state, edit_state, delete_state) = self.action_states(action_id);
+        let name_row: Box<dyn Element> = if let Some(hotkey) = &action.hotkey {
+            let badge_bg = warpui::elements::Fill::Solid(
+                pathfinder_color::ColorU::new(255, 255, 255, 18),
+            );
+            let badge = Container::new(
+                Text::new(hotkey.clone(), font, 10.)
+                    .with_color(sub_color)
+                    .finish(),
+            )
+            .with_padding_left(4.)
+            .with_padding_right(4.)
+            .with_padding_top(2.)
+            .with_padding_bottom(2.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.)))
+            .with_background(badge_bg)
+            .finish();
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(5.)
+                .with_child(name_text)
+                .with_child(badge)
+                .with_main_axis_size(MainAxisSize::Min)
+                .finish()
+        } else {
+            name_text
+        };
 
         let meta_label = if is_builtin {
             "built-in".to_string()
         } else {
-            format!(
+            let mut parts = vec![format!(
                 "{} command{}",
                 action.commands.len(),
                 if action.commands.len() == 1 { "" } else { "s" }
-            )
+            )];
+            if let Some(g) = &action.group {
+                parts.push(g.clone());
+            }
+            parts.join(" · ")
         };
         let meta = Text::new(meta_label, font, 11.)
-            .with_color(theme.sub_text_color(theme.background()).into_solid())
+            .with_color(sub_color)
             .finish();
 
         let run_button = {
@@ -821,11 +1049,29 @@ impl ActionsPanelView {
             .with_child(run_button);
 
         if !is_builtin {
+            // Pin toggle button — star icon (⊕ / ⊙ using text as fallback)
+            let is_pinned = action.pinned;
+            let pin_label = if is_pinned { "★" } else { "☆" };
+            let pin_button = Hoverable::new(pin_state, move |_| {
+                Container::new(
+                    Text::new(pin_label.to_string(), font, 13.)
+                        .with_color(sub_color)
+                        .finish(),
+                )
+                .with_padding_left(4.)
+                .with_padding_right(4.)
+                .finish()
+            })
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(ActionsPanelAction::PinAction(action_id));
+            })
+            .with_cursor(warpui::platform::Cursor::PointingHand)
+            .finish();
+
             let edit_button = {
                 let ui_builder = appearance.ui_builder().clone();
                 let tooltip = ui_builder.tool_tip("Edit action".to_string()).build().finish();
-                let icon_color = theme.sub_text_color(theme.background());
-                icon_button_with_color(appearance, Icon::Edit, false, edit_state, icon_color)
+                icon_button_with_color(appearance, Icon::Edit, false, edit_state, sub_fill)
                     .with_tooltip(move || tooltip)
                     .build()
                     .on_click(move |ctx, _, _| {
@@ -836,8 +1082,7 @@ impl ActionsPanelView {
             let delete_button = {
                 let ui_builder = appearance.ui_builder().clone();
                 let tooltip = ui_builder.tool_tip("Delete action".to_string()).build().finish();
-                let icon_color = theme.sub_text_color(theme.background());
-                icon_button_with_color(appearance, Icon::Trash, false, delete_state, icon_color)
+                icon_button_with_color(appearance, Icon::Trash, false, delete_state, sub_fill)
                     .with_tooltip(move || tooltip)
                     .build()
                     .on_click(move |ctx, _, _| {
@@ -845,7 +1090,10 @@ impl ActionsPanelView {
                     })
                     .finish()
             };
-            buttons_row = buttons_row.with_child(edit_button).with_child(delete_button);
+            buttons_row = buttons_row
+                .with_child(pin_button)
+                .with_child(edit_button)
+                .with_child(delete_button);
         }
 
         let buttons = buttons_row.with_main_axis_size(MainAxisSize::Min).finish();
@@ -857,7 +1105,7 @@ impl ActionsPanelView {
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_child(
                     Flex::column()
-                        .with_child(name)
+                        .with_child(name_row)
                         .with_child(meta)
                         .with_main_axis_size(MainAxisSize::Min)
                         .finish(),
@@ -875,11 +1123,43 @@ impl ActionsPanelView {
     fn render_trigger_row(&self, trigger: &Trigger, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
         let font = appearance.ui_font_family();
+        let sub_color = theme.sub_text_color(theme.background()).into_solid();
+        let sub_fill = theme.sub_text_color(theme.background());
 
-        let name = Text::new(trigger.name.clone(), font, 13.)
+        let trigger_id = trigger.id;
+        let (run_state, edit_state, delete_state, pin_state) = self.trigger_states(trigger_id);
+
+        let name_text = Text::new(trigger.name.clone(), font, 13.)
             .with_style(Properties::default().weight(Weight::Medium))
             .with_color(theme.main_text_color(theme.background()).into_solid())
             .finish();
+
+        let name_row: Box<dyn Element> = if let Some(hotkey) = &trigger.hotkey {
+            let badge_bg = warpui::elements::Fill::Solid(
+                pathfinder_color::ColorU::new(255, 255, 255, 18),
+            );
+            let badge = Container::new(
+                Text::new(hotkey.clone(), font, 10.)
+                    .with_color(sub_color)
+                    .finish(),
+            )
+            .with_padding_left(4.)
+            .with_padding_right(4.)
+            .with_padding_top(2.)
+            .with_padding_bottom(2.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.)))
+            .with_background(badge_bg)
+            .finish();
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(5.)
+                .with_child(name_text)
+                .with_child(badge)
+                .with_main_axis_size(MainAxisSize::Min)
+                .finish()
+        } else {
+            name_text
+        };
 
         let action_count = format!(
             "{} action{}",
@@ -887,11 +1167,8 @@ impl ActionsPanelView {
             if trigger.action_ids.len() == 1 { "" } else { "s" }
         );
         let meta = Text::new(action_count, font, 11.)
-            .with_color(theme.sub_text_color(theme.background()).into_solid())
+            .with_color(sub_color)
             .finish();
-
-        let trigger_id = trigger.id;
-        let (run_state, edit_state, delete_state) = self.trigger_states(trigger_id);
 
         let run_button = {
             let ui_builder = appearance.ui_builder().clone();
@@ -905,11 +1182,28 @@ impl ActionsPanelView {
                 .finish()
         };
 
+        let is_pinned = trigger.pinned;
+        let pin_label = if is_pinned { "★" } else { "☆" };
+        let pin_button = Hoverable::new(pin_state, move |_| {
+            Container::new(
+                Text::new(pin_label.to_string(), font, 13.)
+                    .with_color(sub_color)
+                    .finish(),
+            )
+            .with_padding_left(4.)
+            .with_padding_right(4.)
+            .finish()
+        })
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(ActionsPanelAction::PinTrigger(trigger_id));
+        })
+        .with_cursor(warpui::platform::Cursor::PointingHand)
+        .finish();
+
         let edit_button = {
             let ui_builder = appearance.ui_builder().clone();
             let tooltip = ui_builder.tool_tip("Edit trigger".to_string()).build().finish();
-            let icon_color = theme.sub_text_color(theme.background());
-            icon_button_with_color(appearance, Icon::Edit, false, edit_state, icon_color)
+            icon_button_with_color(appearance, Icon::Edit, false, edit_state, sub_fill)
                 .with_tooltip(move || tooltip)
                 .build()
                 .on_click(move |ctx, _, _| {
@@ -921,8 +1215,7 @@ impl ActionsPanelView {
         let delete_button = {
             let ui_builder = appearance.ui_builder().clone();
             let tooltip = ui_builder.tool_tip("Delete trigger".to_string()).build().finish();
-            let icon_color = theme.sub_text_color(theme.background());
-            icon_button_with_color(appearance, Icon::Trash, false, delete_state, icon_color)
+            icon_button_with_color(appearance, Icon::Trash, false, delete_state, sub_fill)
                 .with_tooltip(move || tooltip)
                 .build()
                 .on_click(move |ctx, _, _| {
@@ -935,6 +1228,7 @@ impl ActionsPanelView {
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(2.0)
             .with_child(run_button)
+            .with_child(pin_button)
             .with_child(edit_button)
             .with_child(delete_button)
             .with_main_axis_size(MainAxisSize::Min)
@@ -947,7 +1241,7 @@ impl ActionsPanelView {
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_child(
                     Flex::column()
-                        .with_child(name)
+                        .with_child(name_row)
                         .with_child(meta)
                         .with_main_axis_size(MainAxisSize::Min)
                         .finish(),
@@ -1169,6 +1463,15 @@ impl ActionsPanelView {
         col = col.with_child(self.render_field_label("TAB NAME", appearance));
         col = col.with_child(self.render_text_field(&self.edit_tab_name_editor, Some(FIELD_HEIGHT), appearance));
 
+        col = col.with_child(self.render_field_label("GROUP", appearance));
+        col = col.with_child(self.render_text_field(&self.edit_group_editor, Some(FIELD_HEIGHT), appearance));
+
+        col = col.with_child(self.render_field_label("HOTKEY", appearance));
+        col = col.with_child(self.render_text_field(&self.edit_hotkey_editor, Some(FIELD_HEIGHT), appearance));
+
+        col = col.with_child(self.render_field_label("TIMEOUT (SECS)", appearance));
+        col = col.with_child(self.render_text_field(&self.edit_timeout_editor, Some(FIELD_HEIGHT), appearance));
+
         // ── Commands list ─────────────────────────────────────────────────
         col = col.with_child(self.render_field_label("COMMANDS", appearance));
 
@@ -1267,6 +1570,216 @@ impl ActionsPanelView {
             .finish()
     }
 
+    fn render_palette(
+        &self,
+        actions: &[Action],
+        triggers: &[Trigger],
+        workspaces: &[SavedWorkspace],
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+        let sub_color = theme.sub_text_color(theme.background()).into_solid();
+        let main_color = theme.main_text_color(theme.background()).into_solid();
+        let q = self.palette_query.to_lowercase();
+
+        let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
+
+        col = col.with_child(self.render_text_field(&self.palette_search_editor, Some(FIELD_HEIGHT), appearance));
+
+        // Close-palette row
+        let cancel_btn = appearance
+            .ui_builder()
+            .button(ButtonVariant::Secondary, self.cancel_form_state.clone())
+            .with_style(warpui::ui_components::components::UiComponentStyles {
+                font_size: Some(BUTTON_FONT_SIZE),
+                padding: Some(warpui::ui_components::components::Coords { top: 5., bottom: 5., left: 12., right: 12. }),
+                ..Default::default()
+            })
+            .with_text_label("Close".to_string())
+            .build()
+            .on_click(|ctx, _, _| ctx.dispatch_typed_action(ActionsPanelAction::CancelForm))
+            .with_cursor(warpui::platform::Cursor::PointingHand)
+            .finish();
+        col = col.with_child(
+            Container::new(
+                Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_main_axis_alignment(MainAxisAlignment::End)
+                    .with_child(cancel_btn)
+                    .finish(),
+            )
+            .with_margin_bottom(8.)
+            .finish(),
+        );
+
+        let mut any_result = false;
+
+        // ── Actions ───────────────────────────────────────────────────────
+        let matching_actions: Vec<(Uuid, String, String, MouseStateHandle)> = actions
+            .iter()
+            .filter(|a| q.is_empty() || a.name.to_lowercase().contains(&q))
+            .map(|a| {
+                let is_builtin = is_builtin_action(&a.id);
+                let desc = a.description.clone().unwrap_or_else(|| {
+                    if is_builtin { "built-in".to_string() }
+                    else { format!("{} cmd{}", a.commands.len(), if a.commands.len() == 1 { "" } else { "s" }) }
+                });
+                let (run_state, _, _, _) = self.action_states(a.id);
+                (a.id, a.name.clone(), desc, run_state)
+            })
+            .collect();
+        if !matching_actions.is_empty() {
+            col = col.with_child(self.render_group_header("ACTIONS", appearance));
+            for (action_id, action_name, desc, run_state) in matching_actions {
+                any_result = true;
+                let name_el = Text::new(action_name, font, 13.)
+                    .with_style(Properties::default().weight(Weight::Medium))
+                    .with_color(main_color)
+                    .finish();
+                let desc_el = Text::new(desc, font, 11.).with_color(sub_color).finish();
+                let row = Hoverable::new(run_state, move |state| {
+                    let bg = if state.is_hovered() {
+                        Some(warpui::elements::Fill::Solid(pathfinder_color::ColorU::new(255, 255, 255, 10)))
+                    } else { None };
+                    let mut c = Container::new(
+                        Flex::row()
+                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                            .with_main_axis_size(MainAxisSize::Max)
+                            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                            .with_child(name_el)
+                            .with_child(desc_el)
+                            .finish(),
+                    )
+                    .with_padding_top(5.)
+                    .with_padding_bottom(5.);
+                    if let Some(bg) = bg { c = c.with_background(bg); }
+                    c.finish()
+                })
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::RunAction(action_id));
+                    ctx.dispatch_typed_action(ActionsPanelAction::CancelForm);
+                })
+                .with_cursor(warpui::platform::Cursor::PointingHand)
+                .finish();
+                col = col.with_child(row);
+            }
+        }
+
+        // ── Triggers ──────────────────────────────────────────────────────
+        let matching_triggers: Vec<(Uuid, String, String, MouseStateHandle)> = triggers
+            .iter()
+            .filter(|t| q.is_empty() || t.name.to_lowercase().contains(&q))
+            .map(|t| {
+                let count_str = format!("{} action{}", t.action_ids.len(), if t.action_ids.len() == 1 { "" } else { "s" });
+                let (run_state, _, _, _) = self.trigger_states(t.id);
+                (t.id, t.name.clone(), count_str, run_state)
+            })
+            .collect();
+        if !matching_triggers.is_empty() {
+            col = col.with_child(self.render_group_header("TRIGGERS", appearance));
+            for (trigger_id, trigger_name, count_str, run_state) in matching_triggers {
+                any_result = true;
+                let name_el = Text::new(trigger_name, font, 13.)
+                    .with_style(Properties::default().weight(Weight::Medium))
+                    .with_color(main_color)
+                    .finish();
+                let count_el = Text::new(count_str, font, 11.).with_color(sub_color).finish();
+                let row = Hoverable::new(run_state, move |state| {
+                    let bg = if state.is_hovered() {
+                        Some(warpui::elements::Fill::Solid(pathfinder_color::ColorU::new(255, 255, 255, 10)))
+                    } else { None };
+                    let mut c = Container::new(
+                        Flex::row()
+                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                            .with_main_axis_size(MainAxisSize::Max)
+                            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                            .with_child(name_el)
+                            .with_child(count_el)
+                            .finish(),
+                    )
+                    .with_padding_top(5.)
+                    .with_padding_bottom(5.);
+                    if let Some(bg) = bg { c = c.with_background(bg); }
+                    c.finish()
+                })
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::RunTrigger(trigger_id));
+                    ctx.dispatch_typed_action(ActionsPanelAction::CancelForm);
+                })
+                .with_cursor(warpui::platform::Cursor::PointingHand)
+                .finish();
+                col = col.with_child(row);
+            }
+        }
+
+        // ── Workspaces ────────────────────────────────────────────────────
+        let matching_workspaces: Vec<(Uuid, String, String, MouseStateHandle)> = workspaces
+            .iter()
+            .filter(|w| q.is_empty() || w.name.to_lowercase().contains(&q))
+            .map(|w| {
+                let tab_str = format!("{} tab{}", w.snapshot.tabs.len(), if w.snapshot.tabs.len() == 1 { "" } else { "s" });
+                let (run_state, _, _) = self.workspace_states(w.id);
+                (w.id, w.name.clone(), tab_str, run_state)
+            })
+            .collect();
+        if !matching_workspaces.is_empty() {
+            col = col.with_child(self.render_group_header("WORKSPACES", appearance));
+            for (ws_id, ws_name, tab_str, run_state) in matching_workspaces {
+                any_result = true;
+                let name_el = Text::new(ws_name, font, 13.)
+                    .with_style(Properties::default().weight(Weight::Medium))
+                    .with_color(main_color)
+                    .finish();
+                let tab_el = Text::new(tab_str, font, 11.).with_color(sub_color).finish();
+                let row = Hoverable::new(run_state, move |state| {
+                    let bg = if state.is_hovered() {
+                        Some(warpui::elements::Fill::Solid(pathfinder_color::ColorU::new(255, 255, 255, 10)))
+                    } else { None };
+                    let mut c = Container::new(
+                        Flex::row()
+                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                            .with_main_axis_size(MainAxisSize::Max)
+                            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                            .with_child(name_el)
+                            .with_child(tab_el)
+                            .finish(),
+                    )
+                    .with_padding_top(5.)
+                    .with_padding_bottom(5.);
+                    if let Some(bg) = bg { c = c.with_background(bg); }
+                    c.finish()
+                })
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::RestoreWorkspace(ws_id));
+                    ctx.dispatch_typed_action(ActionsPanelAction::CancelForm);
+                })
+                .with_cursor(warpui::platform::Cursor::PointingHand)
+                .finish();
+                col = col.with_child(row);
+            }
+        }
+
+        if !any_result {
+            col = col.with_child(
+                Container::new(
+                    Text::new("No results.", font, 12.)
+                        .with_color(sub_color)
+                        .finish(),
+                )
+                .with_padding_top(8.)
+                .finish(),
+            );
+        }
+
+        Container::new(Shrinkable::new(1.0, col.finish()).finish())
+            .with_padding_left(FORM_PADDING)
+            .with_padding_right(FORM_PADDING)
+            .with_padding_top(FORM_PADDING)
+            .with_padding_bottom(FORM_PADDING)
+            .finish()
+    }
+
     fn render_trigger_editor(
         &self,
         actions: &[Action],
@@ -1285,6 +1798,9 @@ impl ActionsPanelView {
 
         col = col.with_child(self.render_field_label("DESCRIPTION", appearance));
         col = col.with_child(self.render_text_field(&self.edit_desc_editor, Some(FIELD_HEIGHT), appearance));
+
+        col = col.with_child(self.render_field_label("HOTKEY", appearance));
+        col = col.with_child(self.render_text_field(&self.edit_trigger_hotkey_editor, Some(FIELD_HEIGHT), appearance));
 
         // ── Selected actions (ordered list) ───────────────────────────────
         if !self.edit_selected_action_ids.is_empty() {
@@ -1526,6 +2042,12 @@ pub enum ActionsPanelAction {
     RemoveCommandRow(Uuid),
     SaveForm,
     CancelForm,
+    /// Switch the panel to command-palette (search-all) mode.
+    EnterPaletteMode,
+    /// Toggle the `pinned` flag on an action by ID.
+    PinAction(Uuid),
+    /// Toggle the `pinned` flag on a trigger by ID.
+    PinTrigger(Uuid),
 }
 
 // ── View impl ─────────────────────────────────────────────────────────────────
@@ -1561,6 +2083,7 @@ impl View for ActionsPanelView {
             PanelMode::EditAction(_) => self.render_action_editor(appearance),
             PanelMode::EditTrigger(_) => self.render_trigger_editor(&actions, appearance),
             PanelMode::EditWorkspaceName(_) => self.render_workspace_name_editor(appearance),
+            PanelMode::Palette => self.render_palette(&actions, &triggers, &workspaces, appearance),
         };
 
         let panel_content = Container::new(
@@ -1710,7 +2233,22 @@ impl warpui::TypedActionView for ActionsPanelView {
             }
             ActionsPanelAction::CancelForm => {
                 self.panel_mode = PanelMode::List;
+                // Also clear palette query when closing palette.
+                self.palette_query = String::new();
+                self.palette_search_editor.update(ctx, |e, ctx| {
+                    e.set_buffer_text_with_base_buffer("", ctx);
+                });
                 ctx.notify();
+            }
+            ActionsPanelAction::EnterPaletteMode => {
+                self.panel_mode = PanelMode::Palette;
+                ctx.notify();
+            }
+            ActionsPanelAction::PinAction(id) => {
+                ctx.dispatch_typed_action(&WorkspaceAction::ToggleActionPin(*id));
+            }
+            ActionsPanelAction::PinTrigger(id) => {
+                ctx.dispatch_typed_action(&WorkspaceAction::ToggleTriggerPin(*id));
             }
             ActionsPanelAction::SaveForm => {
                 // Workspace name form uses its own editor; handle it first.
@@ -1770,10 +2308,32 @@ impl warpui::TypedActionView for ActionsPanelView {
                             .to_string();
                         let tab_name = if tab_name_raw.is_empty() { None } else { Some(tab_name_raw) };
 
+                        let group_raw = self
+                            .edit_group_editor
+                            .read(ctx, |e, ctx| e.buffer_text(ctx))
+                            .trim()
+                            .to_string();
+                        let group = if group_raw.is_empty() { None } else { Some(group_raw) };
+
+                        let hotkey_raw = self
+                            .edit_hotkey_editor
+                            .read(ctx, |e, ctx| e.buffer_text(ctx))
+                            .trim()
+                            .to_string();
+                        let hotkey = if hotkey_raw.is_empty() { None } else { Some(hotkey_raw) };
+
+                        let timeout_raw = self
+                            .edit_timeout_editor
+                            .read(ctx, |e, ctx| e.buffer_text(ctx))
+                            .trim()
+                            .to_string();
+                        let timeout_secs = timeout_raw.parse::<u64>().ok();
+
                         let config = WarpConfig::as_ref(ctx);
-                        let existing_source = maybe_id
-                            .and_then(|id| config.actions().iter().find(|a| a.id == id).cloned())
-                            .and_then(|a| a.source_path.clone());
+                        let existing = maybe_id
+                            .and_then(|id| config.actions().iter().find(|a| a.id == id).cloned());
+                        let existing_source = existing.as_ref().and_then(|a| a.source_path.clone());
+                        let existing_pinned = existing.as_ref().map(|a| a.pinned).unwrap_or(false);
                         drop(config);
 
                         // Delete old file if editing and name changed.
@@ -1786,6 +2346,10 @@ impl warpui::TypedActionView for ActionsPanelView {
                             name,
                             description,
                             tab_name,
+                            group,
+                            timeout_secs,
+                            hotkey,
+                            pinned: existing_pinned,
                             commands,
                             source_path: None,
                         };
@@ -1806,10 +2370,18 @@ impl warpui::TypedActionView for ActionsPanelView {
                     PanelMode::EditTrigger(maybe_id) => {
                         let selected = self.edit_selected_action_ids.iter().cloned().collect::<Vec<_>>();
 
+                        let hotkey_raw = self
+                            .edit_trigger_hotkey_editor
+                            .read(ctx, |e, ctx| e.buffer_text(ctx))
+                            .trim()
+                            .to_string();
+                        let hotkey = if hotkey_raw.is_empty() { None } else { Some(hotkey_raw) };
+
                         let config = WarpConfig::as_ref(ctx);
-                        let existing_source = maybe_id
-                            .and_then(|id| config.triggers().iter().find(|t| t.id == id).cloned())
-                            .and_then(|t| t.source_path.clone());
+                        let existing = maybe_id
+                            .and_then(|id| config.triggers().iter().find(|t| t.id == id).cloned());
+                        let existing_source = existing.as_ref().and_then(|t| t.source_path.clone());
+                        let existing_pinned = existing.as_ref().map(|t| t.pinned).unwrap_or(false);
                         drop(config);
 
                         if let Some(old_path) = existing_source.as_ref() {
@@ -1822,6 +2394,8 @@ impl warpui::TypedActionView for ActionsPanelView {
                             description,
                             action_ids: selected,
                             targets: Default::default(),
+                            hotkey,
+                            pinned: existing_pinned,
                             source_path: None,
                         };
                         let trigger_clone = new_trigger.clone();
@@ -1838,7 +2412,7 @@ impl warpui::TypedActionView for ActionsPanelView {
                             }
                         });
                     }
-                    PanelMode::List | PanelMode::EditWorkspaceName(_) => {}
+                    PanelMode::List | PanelMode::EditWorkspaceName(_) | PanelMode::Palette => {}
                 }
 
                 self.panel_mode = PanelMode::List;

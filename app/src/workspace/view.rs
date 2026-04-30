@@ -1429,7 +1429,7 @@ impl Workspace {
                         // Fall through the loop to consume the first command.
                     }
                 }
-                TriggerQueueItem::SendCommand(cmd) => {
+                TriggerQueueItem::SendCommand { cmd, timeout_secs } => {
                     if let Some(terminal) = self.trigger_active_terminal.clone() {
                         let terminal_id = terminal.id();
                         self.trigger_queue_waiting = true;
@@ -1439,10 +1439,12 @@ impl Workspace {
                         // Spawn a fallback timer.  If PendingCommandCompleted
                         // fires first, trigger_queue_waiting will be false and
                         // the timer callback will be a no-op.
+                        let effective_timeout =
+                            timeout_secs.unwrap_or(TRIGGER_COMMAND_TIMEOUT_SECS);
                         let _ = ctx.spawn(
                             async move {
                                 warpui::r#async::Timer::after(Duration::from_secs(
-                                    TRIGGER_COMMAND_TIMEOUT_SECS,
+                                    effective_timeout,
                                 ))
                                 .await;
                             },
@@ -20851,6 +20853,10 @@ impl TypedActionView for Workspace {
                     name,
                     description: None,
                     tab_name: None,
+                    group: None,
+                    timeout_secs: None,
+                    hotkey: None,
+                    pinned: false,
                     commands: vec![],
                     source_path: None,
                 };
@@ -20869,6 +20875,8 @@ impl TypedActionView for Workspace {
                     description: None,
                     action_ids: vec![],
                     targets: Default::default(),
+                    hotkey: None,
+                    pinned: false,
                     source_path: None,
                 };
                 if let Err(e) = storage::save_trigger(&trigger) {
@@ -20927,6 +20935,66 @@ impl TypedActionView for Workspace {
                     if let Some(path) = trigger.source_path.clone() {
                         self.add_tab_for_code_file(path, None, ctx);
                     }
+                }
+            }
+            ToggleActionPalette => {
+                // Open the Actions panel and switch it to palette (search) mode.
+                let pane_group_handle = self.active_tab_pane_group().clone();
+                pane_group_handle.update(ctx, |pane_group, ctx| {
+                    if !pane_group.actions_panel_open {
+                        pane_group.toggle_actions_panel(ctx);
+                    }
+                });
+                // Signal to the panel view to enter palette mode via dispatch.
+                ctx.dispatch_typed_action(&crate::actions::panel::ActionsPanelAction::EnterPaletteMode);
+            }
+            ToggleActionPin(action_id) => {
+                use crate::actions::storage;
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let actions = config.actions().to_vec();
+                drop(config);
+                if let Some(action) = actions.iter().find(|a| a.id == *action_id) {
+                    if crate::actions::model::is_builtin_action(action_id) {
+                        return;
+                    }
+                    if let Some(old_path) = action.source_path.as_ref() {
+                        let _ = std::fs::remove_file(old_path);
+                    }
+                    let mut updated = action.clone();
+                    updated.pinned = !updated.pinned;
+                    updated.source_path = None;
+                    if let Err(e) = storage::write_action(&updated) {
+                        log::error!("Failed to pin/unpin action: {e}");
+                        return;
+                    }
+                    let updated_clone = updated.clone();
+                    WarpConfig::handle(ctx).update(ctx, move |config, ctx| {
+                        config.update_action(updated_clone, ctx);
+                    });
+                }
+            }
+            ToggleTriggerPin(trigger_id) => {
+                use crate::actions::storage;
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let triggers = config.triggers().to_vec();
+                drop(config);
+                if let Some(trigger) = triggers.iter().find(|t| t.id == *trigger_id) {
+                    if let Some(old_path) = trigger.source_path.as_ref() {
+                        let _ = std::fs::remove_file(old_path);
+                    }
+                    let mut updated = trigger.clone();
+                    updated.pinned = !updated.pinned;
+                    updated.source_path = None;
+                    if let Err(e) = storage::write_trigger(&updated) {
+                        log::error!("Failed to pin/unpin trigger: {e}");
+                        return;
+                    }
+                    let updated_clone = updated.clone();
+                    WarpConfig::handle(ctx).update(ctx, move |config, ctx| {
+                        config.update_trigger(updated_clone, ctx);
+                    });
                 }
             }
             KillAndClearAllTerminals => {

@@ -24,6 +24,10 @@ pub fn builtin_actions() -> Vec<Action> {
             description: Some("Close every open terminal tab".to_string()),
             commands: vec![],
             tab_name: None,
+            group: None,
+            timeout_secs: None,
+            hotkey: None,
+            pinned: false,
             source_path: None,
         },
         Action {
@@ -32,6 +36,10 @@ pub fn builtin_actions() -> Vec<Action> {
             description: Some("Send SIGINT (Ctrl-C) to every running terminal process".to_string()),
             commands: vec![],
             tab_name: None,
+            group: None,
+            timeout_secs: None,
+            hotkey: None,
+            pinned: false,
             source_path: None,
         },
     ]
@@ -65,6 +73,22 @@ pub struct Action {
     /// When set, the new tab is renamed to this value immediately after it opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_name: Option<String>,
+    /// Optional folder/group name used to organise actions in the panel list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Maximum seconds to wait for each command to complete before advancing
+    /// to the next item in the trigger queue.  When `None` the global default
+    /// (5 s) is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// Optional keyboard shortcut label displayed next to the action name in
+    /// the panel (e.g. `"⌘⇧R"`).  Display-only — not used for key registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotkey: Option<String>,
+    /// When `true` the action appears in the Quick Launch strip at the top of
+    /// the Actions panel.
+    #[serde(default)]
+    pub pinned: bool,
     /// Absolute path of the TOML file this action was loaded from.
     /// Skipped during serialisation — it is set by the loader.
     #[serde(skip)]
@@ -106,6 +130,14 @@ pub struct Trigger {
     /// Which terminal panes this trigger targets.
     #[serde(default)]
     pub targets: TriggerTargets,
+    /// Optional keyboard shortcut label displayed next to the trigger name in
+    /// the panel (e.g. `"⌘⇧T"`).  Display-only — not used for key registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotkey: Option<String>,
+    /// When `true` the trigger appears in the Quick Launch strip at the top of
+    /// the Triggers panel.
+    #[serde(default)]
+    pub pinned: bool,
     /// Absolute path of the TOML file this trigger was loaded from.
     #[serde(skip)]
     pub source_path: Option<PathBuf>,

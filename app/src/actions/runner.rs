@@ -13,8 +13,8 @@ use super::model::{
 /// A single step in the sequential trigger execution queue.
 ///
 /// The workspace pops one item at a time, waiting for either
-/// `terminal::Event::PendingCommandCompleted` or a 5-second fallback timer
-/// before advancing to the next step.  This ensures:
+/// `terminal::Event::PendingCommandCompleted` or the fallback timer before
+/// advancing to the next step.  This ensures:
 ///
 /// - Commands within an action run one after the other.
 /// - The next action's tab is opened only after the last command of the
@@ -27,7 +27,13 @@ pub enum TriggerQueueItem {
         tab_name: Option<String>,
     },
     /// Send this command to the currently-active terminal target.
-    SendCommand(String),
+    SendCommand {
+        /// The shell command to execute.
+        cmd: String,
+        /// Max seconds to wait before advancing.  `None` means use the
+        /// global default (5 s).
+        timeout_secs: Option<u64>,
+    },
 }
 
 pub struct TriggerRunner;
@@ -65,7 +71,10 @@ impl TriggerRunner {
             });
             for cmd in &action.commands {
                 if !cmd.trim().is_empty() {
-                    queue.push_back(TriggerQueueItem::SendCommand(cmd.clone()));
+                    queue.push_back(TriggerQueueItem::SendCommand {
+                        cmd: cmd.clone(),
+                        timeout_secs: action.timeout_secs,
+                    });
                 }
             }
         }
