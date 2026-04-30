@@ -20403,13 +20403,18 @@ impl TypedActionView for Workspace {
                 let actions = config.actions().to_vec();
                 drop(config);
                 if let Some(action) = actions.iter().find(|a| a.id == *action_id) {
-                    if let Some(terminal_handle) = self
-                        .active_tab_pane_group()
-                        .read(ctx, |pg, app| pg.active_session_view(app))
-                    {
-                        for command in action.commands.clone() {
+                    if !action.commands.is_empty() {
+                        if let Some(terminal_handle) = self
+                            .active_tab_pane_group()
+                            .read(ctx, |pg, app| pg.active_session_view(app))
+                        {
+                            // Join commands with '\n'. The PTY layer converts '\n' to
+                            // '\r' (Enter) when bracketed-paste is off, and shells handle
+                            // each newline-separated line as a distinct command when
+                            // bracketed-paste is on.
+                            let combined = action.commands.join("\n");
                             terminal_handle.update(ctx, |terminal, term_ctx| {
-                                terminal.execute_command_or_set_pending(&command, term_ctx);
+                                terminal.execute_command_or_set_pending(&combined, term_ctx);
                             });
                         }
                     }
@@ -20430,10 +20435,17 @@ impl TypedActionView for Workspace {
                 }
             }
             CloseAllTerminals => {
-                // Close all tabs in reverse order; remove_tab handles the case where
-                // closing the last tab closes the window entirely.
-                let count = self.tab_count();
-                for i in (0..count).rev() {
+                // Open one fresh terminal tab first so the window always has at
+                // least one tab while we close the old ones (the UI requires ≥1
+                // tab to be present at all times).
+                let old_count = self.tab_count();
+                self.add_terminal_tab(true, ctx);
+
+                // Now close all of the original tabs (indices 0..old_count) in
+                // reverse order so indices stay stable.  remove_tab is safe here
+                // because the newly opened tab is always present.
+                self.cancel_tab_rename(ctx);
+                for i in (0..old_count).rev() {
                     self.remove_tab(i, false, true, ctx);
                 }
             }

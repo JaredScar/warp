@@ -21,7 +21,7 @@ use warpui::{
 
 use crate::appearance::Appearance;
 use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
-use crate::editor::{EditorOptions, EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
+use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
 use crate::pane_group::pane::view::header::{components::HEADER_EDGE_PADDING, PANE_HEADER_HEIGHT};
 use crate::ui_components::{
     blended_colors,
@@ -40,7 +40,6 @@ const FORM_PADDING: f32 = 14.;
 const FIELD_SPACING: f32 = 12.;
 const LABEL_SIZE: f32 = 11.;
 const FIELD_HEIGHT: f32 = 32.;
-const COMMANDS_HEIGHT: f32 = 120.;
 const BUTTON_FONT_SIZE: f32 = 13.;
 
 // ── Panel mode ────────────────────────────────────────────────────────────────
@@ -105,7 +104,12 @@ pub struct ActionsPanelView {
     panel_mode: PanelMode,
     edit_name_editor: ViewHandle<EditorView>,
     edit_desc_editor: ViewHandle<EditorView>,
-    edit_commands_editor: ViewHandle<EditorView>,
+    /// One single-line editor per command, each paired with a stable UUID for mouse-state keying.
+    edit_command_editors: Vec<(Uuid, ViewHandle<EditorView>)>,
+    /// Per-command delete-button mouse states, keyed by the command's stable UUID.
+    edit_command_remove_states: RefCell<HashMap<Uuid, MouseStateHandle>>,
+    /// Mouse state for the "+ Add Command" button.
+    add_command_state: MouseStateHandle,
     /// Single-line editor used for the workspace name form.
     edit_workspace_name_editor: ViewHandle<EditorView>,
     /// Ordered list of action IDs selected for the trigger being edited.
@@ -165,21 +169,6 @@ impl ActionsPanelView {
             }
         });
 
-        let multi_opts = EditorOptions {
-            autogrow: false,
-            soft_wrap: true,
-            text: TextOptions {
-                font_size_override: Some(font_size),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let edit_commands_editor =
-            ctx.add_typed_action_view(|ctx| EditorView::new(multi_opts, ctx));
-        edit_commands_editor.update(ctx, |editor, ctx| {
-            editor.set_placeholder_text("One command per line\ne.g. git status\n     npm install", ctx);
-        });
-
         let edit_workspace_name_editor =
             ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
         edit_workspace_name_editor.update(ctx, |editor, ctx| {
@@ -201,7 +190,9 @@ impl ActionsPanelView {
             panel_mode: PanelMode::List,
             edit_name_editor,
             edit_desc_editor,
-            edit_commands_editor,
+            edit_command_editors: Vec::new(),
+            edit_command_remove_states: Default::default(),
+            add_command_state: Default::default(),
             edit_workspace_name_editor,
             edit_selected_action_ids: Vec::new(),
             trigger_search_query: String::new(),
@@ -222,6 +213,25 @@ impl ActionsPanelView {
 
     // ── Form open/populate ────────────────────────────────────────────────
 
+    /// Create a fresh single-line command editor with placeholder text.
+    fn make_command_editor(
+        &self,
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<EditorView> {
+        let appearance = Appearance::as_ref(ctx);
+        let font_size = appearance.ui_font_size();
+        drop(appearance);
+        let opts = SingleLineEditorOptions {
+            text: TextOptions { font_size_override: Some(font_size), ..Default::default() },
+            ..Default::default()
+        };
+        let editor = ctx.add_typed_action_view(|ctx| EditorView::single_line(opts, ctx));
+        editor.update(ctx, |e, ctx| {
+            e.set_placeholder_text("e.g. npm install", ctx);
+        });
+        editor
+    }
+
     fn open_action_form(&mut self, action_id: Option<Uuid>, ctx: &mut ViewContext<Self>) {
         self.panel_mode = PanelMode::EditAction(action_id);
         let config = WarpConfig::as_ref(ctx);
@@ -229,10 +239,9 @@ impl ActionsPanelView {
         drop(config);
 
         let (name, desc, commands) = if let Some(a) = action {
-            let cmds = a.commands.join("\n");
-            (a.name.clone(), a.description.clone().unwrap_or_default(), cmds)
+            (a.name.clone(), a.description.clone().unwrap_or_default(), a.commands.clone())
         } else {
-            (String::new(), String::new(), String::new())
+            (String::new(), String::new(), vec![String::new()])
         };
 
         self.edit_name_editor.update(ctx, |e, ctx| {
@@ -241,9 +250,19 @@ impl ActionsPanelView {
         self.edit_desc_editor.update(ctx, |e, ctx| {
             e.set_buffer_text_with_base_buffer(&desc, ctx);
         });
-        self.edit_commands_editor.update(ctx, |e, ctx| {
-            e.set_buffer_text_with_base_buffer(&commands, ctx);
-        });
+
+        // Build one editor per command (at least one empty row for new actions).
+        self.edit_command_editors.clear();
+        self.edit_command_remove_states.borrow_mut().clear();
+        let cmds = if commands.is_empty() { vec![String::new()] } else { commands };
+        for cmd_text in cmds {
+            let row_id = Uuid::new_v4();
+            let editor = self.make_command_editor(ctx);
+            editor.update(ctx, |e, ctx| {
+                e.set_buffer_text_with_base_buffer(&cmd_text, ctx);
+            });
+            self.edit_command_editors.push((row_id, editor));
+        }
         ctx.notify();
     }
 
@@ -1109,7 +1128,20 @@ impl ActionsPanelView {
         .finish()
     }
 
+    fn render_command_remove_state(&self, row_id: Uuid) -> MouseStateHandle {
+        self.edit_command_remove_states
+            .borrow_mut()
+            .entry(row_id)
+            .or_insert_with(MouseStateHandle::default)
+            .clone()
+    }
+
     fn render_action_editor(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+        let sub_fill = theme.sub_text_color(theme.background());
+        let sub_color = sub_fill.into_solid();
+
         let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
 
         col = col.with_child(self.render_field_label("NAME", appearance));
@@ -1118,8 +1150,78 @@ impl ActionsPanelView {
         col = col.with_child(self.render_field_label("DESCRIPTION", appearance));
         col = col.with_child(self.render_text_field(&self.edit_desc_editor, Some(FIELD_HEIGHT), appearance));
 
-        col = col.with_child(self.render_field_label("COMMANDS  (one per line)", appearance));
-        col = col.with_child(self.render_text_field(&self.edit_commands_editor, Some(COMMANDS_HEIGHT), appearance));
+        // ── Commands list ─────────────────────────────────────────────────
+        col = col.with_child(self.render_field_label("COMMANDS", appearance));
+
+        let total = self.edit_command_editors.len();
+        for (pos, (row_id, editor_handle)) in self.edit_command_editors.iter().enumerate() {
+            let row_id = *row_id;
+            let remove_state = self.render_command_remove_state(row_id);
+
+            // Numbered index label
+            let index_label = ConstrainedBox::new(
+                Text::new(format!("{}", pos + 1), font, 11.)
+                    .with_color(sub_color)
+                    .finish(),
+            )
+            .with_width(16.)
+            .finish();
+
+            // Single-line text field for the command
+            let input = self.render_text_field(editor_handle, Some(FIELD_HEIGHT), appearance);
+
+            // Delete button (hidden when only one row remains)
+            let delete_btn: Box<dyn Element> = if total > 1 {
+                icon_button_with_color(appearance, Icon::X, false, remove_state, sub_fill)
+                    .build()
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(ActionsPanelAction::RemoveCommandRow(row_id));
+                    })
+                    .with_cursor(Cursor::PointingHand)
+                    .finish()
+            } else {
+                // Invisible spacer to keep alignment consistent
+                ConstrainedBox::new(Container::new(Flex::row().finish()).finish())
+                    .with_width(22.)
+                    .finish()
+            };
+
+            let row = Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(4.)
+                    .with_child(index_label)
+                    .with_child(Shrinkable::new(1.0, input).finish())
+                    .with_child(delete_btn)
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .finish(),
+            )
+            .with_margin_bottom(4.)
+            .finish();
+
+            col = col.with_child(row);
+        }
+
+        // "+ Add Command" button
+        let add_btn = appearance
+            .ui_builder()
+            .button(ButtonVariant::Secondary, self.add_command_state.clone())
+            .with_style(UiComponentStyles {
+                font_size: Some(12.),
+                padding: Some(Coords { top: 5., bottom: 5., left: 10., right: 10. }),
+                ..Default::default()
+            })
+            .with_text_label("+ Add Command".to_string())
+            .build()
+            .on_click(|ctx, _, _| ctx.dispatch_typed_action(ActionsPanelAction::AddCommandRow))
+            .with_cursor(Cursor::PointingHand)
+            .finish();
+
+        col = col.with_child(
+            Container::new(add_btn)
+                .with_margin_bottom(FIELD_SPACING)
+                .finish(),
+        );
 
         col = col.with_child(self.render_form_buttons(appearance));
 
@@ -1399,6 +1501,10 @@ pub enum ActionsPanelAction {
     MoveActionUp(Uuid),
     MoveActionDown(Uuid),
     RemoveActionFromTrigger(Uuid),
+    /// Append a new empty command row to the action editor.
+    AddCommandRow,
+    /// Remove the command row with the given stable UUID.
+    RemoveCommandRow(Uuid),
     SaveForm,
     CancelForm,
 }
@@ -1569,6 +1675,20 @@ impl warpui::TypedActionView for ActionsPanelView {
             }
 
             // ── Save / Cancel form ─────────────────────────────────────────
+            ActionsPanelAction::AddCommandRow => {
+                let row_id = Uuid::new_v4();
+                let editor = self.make_command_editor(ctx);
+                self.edit_command_editors.push((row_id, editor));
+                ctx.notify();
+            }
+            ActionsPanelAction::RemoveCommandRow(row_id) => {
+                // Always keep at least one row so the form is never empty.
+                if self.edit_command_editors.len() > 1 {
+                    self.edit_command_editors.retain(|(id, _)| id != row_id);
+                    self.edit_command_remove_states.borrow_mut().remove(row_id);
+                    ctx.notify();
+                }
+            }
             ActionsPanelAction::CancelForm => {
                 self.panel_mode = PanelMode::List;
                 ctx.notify();
@@ -1616,13 +1736,12 @@ impl warpui::TypedActionView for ActionsPanelView {
 
                 match self.panel_mode.clone() {
                     PanelMode::EditAction(maybe_id) => {
-                        let commands_text = self
-                            .edit_commands_editor
-                            .read(ctx, |e, ctx| e.buffer_text(ctx));
-                        let commands: Vec<String> = commands_text
-                            .lines()
-                            .map(|l| l.trim().to_string())
-                            .filter(|l| !l.is_empty())
+                        // Collect non-empty commands from the per-row editors.
+                        let commands: Vec<String> = self
+                            .edit_command_editors
+                            .iter()
+                            .map(|(_, handle)| handle.read(ctx, |e, ctx| e.buffer_text(ctx)).trim().to_string())
+                            .filter(|s| !s.is_empty())
                             .collect();
 
                         let config = WarpConfig::as_ref(ctx);
