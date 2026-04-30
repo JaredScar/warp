@@ -20394,6 +20394,7 @@ impl TypedActionView for Workspace {
             SaveCurrentWorkspace => {
                 use crate::actions::model::{SavedWorkspace, WorkspaceSnapshot};
                 use crate::actions::storage;
+                use crate::user_config::WarpConfig;
                 let window_id = ctx.window_id();
                 let quake_mode =
                     quake_mode_window_id().map(|id| id == window_id).unwrap_or(false);
@@ -20409,8 +20410,15 @@ impl TypedActionView for Workspace {
                     snapshot: ws_snapshot,
                     source_path: None,
                 };
-                if let Err(e) = storage::save_workspace(&saved) {
-                    log::error!("Failed to save workspace: {e}");
+                match storage::save_workspace(&saved) {
+                    Ok(_) => {
+                        WarpConfig::handle(ctx).update(ctx, |config, ctx| {
+                            config.add_saved_workspace(saved, ctx);
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("Failed to save workspace: {e}");
+                    }
                 }
             }
             RestoreWorkspace(workspace_id) => {

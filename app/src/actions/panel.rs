@@ -86,7 +86,6 @@ pub struct ActionsPanelView {
     // ── layout ──
     resizable_state_handle: ResizableStateHandle,
     // ── header ──
-    close_button_mouse_state: MouseStateHandle,
     actions_tab_mouse_state: MouseStateHandle,
     triggers_tab_mouse_state: MouseStateHandle,
     workspaces_tab_mouse_state: MouseStateHandle,
@@ -178,7 +177,6 @@ impl ActionsPanelView {
 
         Self {
             resizable_state_handle: resizable_state_handle(360.0),
-            close_button_mouse_state: Default::default(),
             actions_tab_mouse_state: Default::default(),
             triggers_tab_mouse_state: Default::default(),
             workspaces_tab_mouse_state: Default::default(),
@@ -312,31 +310,6 @@ impl ActionsPanelView {
     // ── Header ────────────────────────────────────────────────────────────
 
     fn render_header(&self, appearance: &Appearance) -> Box<dyn Element> {
-        let icon_color = appearance
-            .theme()
-            .sub_text_color(appearance.theme().background());
-
-        let close_button = {
-            let ui_builder = appearance.ui_builder().clone();
-            let tooltip = ui_builder
-                .tool_tip("Close panel".to_string())
-                .build()
-                .finish();
-            icon_button_with_color(
-                appearance,
-                icons::Icon::X,
-                false,
-                self.close_button_mouse_state.clone(),
-                icon_color,
-            )
-            .with_tooltip(move || tooltip)
-            .build()
-            .on_click(move |ctx, _, _| {
-                ctx.dispatch_typed_action(ActionsPanelAction::ClosePanel);
-            })
-            .finish()
-        };
-
         // In editing mode show a back arrow + form title instead of tabs.
         let left_side: Box<dyn Element> = match &self.panel_mode {
             PanelMode::List => {
@@ -379,17 +352,9 @@ impl ActionsPanelView {
         };
 
         Container::new(
-            ConstrainedBox::new(
-                Flex::row()
-                    .with_main_axis_size(MainAxisSize::Max)
-                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_child(left_side)
-                    .with_child(close_button)
-                    .finish(),
-            )
-            .with_height(PANE_HEADER_HEIGHT)
-            .finish(),
+            ConstrainedBox::new(left_side)
+                .with_height(PANE_HEADER_HEIGHT)
+                .finish(),
         )
         .with_padding_left(10.)
         .with_padding_right(HEADER_EDGE_PADDING)

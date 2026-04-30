@@ -182,6 +182,12 @@ impl WarpConfig {
         ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
     }
 
+    /// Add a new workspace to the in-memory list and emit an update event.
+    pub fn add_saved_workspace(&mut self, workspace: SavedWorkspace, ctx: &mut ModelContext<Self>) {
+        self.saved_workspaces.push(workspace);
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
     /// Remove a saved workspace from the in-memory list by ID and emit an update event.
     pub fn remove_saved_workspace(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
         self.saved_workspaces.retain(|w| w.id != id);
