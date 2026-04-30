@@ -277,6 +277,10 @@ pub enum WorkspaceAction {
     RunTrigger(Uuid),
     /// Snapshot the current window layout and prompt for a name to save it.
     SaveCurrentWorkspace,
+    /// Snapshot the current window layout and save it with the given name.
+    SaveCurrentWorkspaceWithName(String),
+    /// Rename a saved workspace by ID to a new name.
+    RenameWorkspace(Uuid, String),
     /// Restore a previously saved workspace by ID.
     RestoreWorkspace(Uuid),
     /// Delete a previously saved workspace by ID.
@@ -868,6 +872,8 @@ impl WorkspaceAction {
             | RunActionInActiveTerminal(_)
             | RunTrigger(_)
             | SaveCurrentWorkspace
+            | SaveCurrentWorkspaceWithName(_)
+            | RenameWorkspace(_, _)
             | RestoreWorkspace(_)
             | DeleteWorkspace(_)
             | NewAction

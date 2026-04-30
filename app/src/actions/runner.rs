@@ -91,11 +91,18 @@ impl TriggerRunner {
         group: &mut PaneGroup,
         ctx: &mut ViewContext<PaneGroup>,
     ) {
+        if action.commands.is_empty() {
+            return;
+        }
+        // Join all commands with newlines so they are sent as a single multi-line
+        // input rather than appended one-by-one to the live input buffer.  Shells
+        // with bracketed paste preserve the '\n' separators and execute each line
+        // in sequence; shells without bracketed paste receive '\r'-separated lines
+        // which are each executed as individual commands.
+        let combined = action.commands.join("\n");
         for terminal_handle in group.terminal_views(ctx) {
             terminal_handle.update(ctx, |terminal, term_ctx| {
-                for command in &action.commands {
-                    terminal.execute_command_or_set_pending(command, term_ctx);
-                }
+                terminal.execute_command_or_set_pending(&combined, term_ctx);
             });
         }
     }

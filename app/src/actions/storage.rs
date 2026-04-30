@@ -67,6 +67,24 @@ pub fn save_workspace(workspace: &SavedWorkspace) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Overwrite an existing workspace file (or create a new one keyed by UUID).
+///
+/// Use this when renaming or updating an existing workspace: delete the old
+/// file first if the name changed, then call `write_workspace`.
+pub fn write_workspace(workspace: &SavedWorkspace) -> Result<PathBuf> {
+    let path = workspace
+        .source_path
+        .clone()
+        .unwrap_or_else(|| workspaces_dir().join(format!("{}.toml", workspace.id)));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let toml = toml::to_string_pretty(workspace)?;
+    std::fs::write(&path, toml.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to write workspace '{}': {e}", path.display()))?;
+    Ok(path)
+}
+
 /// Overwrite an existing action file (or create a new one keyed by UUID).
 ///
 /// Use this when editing an existing action: delete the old file first if the

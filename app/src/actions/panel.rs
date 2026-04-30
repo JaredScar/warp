@@ -52,6 +52,8 @@ enum PanelMode {
     EditAction(Option<Uuid>),
     /// Editing a trigger.  `None` means a brand-new trigger; `Some(id)` means editing existing.
     EditTrigger(Option<Uuid>),
+    /// Naming/renaming a workspace.  `None` = new workspace; `Some(id)` = rename existing.
+    EditWorkspaceName(Option<Uuid>),
 }
 
 // ── Per-row stable mouse state ─────────────────────────────────────────────
@@ -103,6 +105,8 @@ pub struct ActionsPanelView {
     edit_name_editor: ViewHandle<EditorView>,
     edit_desc_editor: ViewHandle<EditorView>,
     edit_commands_editor: ViewHandle<EditorView>,
+    /// Single-line editor used for the workspace name form.
+    edit_workspace_name_editor: ViewHandle<EditorView>,
     /// Ordered list of action IDs selected for the trigger being edited.
     edit_selected_action_ids: Vec<Uuid>,
     /// Search query typed in the trigger action picker.
@@ -138,7 +142,7 @@ impl ActionsPanelView {
         let edit_desc_editor =
             ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
         let trigger_search_editor =
-            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts, ctx));
+            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
 
         edit_name_editor.update(ctx, |editor, ctx| {
             editor.set_placeholder_text("Name (required)", ctx);
@@ -175,6 +179,12 @@ impl ActionsPanelView {
             editor.set_placeholder_text("One command per line\ne.g. git status\n     npm install", ctx);
         });
 
+        let edit_workspace_name_editor =
+            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
+        edit_workspace_name_editor.update(ctx, |editor, ctx| {
+            editor.set_placeholder_text("Workspace name (required)", ctx);
+        });
+
         Self {
             resizable_state_handle: resizable_state_handle(360.0),
             actions_tab_mouse_state: Default::default(),
@@ -191,6 +201,7 @@ impl ActionsPanelView {
             edit_name_editor,
             edit_desc_editor,
             edit_commands_editor,
+            edit_workspace_name_editor,
             edit_selected_action_ids: Vec::new(),
             trigger_search_query: String::new(),
             trigger_search_editor,
@@ -267,6 +278,19 @@ impl ActionsPanelView {
         ctx.notify();
     }
 
+    fn open_workspace_name_form(&mut self, workspace_id: Option<Uuid>, ctx: &mut ViewContext<Self>) {
+        self.panel_mode = PanelMode::EditWorkspaceName(workspace_id);
+        let existing_name = workspace_id.and_then(|id| {
+            let config = WarpConfig::as_ref(ctx);
+            config.saved_workspaces().iter().find(|w| w.id == id).map(|w| w.name.clone())
+        });
+        let name = existing_name.unwrap_or_default();
+        self.edit_workspace_name_editor.update(ctx, |e, ctx| {
+            e.set_buffer_text_with_base_buffer(&name, ctx);
+        });
+        ctx.notify();
+    }
+
     // ── Per-row mouse state helpers ────────────────────────────────────────
 
     fn action_states(&self, id: Uuid) -> (MouseStateHandle, MouseStateHandle, MouseStateHandle) {
@@ -281,10 +305,10 @@ impl ActionsPanelView {
         (s.primary.clone(), s.secondary.clone(), s.delete.clone())
     }
 
-    fn workspace_states(&self, id: Uuid) -> (MouseStateHandle, MouseStateHandle) {
+    fn workspace_states(&self, id: Uuid) -> (MouseStateHandle, MouseStateHandle, MouseStateHandle) {
         let mut map = self.workspace_row_states.borrow_mut();
         let s = map.entry(id).or_insert_with(RowMouseStates::default);
-        (s.primary.clone(), s.delete.clone())
+        (s.primary.clone(), s.secondary.clone(), s.delete.clone())
     }
 
     fn action_toggle_state(&self, id: Uuid) -> MouseStateHandle {
@@ -338,6 +362,19 @@ impl ActionsPanelView {
             }
             PanelMode::EditTrigger(id) => {
                 let title = if id.is_some() { "Edit Trigger" } else { "New Trigger" };
+                Shrinkable::new(
+                    1.0,
+                    Text::new(title, appearance.ui_font_family(), 13.)
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .with_color(
+                            appearance.theme().main_text_color(appearance.theme().background()).into_solid(),
+                        )
+                        .finish(),
+                )
+                .finish()
+            }
+            PanelMode::EditWorkspaceName(id) => {
+                let title = if id.is_some() { "Rename Workspace" } else { "Save Workspace" };
                 Shrinkable::new(
                     1.0,
                     Text::new(title, appearance.ui_font_family(), 13.)
@@ -907,7 +944,7 @@ impl ActionsPanelView {
         .finish();
 
         let workspace_id = workspace.id;
-        let (restore_state, delete_state) = self.workspace_states(workspace_id);
+        let (restore_state, rename_state, delete_state) = self.workspace_states(workspace_id);
 
         let restore_button = {
             let ui_builder = appearance.ui_builder().clone();
@@ -917,6 +954,19 @@ impl ActionsPanelView {
                 .build()
                 .on_click(move |ctx, _, _| {
                     ctx.dispatch_typed_action(ActionsPanelAction::RestoreWorkspace(workspace_id));
+                })
+                .finish()
+        };
+
+        let rename_button = {
+            let ui_builder = appearance.ui_builder().clone();
+            let tooltip = ui_builder.tool_tip("Rename workspace".to_string()).build().finish();
+            let icon_color = theme.sub_text_color(theme.background());
+            icon_button_with_color(appearance, Icon::Edit, false, rename_state, icon_color)
+                .with_tooltip(move || tooltip)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::RenameWorkspace(workspace_id));
                 })
                 .finish()
         };
@@ -938,6 +988,7 @@ impl ActionsPanelView {
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(2.0)
             .with_child(restore_button)
+            .with_child(rename_button)
             .with_child(delete_button)
             .with_main_axis_size(MainAxisSize::Min)
             .finish();
@@ -1066,6 +1117,21 @@ impl ActionsPanelView {
 
         col = col.with_child(self.render_form_buttons(appearance));
 
+        Container::new(col.finish())
+            .with_padding_left(FORM_PADDING)
+            .with_padding_right(FORM_PADDING)
+            .with_padding_top(FORM_PADDING)
+            .with_padding_bottom(FORM_PADDING)
+            .finish()
+    }
+
+    fn render_workspace_name_editor(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
+        col = col.with_child(self.render_field_label("NAME", appearance));
+        col = col.with_child(
+            self.render_text_field(&self.edit_workspace_name_editor, Some(FIELD_HEIGHT), appearance),
+        );
+        col = col.with_child(self.render_form_buttons(appearance));
         Container::new(col.finish())
             .with_padding_left(FORM_PADDING)
             .with_padding_right(FORM_PADDING)
@@ -1314,6 +1380,7 @@ pub enum ActionsPanelAction {
     RunAction(Uuid),
     RunTrigger(Uuid),
     SaveWorkspace,
+    RenameWorkspace(Uuid),
     RestoreWorkspace(Uuid),
     DeleteWorkspace(Uuid),
     NewAction,
@@ -1362,6 +1429,7 @@ impl View for ActionsPanelView {
             },
             PanelMode::EditAction(_) => self.render_action_editor(appearance),
             PanelMode::EditTrigger(_) => self.render_trigger_editor(&actions, appearance),
+            PanelMode::EditWorkspaceName(_) => self.render_workspace_name_editor(appearance),
         };
 
         let panel_content = Container::new(
@@ -1413,7 +1481,11 @@ impl warpui::TypedActionView for ActionsPanelView {
 
             // ── Workspaces ─────────────────────────────────────────────────
             ActionsPanelAction::SaveWorkspace => {
-                ctx.dispatch_typed_action(&WorkspaceAction::SaveCurrentWorkspace);
+                self.active_tab = ActionsPanelTab::Workspaces;
+                self.open_workspace_name_form(None, ctx);
+            }
+            ActionsPanelAction::RenameWorkspace(id) => {
+                self.open_workspace_name_form(Some(*id), ctx);
             }
             ActionsPanelAction::RestoreWorkspace(id) => {
                 ctx.dispatch_typed_action(&WorkspaceAction::RestoreWorkspace(*id));
@@ -1487,6 +1559,31 @@ impl warpui::TypedActionView for ActionsPanelView {
                 ctx.notify();
             }
             ActionsPanelAction::SaveForm => {
+                // Workspace name form uses its own editor; handle it first.
+                if let PanelMode::EditWorkspaceName(maybe_id) = self.panel_mode.clone() {
+                    let ws_name = self
+                        .edit_workspace_name_editor
+                        .read(ctx, |e, ctx| e.buffer_text(ctx))
+                        .trim()
+                        .to_string();
+                    if ws_name.is_empty() {
+                        return;
+                    }
+                    match maybe_id {
+                        None => {
+                            ctx.dispatch_typed_action(&WorkspaceAction::SaveCurrentWorkspaceWithName(
+                                ws_name,
+                            ));
+                        }
+                        Some(id) => {
+                            ctx.dispatch_typed_action(&WorkspaceAction::RenameWorkspace(id, ws_name));
+                        }
+                    }
+                    self.panel_mode = PanelMode::List;
+                    ctx.notify();
+                    return;
+                }
+
                 let name = self
                     .edit_name_editor
                     .read(ctx, |e, ctx| e.buffer_text(ctx))
@@ -1580,7 +1677,7 @@ impl warpui::TypedActionView for ActionsPanelView {
                             }
                         });
                     }
-                    PanelMode::List => {}
+                    PanelMode::List | PanelMode::EditWorkspaceName(_) => {}
                 }
 
                 self.panel_mode = PanelMode::List;

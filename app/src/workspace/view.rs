@@ -20430,6 +20430,11 @@ impl TypedActionView for Workspace {
                 }
             }
             SaveCurrentWorkspace => {
+                // Handled by the panel: dispatches SaveCurrentWorkspaceWithName after
+                // prompting the user for a name.  This variant is kept as a no-op here
+                // so that any direct callers still compile.
+            }
+            SaveCurrentWorkspaceWithName(name) => {
                 use crate::actions::model::{SavedWorkspace, WorkspaceSnapshot};
                 use crate::actions::storage;
                 use crate::user_config::WarpConfig;
@@ -20438,13 +20443,9 @@ impl TypedActionView for Workspace {
                     quake_mode_window_id().map(|id| id == window_id).unwrap_or(false);
                 let window_snapshot = self.snapshot(window_id, quake_mode, ctx);
                 let ws_snapshot = WorkspaceSnapshot::from_window_snapshot(&window_snapshot);
-                let name = format!(
-                    "Workspace {}",
-                    chrono::Local::now().format("%Y-%m-%d %H:%M")
-                );
                 let saved = SavedWorkspace {
                     id: uuid::Uuid::new_v4(),
-                    name,
+                    name: name.clone(),
                     snapshot: ws_snapshot,
                     source_path: None,
                 };
@@ -20455,7 +20456,35 @@ impl TypedActionView for Workspace {
                         });
                     }
                     Err(e) => {
-                        log::error!("Failed to save workspace: {e}");
+                        log::error!("Failed to save workspace '{}': {e}", name);
+                    }
+                }
+            }
+            RenameWorkspace(workspace_id, new_name) => {
+                use crate::actions::storage;
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let workspaces = config.saved_workspaces().to_vec();
+                drop(config);
+                if let Some(ws) = workspaces.iter().find(|w| w.id == *workspace_id) {
+                    // Delete the old file, then write with the new name.
+                    if let Some(old_path) = ws.source_path.as_ref() {
+                        let _ = std::fs::remove_file(old_path);
+                    }
+                    let mut updated = ws.clone();
+                    updated.name = new_name.clone();
+                    updated.source_path = None;
+                    match storage::write_workspace(&updated) {
+                        Ok(path) => {
+                            updated.source_path = Some(path);
+                            let updated_clone = updated.clone();
+                            WarpConfig::handle(ctx).update(ctx, move |config, ctx| {
+                                config.update_saved_workspace(updated_clone, ctx);
+                            });
+                        }
+                        Err(e) => {
+                            log::error!("Failed to rename workspace: {e}");
+                        }
                     }
                 }
             }
