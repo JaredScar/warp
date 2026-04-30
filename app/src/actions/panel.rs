@@ -1528,44 +1528,133 @@ impl ActionsPanelView {
             self.hotkey_field_state.clone()
         };
 
-        let recording_bg = pathfinder_color::ColorU::new(255, 140, 0, 40);
-        let normal_bg = pathfinder_color::ColorU::new(255, 255, 255, 10);
+        let recording_fill = warpui::elements::Fill::Solid(pathfinder_color::ColorU::new(255, 140, 0, 40));
+        let normal_fill = warpui::elements::Fill::Solid(pathfinder_color::ColorU::new(255, 255, 255, 10));
+        let badge_fill = warpui::elements::Fill::Solid(pathfinder_color::ColorU::new(255, 255, 255, 28));
         let border_radius = CornerRadius::with_all(Radius::Pixels(4.));
+        let sub_color = theme.sub_text_color(theme.background()).into_solid();
+        let main_color = theme.main_text_color(theme.background()).into_solid();
 
         let inner: Box<dyn Element> = if recording {
-            // Recording mode: show instructions; key capture handled by the EventHandler in render()
-            let text_color = theme.sub_text_color(theme.background()).into_solid();
-            let content = Container::new(
-                Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_child(
-                        Text::new(
-                            "⌨  Press a key combination… (Esc to cancel)".to_string(),
-                            font,
-                            12.,
-                        )
-                        .with_color(text_color)
-                        .finish(),
-                    )
+            // Recording mode: amber background + "✕ Cancel" button
+            let cancel_action = if is_trigger {
+                ActionsPanelAction::StopTriggerHotkeyRecording
+            } else {
+                ActionsPanelAction::StopHotkeyRecording
+            };
+            let recording_indicator = Container::new(
+                Text::new("⌨  Recording… press a key combo".to_string(), font, 12.)
+                    .with_color(sub_color)
                     .finish(),
             )
-            .with_background(recording_bg)
+            .with_background(recording_fill)
             .with_corner_radius(border_radius)
             .with_padding_left(10.)
             .with_padding_right(10.)
             .finish();
-            ConstrainedBox::new(content).with_height(FIELD_HEIGHT).finish()
+
+            let cancel_label = Container::new(
+                Text::new("✕ Cancel".to_string(), font, 11.)
+                    .with_color(sub_color)
+                    .finish(),
+            )
+            .with_padding_left(8.)
+            .with_padding_right(8.)
+            .finish();
+            let cancel_btn = EventHandler::new(cancel_label)
+                .on_left_mouse_down(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(cancel_action.clone());
+                    DispatchEventResult::StopPropagation
+                })
+                .finish();
+
+            let row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_spacing(6.)
+                .with_child(ConstrainedBox::new(recording_indicator).with_height(FIELD_HEIGHT).finish())
+                .with_child(cancel_btn)
+                .finish();
+            row
+        } else if !value.is_empty() {
+            // Has a recorded value: render each key segment as a badge + clear button
+            let segments: Vec<String> = value
+                .split('+')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let start_action = if is_trigger {
+                ActionsPanelAction::StartTriggerHotkeyRecording
+            } else {
+                ActionsPanelAction::StartHotkeyRecording
+            };
+            let clear_action = if is_trigger {
+                ActionsPanelAction::ClearTriggerHotkey
+            } else {
+                ActionsPanelAction::ClearHotkey
+            };
+
+            let mut badges_row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_spacing(3.);
+            for seg in segments {
+                let badge = Container::new(
+                    Text::new(seg, font, 11.)
+                        .with_color(main_color)
+                        .finish(),
+                )
+                .with_padding_left(6.)
+                .with_padding_right(6.)
+                .with_padding_top(3.)
+                .with_padding_bottom(3.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.)))
+                .with_background(badge_fill.clone())
+                .finish();
+                badges_row = badges_row.with_child(badge);
+            }
+            let badges_el: Box<dyn Element> = badges_row.finish();
+
+            // Clicking the badge row re-enters recording
+            let clickable_badges = EventHandler::new(badges_el)
+                .on_left_mouse_down(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(start_action.clone());
+                    DispatchEventResult::StopPropagation
+                })
+                .finish();
+
+            // Clear (✕) button
+            let clear_el = Container::new(
+                Text::new("✕".to_string(), font, 12.)
+                    .with_color(sub_color)
+                    .finish(),
+            )
+            .with_padding_left(6.)
+            .with_padding_right(4.)
+            .finish();
+            let clear_btn = EventHandler::new(clear_el)
+                .on_left_mouse_down(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(clear_action.clone());
+                    DispatchEventResult::StopPropagation
+                })
+                .finish();
+
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_spacing(4.)
+                .with_child(clickable_badges)
+                .with_child(clear_btn)
+                .finish()
         } else {
-            // Normal mode: display value or placeholder; clicking enters recording mode
-            let is_empty = value.is_empty();
-            let display = if is_empty { "Click to record shortcut…".to_string() } else { value.clone() };
-            let sub_color = theme.sub_text_color(theme.background()).into_solid();
-            let main_color = theme.main_text_color(theme.background()).into_solid();
+            // Empty state: placeholder that enters recording on click
             Hoverable::new(field_state, move |_| {
-                let text_color = if is_empty { sub_color } else { main_color };
-                let text_el = Text::new(display.clone(), font, 12.).with_color(text_color).finish();
+                let text_el = Text::new("Click to record shortcut…".to_string(), font, 12.)
+                    .with_color(sub_color)
+                    .finish();
                 let content = Container::new(text_el)
-                    .with_background(normal_bg)
+                    .with_background(normal_fill.clone())
                     .with_corner_radius(border_radius)
                     .with_padding_left(10.)
                     .with_padding_right(10.)

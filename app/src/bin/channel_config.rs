@@ -41,8 +41,24 @@ macro_rules! load_config {
 }
 pub use load_config;
 
+/// Returns a default [`ChannelConfig`] suitable for the OSS build when the
+/// external config generator binary is unavailable.
+fn default_oss_config() -> ChannelConfig {
+    use warp_core::channel::{OzConfig, WarpServerConfig};
+    ChannelConfig {
+        app_id: warp_core::AppId::new("dev", "warp", "WarpOss"),
+        logfile_name: "warp.log".into(),
+        server_config: WarpServerConfig::production(),
+        oz_config: OzConfig::production(),
+        telemetry_config: None,
+        autoupdate_config: None,
+        crash_reporting_config: None,
+        mcp_static_config: None,
+    }
+}
+
 /// Invokes the config generator binary at runtime and deserializes its JSON output into a
-/// [`ChannelConfig`].
+/// [`ChannelConfig`].  Falls back to a hardcoded OSS default if the binary is not found.
 #[cfg_attr(feature = "release_bundle", expect(dead_code))]
 pub fn load_config_from_generator(channel: &str) -> ChannelConfig {
     let target_family = if cfg!(target_family = "wasm") {
@@ -59,35 +75,42 @@ pub fn load_config_from_generator(channel: &str) -> ChannelConfig {
         "linux"
     };
 
-    let output = command::blocking::Command::new(CONFIG_BIN_NAME)
+    let result = command::blocking::Command::new(CONFIG_BIN_NAME)
         .arg("--channel")
         .arg(channel)
         .arg("--target-family")
         .arg(target_family)
         .arg("--target-os")
         .arg(target_os)
-        .output()
-        .unwrap_or_else(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                panic!(
-                    "\n\n'{CONFIG_BIN_NAME}' was not found on PATH.\n\n\
-                     To build internal channels, run:\n\
-                     \n\
-                     \x20 ./script/install_channel_config\n\n"
-                )
-            }
-            panic!("Failed to execute '{CONFIG_BIN_NAME}': {err}")
-        });
+        .output();
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!("Config generator failed for channel '{channel}':\n{stderr}");
+    match result {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            log::warn!(
+                "'{CONFIG_BIN_NAME}' not found on PATH — using built-in OSS defaults. \
+                 Run ./script/install_channel_config for full channel configuration."
+            );
+            default_oss_config()
+        }
+        Err(err) => {
+            log::error!("Failed to execute '{CONFIG_BIN_NAME}': {err} — falling back to OSS defaults.");
+            default_oss_config()
+        }
+        Ok(output) if !output.status.success() => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::error!("Config generator failed for channel '{channel}':\n{stderr} — falling back to OSS defaults.");
+            default_oss_config()
+        }
+        Ok(output) => {
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                log::error!(
+                    "Failed to parse config generator output for channel '{channel}': {err}\nOutput:\n{stdout} — falling back to OSS defaults."
+                );
+                default_oss_config()
+            })
+        }
     }
-
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        panic!("Failed to parse config generator output for channel '{channel}': {err}\nOutput:\n{stdout}")
-    })
 }
 
 /// Deserializes a [`ChannelConfig`] from a JSON string embedded at compile time.
