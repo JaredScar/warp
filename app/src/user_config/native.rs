@@ -3,11 +3,14 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 
+use walkdir::DirEntry;
+
 use anyhow::{anyhow, Result};
 use itertools::Itertools;
 use repo_metadata::RepositoryUpdate;
 use warpui::{ModelContext, SingletonEntity};
 
+use crate::actions::model::{Action, SavedWorkspace, Trigger};
 use crate::features::FeatureFlag;
 use crate::launch_configs::launch_config::LaunchConfig;
 use crate::tab_configs::{TabConfig, TabConfigError};
@@ -23,8 +26,8 @@ use super::util::{
     parse_multi_workflow_dir_entry, parse_single_theme_dir_entry, parse_tab_config_dir_entry,
 };
 use super::{
-    launch_configs_dir, tab_configs_dir, themes_dir, workflows_dir, WarpConfigUpdateEvent,
-    LAUNCH_CONFIG_COMMENT,
+    actions_dir, launch_configs_dir, saved_workspaces_dir, tab_configs_dir, themes_dir,
+    triggers_dir, workflows_dir, WarpConfigUpdateEvent, LAUNCH_CONFIG_COMMENT,
 };
 
 impl super::WarpConfig {
@@ -55,6 +58,20 @@ impl super::WarpConfig {
                 },
             );
         }
+        let _ = ctx.spawn(
+            async move {
+                let actions = load_actions(&actions_dir());
+                let triggers = load_triggers(&triggers_dir());
+                let workspaces = load_saved_workspaces(&saved_workspaces_dir());
+                (actions, triggers, workspaces)
+            },
+            |me, (actions, triggers, workspaces), ctx| {
+                me.actions = actions;
+                me.triggers = triggers;
+                me.saved_workspaces = workspaces;
+                ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+            },
+        );
         let _ = ctx.spawn(
             async move { load_workflows(&workflows_dir()) },
             |me, user_workflows, ctx| {
@@ -124,6 +141,26 @@ impl super::WarpConfig {
                     if !errors.is_empty() {
                         ctx.emit(WarpConfigUpdateEvent::TabConfigErrors(errors));
                     }
+                },
+            );
+        }
+
+        if update_touches_dir(update, &actions_dir())
+            || update_touches_dir(update, &triggers_dir())
+            || update_touches_dir(update, &saved_workspaces_dir())
+        {
+            let _ = ctx.spawn(
+                async move {
+                    let actions = load_actions(&actions_dir());
+                    let triggers = load_triggers(&triggers_dir());
+                    let workspaces = load_saved_workspaces(&saved_workspaces_dir());
+                    (actions, triggers, workspaces)
+                },
+                |me, (actions, triggers, workspaces), ctx| {
+                    me.actions = actions;
+                    me.triggers = triggers;
+                    me.saved_workspaces = workspaces;
+                    ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
                 },
             );
         }
@@ -222,4 +259,53 @@ fn update_touches_path(update: &RepositoryUpdate, path: &Path) -> bool {
     let canonical_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     repository_update_touches_path(update, path)
         || repository_update_touches_path(update, &canonical_path)
+}
+
+/// Returns `true` if `item` is a regular `.toml` file.
+fn is_toml_dir_entry(item: &DirEntry) -> bool {
+    item.metadata()
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+        && item
+            .path()
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("toml"))
+            .unwrap_or(false)
+}
+
+/// Loads all actions from `~/.warp/actions/*.toml`.
+pub fn load_actions(dir: &Path) -> Vec<Action> {
+    for_each_dir_entry(dir, |item| {
+        if !is_toml_dir_entry(item) {
+            return None;
+        }
+        let mut action: Action = super::util::from_toml(item.path().into()).ok()?;
+        action.source_path = Some(item.path().into());
+        Some(action)
+    })
+}
+
+/// Loads all triggers from `~/.warp/triggers/*.toml`.
+pub fn load_triggers(dir: &Path) -> Vec<Trigger> {
+    for_each_dir_entry(dir, |item| {
+        if !is_toml_dir_entry(item) {
+            return None;
+        }
+        let mut trigger: Trigger = super::util::from_toml(item.path().into()).ok()?;
+        trigger.source_path = Some(item.path().into());
+        Some(trigger)
+    })
+}
+
+/// Loads all saved workspaces from `~/.warp/workspaces/*.toml`.
+pub fn load_saved_workspaces(dir: &Path) -> Vec<SavedWorkspace> {
+    for_each_dir_entry(dir, |item| {
+        if !is_toml_dir_entry(item) {
+            return None;
+        }
+        let mut ws: SavedWorkspace = super::util::from_toml(item.path().into()).ok()?;
+        ws.source_path = Some(item.path().into());
+        Some(ws)
+    })
 }
