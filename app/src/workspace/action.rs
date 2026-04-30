@@ -279,6 +279,20 @@ pub enum WorkspaceAction {
     SaveCurrentWorkspace,
     /// Restore a previously saved workspace by ID.
     RestoreWorkspace(Uuid),
+    /// Delete a previously saved workspace by ID.
+    DeleteWorkspace(Uuid),
+    /// Create a new empty action template and persist it to disk.
+    NewAction,
+    /// Create a new empty trigger template and persist it to disk.
+    NewTrigger,
+    /// Delete an action by ID.
+    DeleteAction(Uuid),
+    /// Delete a trigger by ID.
+    DeleteTrigger(Uuid),
+    /// Open the TOML source file for an action in a new editor tab.
+    OpenActionFile(Uuid),
+    /// Open the TOML source file for a trigger in a new editor tab.
+    OpenTriggerFile(Uuid),
     /// Sends Ctrl+C to every terminal pane across all open tabs and clears their output.
     KillAndClearAllTerminals,
     /// Opens the code review panel (right panel) without toggling. If already open,
@@ -855,6 +869,13 @@ impl WorkspaceAction {
             | RunTrigger(_)
             | SaveCurrentWorkspace
             | RestoreWorkspace(_)
+            | DeleteWorkspace(_)
+            | NewAction
+            | NewTrigger
+            | DeleteAction(_)
+            | DeleteTrigger(_)
+            | OpenActionFile(_)
+            | OpenTriggerFile(_)
             | KillAndClearAllTerminals
             | OpenCodeReviewPanel(..)
             | ToggleVerticalTabsSettingsPopup

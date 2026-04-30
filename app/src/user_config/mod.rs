@@ -142,6 +142,24 @@ impl WarpConfig {
         &self.saved_workspaces
     }
 
+    /// Remove an action from the in-memory list by ID and emit an update event.
+    pub fn remove_action(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
+        self.actions.retain(|a| a.id != id);
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
+    /// Remove a trigger from the in-memory list by ID and emit an update event.
+    pub fn remove_trigger(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
+        self.triggers.retain(|t| t.id != id);
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
+    /// Remove a saved workspace from the in-memory list by ID and emit an update event.
+    pub fn remove_saved_workspace(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
+        self.saved_workspaces.retain(|w| w.id != id);
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
     /// Saving the newly created launch configuration to the WarpConfig that we currently
     /// have.
     pub fn append_launch_config(

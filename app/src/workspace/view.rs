@@ -20444,6 +20444,108 @@ impl TypedActionView for Workspace {
                     }
                 }
             }
+            DeleteWorkspace(workspace_id) => {
+                use crate::actions::storage;
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let workspaces = config.saved_workspaces().to_vec();
+                drop(config);
+                if let Some(ws) = workspaces.iter().find(|w| w.id == *workspace_id) {
+                    if let Err(e) = storage::delete_workspace(ws) {
+                        log::error!("Failed to delete workspace '{}': {e}", ws.name);
+                    }
+                }
+                let id = *workspace_id;
+                WarpConfig::handle(ctx).update(ctx, move |config, ctx| {
+                    config.remove_saved_workspace(id, ctx);
+                });
+            }
+            NewAction => {
+                use crate::actions::model::Action;
+                use crate::actions::storage;
+                let name = format!("New Action {}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+                let action = Action {
+                    id: uuid::Uuid::new_v4(),
+                    name,
+                    description: None,
+                    commands: vec![],
+                    source_path: None,
+                };
+                if let Err(e) = storage::save_action(&action) {
+                    log::error!("Failed to create action: {e}");
+                }
+            }
+            NewTrigger => {
+                use crate::actions::model::Trigger;
+                use crate::actions::storage;
+                let name =
+                    format!("New Trigger {}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+                let trigger = Trigger {
+                    id: uuid::Uuid::new_v4(),
+                    name,
+                    description: None,
+                    action_ids: vec![],
+                    targets: Default::default(),
+                    source_path: None,
+                };
+                if let Err(e) = storage::save_trigger(&trigger) {
+                    log::error!("Failed to create trigger: {e}");
+                }
+            }
+            DeleteAction(action_id) => {
+                use crate::actions::storage;
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let actions = config.actions().to_vec();
+                drop(config);
+                if let Some(action) = actions.iter().find(|a| a.id == *action_id) {
+                    if let Err(e) = storage::delete_action(action) {
+                        log::error!("Failed to delete action '{}': {e}", action.name);
+                    }
+                }
+                let id = *action_id;
+                WarpConfig::handle(ctx).update(ctx, move |config, ctx| {
+                    config.remove_action(id, ctx);
+                });
+            }
+            DeleteTrigger(trigger_id) => {
+                use crate::actions::storage;
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let triggers = config.triggers().to_vec();
+                drop(config);
+                if let Some(trigger) = triggers.iter().find(|t| t.id == *trigger_id) {
+                    if let Err(e) = storage::delete_trigger(trigger) {
+                        log::error!("Failed to delete trigger '{}': {e}", trigger.name);
+                    }
+                }
+                let id = *trigger_id;
+                WarpConfig::handle(ctx).update(ctx, move |config, ctx| {
+                    config.remove_trigger(id, ctx);
+                });
+            }
+            OpenActionFile(action_id) => {
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let actions = config.actions().to_vec();
+                drop(config);
+                if let Some(action) = actions.iter().find(|a| a.id == *action_id) {
+                    if let Some(path) = action.source_path.clone() {
+                        self.add_tab_for_code_file(path, None, ctx);
+                    }
+                }
+            }
+            OpenTriggerFile(trigger_id) => {
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let triggers = config.triggers().to_vec();
+                drop(config);
+                if let Some(trigger) = triggers.iter().find(|t| t.id == *trigger_id) {
+                    if let Some(path) = trigger.source_path.clone() {
+                        self.add_tab_for_code_file(path, None, ctx);
+                    }
+                }
+            }
             KillAndClearAllTerminals => {
                 let count = self.tab_count();
                 let groups: Vec<_> = (0..count)

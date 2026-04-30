@@ -68,6 +68,39 @@ pub fn save_workspace(workspace: &SavedWorkspace) -> Result<PathBuf> {
     Ok(path)
 }
 
+// ── Delete helpers ────────────────────────────────────────────────────────────
+
+/// Delete the TOML file backing `action` (uses `source_path` when present,
+/// otherwise derives the path from the action's name).
+pub fn delete_action(action: &Action) -> Result<()> {
+    let path = action
+        .source_path
+        .clone()
+        .unwrap_or_else(|| actions_dir().join(format!("{}.toml", slug(&action.name))));
+    std::fs::remove_file(&path)
+        .map_err(|e| anyhow::anyhow!("Failed to delete action '{}': {e}", path.display()))
+}
+
+/// Delete the TOML file backing `trigger`.
+pub fn delete_trigger(trigger: &Trigger) -> Result<()> {
+    let path = trigger
+        .source_path
+        .clone()
+        .unwrap_or_else(|| triggers_dir().join(format!("{}.toml", slug(&trigger.name))));
+    std::fs::remove_file(&path)
+        .map_err(|e| anyhow::anyhow!("Failed to delete trigger '{}': {e}", path.display()))
+}
+
+/// Delete the TOML file backing `workspace`.
+pub fn delete_workspace(workspace: &SavedWorkspace) -> Result<()> {
+    let path = workspace
+        .source_path
+        .clone()
+        .unwrap_or_else(|| workspaces_dir().join(format!("{}.toml", slug(&workspace.name))));
+    std::fs::remove_file(&path)
+        .map_err(|e| anyhow::anyhow!("Failed to delete workspace '{}': {e}", path.display()))
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 fn slug(name: &str) -> String {

@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use uuid::Uuid;
 use warp_core::ui::Icon;
 use warpui::{
@@ -24,6 +27,26 @@ use crate::workspace::WorkspaceAction;
 
 use super::model::{Action, SavedWorkspace, Trigger};
 
+/// Per-row mouse state handles for one item in a dynamic list.
+///
+/// Stored in a `RefCell<HashMap<Uuid, RowMouseStates>>` so they survive
+/// across re-renders without needing `&mut self` in `render()`.
+struct RowMouseStates {
+    primary: MouseStateHandle,
+    secondary: MouseStateHandle,
+    delete: MouseStateHandle,
+}
+
+impl Default for RowMouseStates {
+    fn default() -> Self {
+        Self {
+            primary: Default::default(),
+            secondary: Default::default(),
+            delete: Default::default(),
+        }
+    }
+}
+
 /// The three tabs available inside the Actions & Triggers panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionsPanelTab {
@@ -44,18 +67,31 @@ pub struct ActionsPanelView {
     triggers_tab_mouse_state: MouseStateHandle,
     workspaces_tab_mouse_state: MouseStateHandle,
     save_workspace_mouse_state: MouseStateHandle,
+    new_action_mouse_state: MouseStateHandle,
+    new_trigger_mouse_state: MouseStateHandle,
+    /// Stable per-row mouse states for action list rows (keyed by action UUID).
+    action_row_states: RefCell<HashMap<Uuid, RowMouseStates>>,
+    /// Stable per-row mouse states for trigger list rows (keyed by trigger UUID).
+    trigger_row_states: RefCell<HashMap<Uuid, RowMouseStates>>,
+    /// Stable per-row mouse states for workspace list rows (keyed by workspace UUID).
+    workspace_row_states: RefCell<HashMap<Uuid, RowMouseStates>>,
     active_tab: ActionsPanelTab,
 }
 
 impl ActionsPanelView {
     pub fn new(_ctx: &mut ViewContext<Self>) -> Self {
         Self {
-            resizable_state_handle: resizable_state_handle(240.0),
+            resizable_state_handle: resizable_state_handle(340.0),
             close_button_mouse_state: Default::default(),
             actions_tab_mouse_state: Default::default(),
             triggers_tab_mouse_state: Default::default(),
             workspaces_tab_mouse_state: Default::default(),
             save_workspace_mouse_state: Default::default(),
+            new_action_mouse_state: Default::default(),
+            new_trigger_mouse_state: Default::default(),
+            action_row_states: Default::default(),
+            trigger_row_states: Default::default(),
+            workspace_row_states: Default::default(),
             active_tab: ActionsPanelTab::Actions,
         }
     }
@@ -63,6 +99,26 @@ impl ActionsPanelView {
     pub fn set_active_tab(&mut self, tab: ActionsPanelTab, ctx: &mut ViewContext<Self>) {
         self.active_tab = tab;
         ctx.notify();
+    }
+
+    // ── Per-row mouse state helpers ────────────────────────────────────────
+
+    fn action_states(&self, id: Uuid) -> (MouseStateHandle, MouseStateHandle, MouseStateHandle) {
+        let mut map = self.action_row_states.borrow_mut();
+        let s = map.entry(id).or_insert_with(RowMouseStates::default);
+        (s.primary.clone(), s.secondary.clone(), s.delete.clone())
+    }
+
+    fn trigger_states(&self, id: Uuid) -> (MouseStateHandle, MouseStateHandle, MouseStateHandle) {
+        let mut map = self.trigger_row_states.borrow_mut();
+        let s = map.entry(id).or_insert_with(RowMouseStates::default);
+        (s.primary.clone(), s.secondary.clone(), s.delete.clone())
+    }
+
+    fn workspace_states(&self, id: Uuid) -> (MouseStateHandle, MouseStateHandle) {
+        let mut map = self.workspace_row_states.borrow_mut();
+        let s = map.entry(id).or_insert_with(RowMouseStates::default);
+        (s.primary.clone(), s.delete.clone())
     }
 
     // ── Rendering helpers ─────────────────────────────────────────────────
@@ -87,9 +143,8 @@ impl ActionsPanelView {
             .with_tooltip(move || tooltip)
             .build()
             .on_click(move |ctx, _, _| {
-                ctx.dispatch_typed_action(WorkspaceAction::ToggleActionsPanel);
+                ctx.dispatch_typed_action(ActionsPanelAction::ClosePanel);
             })
-            .with_cursor(Cursor::PointingHand)
             .finish()
         };
 
@@ -178,15 +233,53 @@ impl ActionsPanelView {
     }
 
     fn render_actions_tab(&self, actions: &[Action], appearance: &Appearance) -> Box<dyn Element> {
-        if actions.is_empty() {
-            return self.render_empty_state(appearance, "No actions yet.");
-        }
+        let new_button = {
+            let ui_builder = appearance.ui_builder().clone();
+            let tooltip = ui_builder
+                .tool_tip("Create new action".to_string())
+                .build()
+                .finish();
+            icon_button(
+                appearance,
+                Icon::Plus,
+                false,
+                self.new_action_mouse_state.clone(),
+            )
+            .with_tooltip(move || tooltip)
+            .build()
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(ActionsPanelAction::NewAction);
+            })
+            .finish()
+        };
 
-        let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
-        for action in actions {
-            col = col.with_child(self.render_action_row(action, appearance));
-        }
-        Shrinkable::new(1.0, col.finish()).finish()
+        let toolbar = Container::new(
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_main_axis_alignment(MainAxisAlignment::End)
+                .with_child(new_button)
+                .finish(),
+        )
+        .with_padding_left(10.)
+        .with_padding_right(10.)
+        .with_padding_bottom(4.)
+        .finish();
+
+        let list: Box<dyn Element> = if actions.is_empty() {
+            self.render_empty_state(appearance, "No actions yet.")
+        } else {
+            let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
+            for action in actions {
+                col = col.with_child(self.render_action_row(action, appearance));
+            }
+            Shrinkable::new(1.0, col.finish()).finish()
+        };
+
+        Flex::column()
+            .with_child(toolbar)
+            .with_child(Shrinkable::new(1.0, list).finish())
+            .with_main_axis_size(MainAxisSize::Max)
+            .finish()
     }
 
     fn render_action_row(&self, action: &Action, appearance: &Appearance) -> Box<dyn Element> {
@@ -208,26 +301,63 @@ impl ActionsPanelView {
             .finish();
 
         let action_id = action.id;
+        let (run_state, edit_state, delete_state) = self.action_states(action_id);
+
         let run_button = {
             let ui_builder = appearance.ui_builder().clone();
             let tooltip = ui_builder
                 .tool_tip("Run in active terminal".to_string())
                 .build()
                 .finish();
-            icon_button(
-                appearance,
-                Icon::Play,
-                false,
-                MouseStateHandle::default(),
-            )
-            .with_tooltip(move || tooltip)
-            .build()
-            .on_click(move |ctx, _, _| {
-                ctx.dispatch_typed_action(ActionsPanelAction::RunAction(action_id));
-            })
-            .with_cursor(Cursor::PointingHand)
-            .finish()
+            icon_button(appearance, Icon::Play, false, run_state)
+                .with_tooltip(move || tooltip)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::RunAction(action_id));
+                })
+                .finish()
         };
+
+        let edit_button = {
+            let ui_builder = appearance.ui_builder().clone();
+            let tooltip = ui_builder
+                .tool_tip("Edit action file".to_string())
+                .build()
+                .finish();
+            let icon_color = theme.sub_text_color(theme.background());
+            icon_button_with_color(appearance, Icon::Edit, false, edit_state, icon_color)
+                .with_tooltip(move || tooltip)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::EditAction(action_id));
+                })
+                .finish()
+        };
+
+        let delete_button = {
+            let ui_builder = appearance.ui_builder().clone();
+            let tooltip = ui_builder
+                .tool_tip("Delete action".to_string())
+                .build()
+                .finish();
+            let icon_color = theme.sub_text_color(theme.background());
+            icon_button_with_color(appearance, Icon::Trash, false, delete_state, icon_color)
+                .with_tooltip(move || tooltip)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::DeleteAction(action_id));
+                })
+                .finish()
+        };
+
+        let buttons = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(2.0)
+            .with_child(run_button)
+            .with_child(edit_button)
+            .with_child(delete_button)
+            .with_main_axis_size(MainAxisSize::Min)
+            .finish();
 
         Container::new(
             Flex::row()
@@ -241,7 +371,7 @@ impl ActionsPanelView {
                         .with_main_axis_size(MainAxisSize::Min)
                         .finish(),
                 )
-                .with_child(run_button)
+                .with_child(buttons)
                 .finish(),
         )
         .with_padding_left(10.)
@@ -256,15 +386,53 @@ impl ActionsPanelView {
         triggers: &[Trigger],
         appearance: &Appearance,
     ) -> Box<dyn Element> {
-        if triggers.is_empty() {
-            return self.render_empty_state(appearance, "No triggers yet.");
-        }
+        let new_button = {
+            let ui_builder = appearance.ui_builder().clone();
+            let tooltip = ui_builder
+                .tool_tip("Create new trigger".to_string())
+                .build()
+                .finish();
+            icon_button(
+                appearance,
+                Icon::Plus,
+                false,
+                self.new_trigger_mouse_state.clone(),
+            )
+            .with_tooltip(move || tooltip)
+            .build()
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(ActionsPanelAction::NewTrigger);
+            })
+            .finish()
+        };
 
-        let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
-        for trigger in triggers {
-            col = col.with_child(self.render_trigger_row(trigger, appearance));
-        }
-        Shrinkable::new(1.0, col.finish()).finish()
+        let toolbar = Container::new(
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_main_axis_alignment(MainAxisAlignment::End)
+                .with_child(new_button)
+                .finish(),
+        )
+        .with_padding_left(10.)
+        .with_padding_right(10.)
+        .with_padding_bottom(4.)
+        .finish();
+
+        let list: Box<dyn Element> = if triggers.is_empty() {
+            self.render_empty_state(appearance, "No triggers yet.")
+        } else {
+            let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
+            for trigger in triggers {
+                col = col.with_child(self.render_trigger_row(trigger, appearance));
+            }
+            Shrinkable::new(1.0, col.finish()).finish()
+        };
+
+        Flex::column()
+            .with_child(toolbar)
+            .with_child(Shrinkable::new(1.0, list).finish())
+            .with_main_axis_size(MainAxisSize::Max)
+            .finish()
     }
 
     fn render_trigger_row(&self, trigger: &Trigger, appearance: &Appearance) -> Box<dyn Element> {
@@ -286,26 +454,63 @@ impl ActionsPanelView {
             .finish();
 
         let trigger_id = trigger.id;
+        let (run_state, edit_state, delete_state) = self.trigger_states(trigger_id);
+
         let run_button = {
             let ui_builder = appearance.ui_builder().clone();
             let tooltip = ui_builder
                 .tool_tip("Run trigger across targets".to_string())
                 .build()
                 .finish();
-            icon_button(
-                appearance,
-                Icon::Play,
-                false,
-                MouseStateHandle::default(),
-            )
-            .with_tooltip(move || tooltip)
-            .build()
-            .on_click(move |ctx, _, _| {
-                ctx.dispatch_typed_action(ActionsPanelAction::RunTrigger(trigger_id));
-            })
-            .with_cursor(Cursor::PointingHand)
-            .finish()
+            icon_button(appearance, Icon::Play, false, run_state)
+                .with_tooltip(move || tooltip)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::RunTrigger(trigger_id));
+                })
+                .finish()
         };
+
+        let edit_button = {
+            let ui_builder = appearance.ui_builder().clone();
+            let tooltip = ui_builder
+                .tool_tip("Edit trigger file".to_string())
+                .build()
+                .finish();
+            let icon_color = theme.sub_text_color(theme.background());
+            icon_button_with_color(appearance, Icon::Edit, false, edit_state, icon_color)
+                .with_tooltip(move || tooltip)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::EditTrigger(trigger_id));
+                })
+                .finish()
+        };
+
+        let delete_button = {
+            let ui_builder = appearance.ui_builder().clone();
+            let tooltip = ui_builder
+                .tool_tip("Delete trigger".to_string())
+                .build()
+                .finish();
+            let icon_color = theme.sub_text_color(theme.background());
+            icon_button_with_color(appearance, Icon::Trash, false, delete_state, icon_color)
+                .with_tooltip(move || tooltip)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::DeleteTrigger(trigger_id));
+                })
+                .finish()
+        };
+
+        let buttons = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(2.0)
+            .with_child(run_button)
+            .with_child(edit_button)
+            .with_child(delete_button)
+            .with_main_axis_size(MainAxisSize::Min)
+            .finish();
 
         Container::new(
             Flex::row()
@@ -319,7 +524,7 @@ impl ActionsPanelView {
                         .with_main_axis_size(MainAxisSize::Min)
                         .finish(),
                 )
-                .with_child(run_button)
+                .with_child(buttons)
                 .finish(),
         )
         .with_padding_left(10.)
@@ -351,7 +556,6 @@ impl ActionsPanelView {
             .on_click(move |ctx, _, _| {
                 ctx.dispatch_typed_action(ActionsPanelAction::SaveWorkspace);
             })
-            .with_cursor(Cursor::PointingHand)
             .finish()
         };
 
@@ -407,26 +611,46 @@ impl ActionsPanelView {
         .finish();
 
         let workspace_id = workspace.id;
+        let (restore_state, delete_state) = self.workspace_states(workspace_id);
+
         let restore_button = {
             let ui_builder = appearance.ui_builder().clone();
             let tooltip = ui_builder
                 .tool_tip("Restore workspace".to_string())
                 .build()
                 .finish();
-            icon_button(
-                appearance,
-                Icon::Refresh,
-                false,
-                MouseStateHandle::default(),
-            )
-            .with_tooltip(move || tooltip)
-            .build()
-            .on_click(move |ctx, _, _| {
-                ctx.dispatch_typed_action(ActionsPanelAction::RestoreWorkspace(workspace_id));
-            })
-            .with_cursor(Cursor::PointingHand)
-            .finish()
+            icon_button(appearance, Icon::Refresh, false, restore_state)
+                .with_tooltip(move || tooltip)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::RestoreWorkspace(workspace_id));
+                })
+                .finish()
         };
+
+        let delete_button = {
+            let ui_builder = appearance.ui_builder().clone();
+            let tooltip = ui_builder
+                .tool_tip("Delete workspace".to_string())
+                .build()
+                .finish();
+            let icon_color = theme.sub_text_color(theme.background());
+            icon_button_with_color(appearance, Icon::Trash, false, delete_state, icon_color)
+                .with_tooltip(move || tooltip)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::DeleteWorkspace(workspace_id));
+                })
+                .finish()
+        };
+
+        let buttons = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(2.0)
+            .with_child(restore_button)
+            .with_child(delete_button)
+            .with_main_axis_size(MainAxisSize::Min)
+            .finish();
 
         Container::new(
             Flex::row()
@@ -440,7 +664,7 @@ impl ActionsPanelView {
                         .with_main_axis_size(MainAxisSize::Min)
                         .finish(),
                 )
-                .with_child(restore_button)
+                .with_child(buttons)
                 .finish(),
         )
         .with_padding_left(10.)
@@ -474,10 +698,18 @@ impl ActionsPanelView {
 #[derive(Clone, Debug)]
 pub enum ActionsPanelAction {
     SetTab(ActionsPanelTab),
+    ClosePanel,
     RunAction(Uuid),
     RunTrigger(Uuid),
     SaveWorkspace,
     RestoreWorkspace(Uuid),
+    DeleteWorkspace(Uuid),
+    NewAction,
+    NewTrigger,
+    DeleteAction(Uuid),
+    DeleteTrigger(Uuid),
+    EditAction(Uuid),
+    EditTrigger(Uuid),
 }
 
 // ── View impl ─────────────────────────────────────────────────────────────────
@@ -543,6 +775,9 @@ impl warpui::TypedActionView for ActionsPanelView {
             ActionsPanelAction::SetTab(tab) => {
                 self.set_active_tab(*tab, ctx);
             }
+            ActionsPanelAction::ClosePanel => {
+                ctx.dispatch_typed_action(&WorkspaceAction::ToggleActionsPanel);
+            }
             ActionsPanelAction::RunAction(id) => {
                 ctx.dispatch_typed_action(&WorkspaceAction::RunActionInActiveTerminal(*id));
             }
@@ -554,6 +789,27 @@ impl warpui::TypedActionView for ActionsPanelView {
             }
             ActionsPanelAction::RestoreWorkspace(id) => {
                 ctx.dispatch_typed_action(&WorkspaceAction::RestoreWorkspace(*id));
+            }
+            ActionsPanelAction::DeleteWorkspace(id) => {
+                ctx.dispatch_typed_action(&WorkspaceAction::DeleteWorkspace(*id));
+            }
+            ActionsPanelAction::NewAction => {
+                ctx.dispatch_typed_action(&WorkspaceAction::NewAction);
+            }
+            ActionsPanelAction::NewTrigger => {
+                ctx.dispatch_typed_action(&WorkspaceAction::NewTrigger);
+            }
+            ActionsPanelAction::DeleteAction(id) => {
+                ctx.dispatch_typed_action(&WorkspaceAction::DeleteAction(*id));
+            }
+            ActionsPanelAction::DeleteTrigger(id) => {
+                ctx.dispatch_typed_action(&WorkspaceAction::DeleteTrigger(*id));
+            }
+            ActionsPanelAction::EditAction(id) => {
+                ctx.dispatch_typed_action(&WorkspaceAction::OpenActionFile(*id));
+            }
+            ActionsPanelAction::EditTrigger(id) => {
+                ctx.dispatch_typed_action(&WorkspaceAction::OpenTriggerFile(*id));
             }
         }
     }
