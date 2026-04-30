@@ -4,6 +4,7 @@ pub mod util;
 #[cfg_attr(target_family = "wasm", path = "wasm.rs")]
 mod imp;
 
+use crate::actions::model::{Action, SavedWorkspace, Trigger};
 use crate::tab_configs::{TabConfig, TabConfigError};
 use crate::themes::theme::WarpThemeConfig;
 use crate::{
@@ -72,6 +73,9 @@ pub enum WarpConfigUpdateEvent {
     /// A previously-errored settings reload succeeded with no errors.
     #[cfg_attr(not(feature = "local_fs"), expect(dead_code))]
     SettingsErrorsCleared,
+    /// Actions, triggers, or saved workspaces on disk changed.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    ActionsAndTriggers,
 }
 
 /// Singleton model containing user configurable file entities like themes, launch configs, and
@@ -89,6 +93,12 @@ pub struct WarpConfig {
     tab_config_errors: Vec<TabConfigError>,
     theme_config: WarpThemeConfig,
     local_user_workflows: Vec<Workflow>,
+    /// User-authored actions loaded from `~/.warp/actions/*.toml`.
+    actions: Vec<Action>,
+    /// User-authored triggers loaded from `~/.warp/triggers/*.toml`.
+    triggers: Vec<Trigger>,
+    /// User-saved workspace snapshots loaded from `~/.warp/workspaces/*.toml`.
+    saved_workspaces: Vec<SavedWorkspace>,
 }
 
 /// Platform-independent parts of WarpConfig.
@@ -118,6 +128,70 @@ impl WarpConfig {
 
     pub fn local_user_workflows(&self) -> &Vec<Workflow> {
         &self.local_user_workflows
+    }
+
+    pub fn actions(&self) -> &[Action] {
+        &self.actions
+    }
+
+    pub fn triggers(&self) -> &[Trigger] {
+        &self.triggers
+    }
+
+    pub fn saved_workspaces(&self) -> &[SavedWorkspace] {
+        &self.saved_workspaces
+    }
+
+    /// Add a new action to the in-memory list and emit an update event.
+    pub fn add_action(&mut self, action: Action, ctx: &mut ModelContext<Self>) {
+        self.actions.push(action);
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
+    /// Replace the action with the same ID in-memory and emit an update event.
+    pub fn update_action(&mut self, action: Action, ctx: &mut ModelContext<Self>) {
+        if let Some(existing) = self.actions.iter_mut().find(|a| a.id == action.id) {
+            *existing = action;
+        }
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
+    /// Remove an action from the in-memory list by ID and emit an update event.
+    pub fn remove_action(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
+        self.actions.retain(|a| a.id != id);
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
+    /// Add a new trigger to the in-memory list and emit an update event.
+    pub fn add_trigger(&mut self, trigger: Trigger, ctx: &mut ModelContext<Self>) {
+        self.triggers.push(trigger);
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
+    /// Replace the trigger with the same ID in-memory and emit an update event.
+    pub fn update_trigger(&mut self, trigger: Trigger, ctx: &mut ModelContext<Self>) {
+        if let Some(existing) = self.triggers.iter_mut().find(|t| t.id == trigger.id) {
+            *existing = trigger;
+        }
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
+    /// Remove a trigger from the in-memory list by ID and emit an update event.
+    pub fn remove_trigger(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
+        self.triggers.retain(|t| t.id != id);
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
+    /// Add a new workspace to the in-memory list and emit an update event.
+    pub fn add_saved_workspace(&mut self, workspace: SavedWorkspace, ctx: &mut ModelContext<Self>) {
+        self.saved_workspaces.push(workspace);
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
+    /// Remove a saved workspace from the in-memory list by ID and emit an update event.
+    pub fn remove_saved_workspace(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
+        self.saved_workspaces.retain(|w| w.id != id);
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
     }
 
     /// Saving the newly created launch configuration to the WarpConfig that we currently
@@ -192,6 +266,24 @@ pub fn launch_configs_dir() -> PathBuf {
 #[cfg_attr(target_family = "wasm", expect(dead_code))]
 pub fn tab_configs_dir() -> PathBuf {
     base_dir().join("tab_configs")
+}
+
+/// Returns the path to the directory containing the user's actions.
+#[cfg_attr(target_family = "wasm", expect(dead_code))]
+pub fn actions_dir() -> PathBuf {
+    base_dir().join("actions")
+}
+
+/// Returns the path to the directory containing the user's triggers.
+#[cfg_attr(target_family = "wasm", expect(dead_code))]
+pub fn triggers_dir() -> PathBuf {
+    base_dir().join("triggers")
+}
+
+/// Returns the path to the directory containing the user's saved workspaces.
+#[cfg_attr(target_family = "wasm", expect(dead_code))]
+pub fn saved_workspaces_dir() -> PathBuf {
+    base_dir().join("workspaces")
 }
 
 /// Returns the path to the directory containing the built-in default tab configs.

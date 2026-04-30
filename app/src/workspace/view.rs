@@ -1012,6 +1012,7 @@ pub struct Workspace {
     left_panel_view: ViewHandle<LeftPanelView>,
     left_panel_views: Vec<ToolPanelView>,
     right_panel_view: ViewHandle<RightPanelView>,
+    actions_panel_view: ViewHandle<crate::actions::panel::ActionsPanelView>,
     working_directories_model: ModelHandle<pane_group::WorkingDirectoriesModel>,
     agent_management_view: ViewHandle<AgentManagementView>,
     notification_mailbox_view: Option<ViewHandle<NotificationMailboxView>>,
@@ -2722,6 +2723,10 @@ impl Workspace {
             me.handle_right_panel_event(event.clone(), ctx);
         });
 
+        let actions_panel_view = ctx.add_typed_action_view(|ctx| {
+            crate::actions::panel::ActionsPanelView::new(ctx)
+        });
+
         // Get persisted filters from window snapshot if restoring.
         let agent_management_filters = match workspace_setting {
             NewWorkspaceSource::Restored {
@@ -3121,6 +3126,7 @@ impl Workspace {
             left_panel_view,
             left_panel_views,
             right_panel_view,
+            actions_panel_view,
             working_directories_model,
             shown_staging_banner_count: 0,
 
@@ -16740,6 +16746,48 @@ impl Workspace {
         .finish()
     }
 
+    fn render_actions_panel_button(
+        &self,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Box<dyn Element> {
+        let is_active = self.active_tab_pane_group().as_ref(ctx).actions_panel_open;
+        self.render_tab_bar_icon_button(
+            appearance,
+            icons::Icon::Lightning,
+            &self.mouse_states.actions_panel_icon,
+            WorkspaceAction::ToggleActionsPanel,
+            "Actions & Triggers".to_string(),
+            None,
+            is_active,
+            false,
+        )
+        .finish()
+    }
+
+    fn render_kill_all_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let icon_color = appearance.theme().ansi_fg_red();
+        let ui_builder = appearance.ui_builder().clone();
+        let tooltip = ui_builder
+            .tool_tip("Kill all processes and clear terminal output".to_string())
+            .build()
+            .finish();
+        icon_button_with_color(
+            appearance,
+            icons::Icon::XCircle,
+            false,
+            self.mouse_states.kill_all_icon.clone(),
+            Fill::Solid(icon_color),
+        )
+        .with_tooltip(move || tooltip)
+        .build()
+        .on_click(|ctx, _, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::KillAndClearAllTerminals);
+        })
+        .with_cursor(warpui::platform::Cursor::PointingHand)
+        .finish()
+    }
+
     fn render_tools_panel_button(
         &self,
         appearance: &Appearance,
@@ -17308,6 +17356,10 @@ impl Workspace {
             HeaderToolbarItemKind::NotificationsMailbox => {
                 self.render_notifications_mailbox_button(appearance, ctx)
             }
+            HeaderToolbarItemKind::ActionsAndTriggers => {
+                self.render_actions_panel_button(appearance, ctx)
+            }
+            HeaderToolbarItemKind::KillAll => self.render_kill_all_button(appearance),
         };
         Some(
             Container::new(
@@ -19015,7 +19067,14 @@ impl Workspace {
                 Some(ChildView::new(&self.right_panel_view).finish())
             }
             HeaderToolbarItemKind::AgentManagement
-            | HeaderToolbarItemKind::NotificationsMailbox => None,
+            | HeaderToolbarItemKind::NotificationsMailbox
+            | HeaderToolbarItemKind::KillAll => None,
+            HeaderToolbarItemKind::ActionsAndTriggers => {
+                if !pane_group.actions_panel_open {
+                    return None;
+                }
+                Some(ChildView::new(&self.actions_panel_view).finish())
+            }
         }
     }
 
@@ -20331,6 +20390,243 @@ impl TypedActionView for Workspace {
             ToggleRightPanel => {
                 let pane_group_handle = self.active_tab_pane_group().clone();
                 self.toggle_right_panel(&pane_group_handle, ctx);
+            }
+            ToggleActionsPanel => {
+                let pane_group_handle = self.active_tab_pane_group().clone();
+                pane_group_handle.update(ctx, |pane_group, ctx| {
+                    pane_group.toggle_actions_panel(ctx);
+                });
+            }
+            RunActionInActiveTerminal(action_id) => {
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let actions = config.actions().to_vec();
+                drop(config);
+                if let Some(action) = actions.iter().find(|a| a.id == *action_id) {
+                    if let Some(terminal_handle) = self
+                        .active_tab_pane_group()
+                        .read(ctx, |pg, app| pg.active_session_view(app))
+                    {
+                        for command in action.commands.clone() {
+                            terminal_handle.update(ctx, |terminal, term_ctx| {
+                                terminal.execute_command_or_set_pending(&command, term_ctx);
+                            });
+                        }
+                    }
+                }
+            }
+            RunTrigger(trigger_id) => {
+                use crate::actions::runner::TriggerRunner;
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let actions = config.actions().to_vec();
+                let triggers = config.triggers().to_vec();
+                drop(config);
+                if let Some(trigger) = triggers.iter().find(|t| t.id == *trigger_id) {
+                    let weak_handle = ctx.handle();
+                    if let Some(workspace_handle) = weak_handle.upgrade(ctx) {
+                        TriggerRunner::run(trigger, &actions, &workspace_handle, ctx);
+                    }
+                }
+            }
+            SaveCurrentWorkspace => {
+                use crate::actions::model::{SavedWorkspace, WorkspaceSnapshot};
+                use crate::actions::storage;
+                use crate::user_config::WarpConfig;
+                let window_id = ctx.window_id();
+                let quake_mode =
+                    quake_mode_window_id().map(|id| id == window_id).unwrap_or(false);
+                let window_snapshot = self.snapshot(window_id, quake_mode, ctx);
+                let ws_snapshot = WorkspaceSnapshot::from_window_snapshot(&window_snapshot);
+                let name = format!(
+                    "Workspace {}",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M")
+                );
+                let saved = SavedWorkspace {
+                    id: uuid::Uuid::new_v4(),
+                    name,
+                    snapshot: ws_snapshot,
+                    source_path: None,
+                };
+                match storage::save_workspace(&saved) {
+                    Ok(_) => {
+                        WarpConfig::handle(ctx).update(ctx, |config, ctx| {
+                            config.add_saved_workspace(saved, ctx);
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("Failed to save workspace: {e}");
+                    }
+                }
+            }
+            RestoreWorkspace(workspace_id) => {
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let workspaces = config.saved_workspaces().to_vec();
+                drop(config);
+                if let Some(saved_ws) = workspaces.iter().find(|w| w.id == *workspace_id) {
+                    log::info!(
+                        "Restoring workspace '{}' ({} tab(s))",
+                        saved_ws.name,
+                        saved_ws.snapshot.tabs.len()
+                    );
+                    for tab_snapshot in &saved_ws.snapshot.tabs {
+                        if tab_snapshot.is_ambient_agent {
+                            self.add_ambient_agent_tab(ctx);
+                            continue;
+                        }
+
+                        let initial_directory = tab_snapshot
+                            .cwd
+                            .as_deref()
+                            .map(std::path::PathBuf::from)
+                            .filter(|p| p.is_dir());
+                        let custom_title = tab_snapshot.custom_title.clone();
+
+                        // Resolve the saved shell back to an AvailableShell so
+                        // the restored tab uses the same shell (bash, PowerShell, etc.)
+                        // as when the workspace was saved.
+                        #[cfg(feature = "local_tty")]
+                        let shell: Option<AvailableShell> =
+                            tab_snapshot.shell_launch_data.as_ref().and_then(|sld| {
+                                use crate::terminal::available_shells::AvailableShells;
+                                AvailableShells::handle(ctx)
+                                    .read(ctx, |model, _| model.get_from_shell_launch_data(sld))
+                            });
+                        #[cfg(not(feature = "local_tty"))]
+                        let shell: Option<AvailableShell> = None;
+
+                        self.add_tab_with_pane_layout(
+                            PanesLayout::SingleTerminal(Box::new(NewTerminalOptions {
+                                initial_directory,
+                                hide_homepage: true,
+                                shell,
+                                ..Default::default()
+                            })),
+                            std::sync::Arc::new(std::collections::HashMap::new()),
+                            custom_title,
+                            ctx,
+                        );
+                    }
+                }
+            }
+            DeleteWorkspace(workspace_id) => {
+                use crate::actions::storage;
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let workspaces = config.saved_workspaces().to_vec();
+                drop(config);
+                if let Some(ws) = workspaces.iter().find(|w| w.id == *workspace_id) {
+                    if let Err(e) = storage::delete_workspace(ws) {
+                        log::error!("Failed to delete workspace '{}': {e}", ws.name);
+                    }
+                }
+                let id = *workspace_id;
+                WarpConfig::handle(ctx).update(ctx, move |config, ctx| {
+                    config.remove_saved_workspace(id, ctx);
+                });
+            }
+            NewAction => {
+                use crate::actions::model::Action;
+                use crate::actions::storage;
+                let name = format!("New Action {}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+                let action = Action {
+                    id: uuid::Uuid::new_v4(),
+                    name,
+                    description: None,
+                    commands: vec![],
+                    source_path: None,
+                };
+                if let Err(e) = storage::save_action(&action) {
+                    log::error!("Failed to create action: {e}");
+                }
+            }
+            NewTrigger => {
+                use crate::actions::model::Trigger;
+                use crate::actions::storage;
+                let name =
+                    format!("New Trigger {}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+                let trigger = Trigger {
+                    id: uuid::Uuid::new_v4(),
+                    name,
+                    description: None,
+                    action_ids: vec![],
+                    targets: Default::default(),
+                    source_path: None,
+                };
+                if let Err(e) = storage::save_trigger(&trigger) {
+                    log::error!("Failed to create trigger: {e}");
+                }
+            }
+            DeleteAction(action_id) => {
+                use crate::actions::storage;
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let actions = config.actions().to_vec();
+                drop(config);
+                if let Some(action) = actions.iter().find(|a| a.id == *action_id) {
+                    if let Err(e) = storage::delete_action(action) {
+                        log::error!("Failed to delete action '{}': {e}", action.name);
+                    }
+                }
+                let id = *action_id;
+                WarpConfig::handle(ctx).update(ctx, move |config, ctx| {
+                    config.remove_action(id, ctx);
+                });
+            }
+            DeleteTrigger(trigger_id) => {
+                use crate::actions::storage;
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let triggers = config.triggers().to_vec();
+                drop(config);
+                if let Some(trigger) = triggers.iter().find(|t| t.id == *trigger_id) {
+                    if let Err(e) = storage::delete_trigger(trigger) {
+                        log::error!("Failed to delete trigger '{}': {e}", trigger.name);
+                    }
+                }
+                let id = *trigger_id;
+                WarpConfig::handle(ctx).update(ctx, move |config, ctx| {
+                    config.remove_trigger(id, ctx);
+                });
+            }
+            OpenActionFile(action_id) => {
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let actions = config.actions().to_vec();
+                drop(config);
+                if let Some(action) = actions.iter().find(|a| a.id == *action_id) {
+                    if let Some(path) = action.source_path.clone() {
+                        self.add_tab_for_code_file(path, None, ctx);
+                    }
+                }
+            }
+            OpenTriggerFile(trigger_id) => {
+                use crate::user_config::WarpConfig;
+                let config = WarpConfig::as_ref(ctx);
+                let triggers = config.triggers().to_vec();
+                drop(config);
+                if let Some(trigger) = triggers.iter().find(|t| t.id == *trigger_id) {
+                    if let Some(path) = trigger.source_path.clone() {
+                        self.add_tab_for_code_file(path, None, ctx);
+                    }
+                }
+            }
+            KillAndClearAllTerminals => {
+                let count = self.tab_count();
+                let groups: Vec<_> = (0..count)
+                    .filter_map(|i| self.get_pane_group_view(i).cloned())
+                    .collect();
+                for group_handle in groups {
+                    group_handle.update(ctx, |group, group_ctx| {
+                        for terminal_handle in group.terminal_views(group_ctx) {
+                            terminal_handle.update(group_ctx, |terminal, term_ctx| {
+                                terminal.send_interrupt(term_ctx);
+                                terminal.clear_all_output(term_ctx);
+                            });
+                        }
+                    });
+                }
             }
             #[cfg(feature = "local_fs")]
             OpenCodeReviewPanel(locator) => {
