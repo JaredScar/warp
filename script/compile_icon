@@ -37,14 +37,26 @@ echo "Compiling .icon bundle for $CHANNEL channel"
 BUNDLED_RESOURCES_DIR="$APP_BUNDLE_PATH/Contents/Resources"
 PARTIAL_INFO_PLIST="$(dirname "$APP_BUNDLE_PATH")/partial-icon-info.plist"
 
-# Compile the .icon bundle using actool
+# Compile the .icon bundle using actool.
+# actool can crash on some Xcode versions (e.g. Xcode 26 with certain icon
+# bundle formats), so we capture its exit status separately rather than letting
+# `set -e` abort the whole build. The icon is cosmetic for dev builds; missing
+# it is acceptable.
+ACTOOL_EXIT=0
 xcrun actool \
   --compile "$BUNDLED_RESOURCES_DIR" \
   --platform macosx \
   --minimum-deployment-target 10.14 \
   --app-icon AppIcon \
   --output-partial-info-plist "$PARTIAL_INFO_PLIST" \
-  "$ICON_BUNDLE_PATH"
+  "$ICON_BUNDLE_PATH" || ACTOOL_EXIT=$?
+
+if [[ $ACTOOL_EXIT -ne 0 ]]; then
+    XCODE_VERSION=$(xcodebuild -version 2>/dev/null | head -1 || echo "unknown")
+    echo "Warning: actool exited with code $ACTOOL_EXIT while compiling icon bundle; skipping icon step." >&2
+    echo "(Xcode version: $XCODE_VERSION — Xcode <26 does not support .icon bundles.)" >&2
+    exit 0
+fi
 
 # Earlier XCode versions won't build the correct asset format for adaptive icons
 if [[ ! -f "$BUNDLED_RESOURCES_DIR/Assets.car" ]]; then
