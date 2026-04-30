@@ -35,6 +35,8 @@ The **Actions, Triggers & Workspaces** panel is a productivity feature accessibl
 
 **Actions** are named, reusable groups of shell commands. Once defined, an action can be run in the active terminal with a single click, or composed into a trigger to fire multiple actions in sequence.
 
+<img width="480" alt="Actions list showing built-in and user-defined actions" src="docs/screenshots/actions-list.png" />
+
 **Creating and editing actions**
 
 - Open the panel and switch to the **Actions** tab.
@@ -42,14 +44,21 @@ The **Actions, Triggers & Workspaces** panel is a productivity feature accessibl
 - Fill in:
   - **Name** — a short, human-readable identifier (e.g. `Start Dev Server`).
   - **Description** *(optional)* — extra context shown as secondary text in the list.
-  - **Commands** — one or more shell commands separated by newlines. Each line is sent to the active terminal in order.
+  - **Tab Name** *(optional)* — when the action is executed via a trigger, the new terminal tab will be given this name.
+  - **Commands** — one or more shell commands, each on its own numbered row. Commands are sent to the terminal in order. Use **+ Add Command** to insert additional rows; click **✕** to remove one.
 - Click **Save** to persist the action to `~/.warp/actions/<name>.toml`. Click **Cancel** to discard.
-- To edit an existing action, click the **pencil icon** on any action row. The editor opens pre-populated with the saved name, description, and commands.
+- To edit an existing action, click the **pencil icon** on any action row. The editor opens pre-populated with the saved name, description, tab name, and commands.
 - To delete an action, click the **trash icon** on the action row.
+
+<img width="480" alt="Action editor with tab name and individual command rows" src="docs/screenshots/action-editor.png" />
+
+> **Built-in actions** — two non-deletable actions are always present at the top of the list:
+> - **Close All Terminals** — closes every open terminal tab and leaves one clean tab open.
+> - **Kill All Terminal Processes** — sends SIGINT (Ctrl-C) to every running terminal process.
 
 **Running actions**
 
-Click the **play icon** on any action row to immediately send all of its commands to the currently focused terminal pane.
+Click the **play icon** on any action row to immediately send all of its commands to the currently focused terminal pane in sequence.
 
 ---
 
@@ -74,9 +83,17 @@ Click the **play icon** on any action row to immediately send all of its command
 - To edit an existing trigger, click the **pencil icon** on a trigger row. The editor opens pre-populated with all fields and the previously selected action order.
 - To delete a trigger, click the **trash icon** on the trigger row.
 
+<img width="480" alt="Trigger editor showing selected actions in execution order" src="docs/screenshots/trigger-editor.png" />
+
 **Running triggers**
 
-Click the **play icon** on a trigger row to run all of its actions in sequence in the active terminal.
+Click the **play icon** on a trigger row to start the sequence. Each action opens a **new terminal tab** (named by the action's optional Tab Name) and runs its commands one after the other before moving to the next action.
+
+While a trigger is running:
+- The main window is dimmed and non-interactable, with a **"Trigger Running"** card showing the trigger name and a **Stop Trigger** button.
+- A badge appears on the Actions & Triggers toolbar icon — clicking it also stops the trigger immediately.
+
+<img width="720" alt="Trigger running overlay with Stop Trigger button" src="docs/screenshots/trigger-running.png" />
 
 ---
 
