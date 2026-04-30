@@ -20425,16 +20425,36 @@ impl TypedActionView for Workspace {
                         saved_ws.snapshot.tabs.len()
                     );
                     for tab_snapshot in &saved_ws.snapshot.tabs {
+                        if tab_snapshot.is_ambient_agent {
+                            self.add_ambient_agent_tab(ctx);
+                            continue;
+                        }
+
                         let initial_directory = tab_snapshot
                             .cwd
                             .as_deref()
                             .map(std::path::PathBuf::from)
                             .filter(|p| p.is_dir());
                         let custom_title = tab_snapshot.custom_title.clone();
+
+                        // Resolve the saved shell back to an AvailableShell so
+                        // the restored tab uses the same shell (bash, PowerShell, etc.)
+                        // as when the workspace was saved.
+                        #[cfg(feature = "local_tty")]
+                        let shell: Option<AvailableShell> =
+                            tab_snapshot.shell_launch_data.as_ref().and_then(|sld| {
+                                use crate::terminal::available_shells::AvailableShells;
+                                AvailableShells::handle(ctx)
+                                    .read(ctx, |model, _| model.get_from_shell_launch_data(sld))
+                            });
+                        #[cfg(not(feature = "local_tty"))]
+                        let shell: Option<AvailableShell> = None;
+
                         self.add_tab_with_pane_layout(
                             PanesLayout::SingleTerminal(Box::new(NewTerminalOptions {
                                 initial_directory,
                                 hide_homepage: true,
+                                shell,
                                 ..Default::default()
                             })),
                             std::sync::Arc::new(std::collections::HashMap::new()),

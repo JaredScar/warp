@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::terminal::ShellLaunchData;
+
 /// A named group of shell commands that can be run together.
 ///
 /// Actions are the atomic unit of automation — each holds an ordered list of
@@ -110,6 +112,14 @@ pub struct WorkspaceTabSnapshot {
     /// Shell command to run on open (forwarded to `ShellLaunchData`).
     #[serde(default)]
     pub commands: Vec<String>,
+    /// The shell that was running in the terminal pane at save time.
+    /// `None` means "use the system default shell" (same as before this field existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_launch_data: Option<ShellLaunchData>,
+    /// When `true`, this tab was an Ambient Agent (Cloud Oz) pane rather than
+    /// a regular terminal.  Restored via `add_ambient_agent_tab`.
+    #[serde(default)]
+    pub is_ambient_agent: bool,
 }
 
 impl WorkspaceSnapshot {
@@ -133,15 +143,30 @@ impl WorkspaceSnapshot {
             }
         }
 
+        fn is_ambient_agent(node: &PaneNodeSnapshot) -> bool {
+            match node {
+                PaneNodeSnapshot::Leaf(leaf) => {
+                    matches!(leaf.contents, LeafContents::AmbientAgent(_))
+                }
+                PaneNodeSnapshot::Branch(branch) => branch
+                    .children
+                    .iter()
+                    .any(|(_, child)| is_ambient_agent(child)),
+            }
+        }
+
         let tabs = ws
             .tabs
             .iter()
             .map(|tab| {
+                let ambient = is_ambient_agent(&tab.root);
                 let terminal = first_terminal(&tab.root);
                 WorkspaceTabSnapshot {
                     custom_title: tab.custom_title.clone(),
                     cwd: terminal.and_then(|t| t.cwd.clone()),
                     commands: vec![],
+                    shell_launch_data: terminal.and_then(|t| t.shell_launch_data.clone()),
+                    is_ambient_agent: ambient,
                 }
             })
             .collect();
