@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 use crate::actions::model::is_builtin_action;
@@ -7,10 +7,12 @@ use warp_core::ui::Icon;
 use warpui::{
     elements::{
         resizable_state_handle, Align, ConstrainedBox, Container, CornerRadius,
-        CrossAxisAlignment, DragBarSide, Element, Flex, Hoverable, MainAxisAlignment, MainAxisSize,
-        MouseStateHandle, ParentElement, Radius, Resizable, ResizableStateHandle, Shrinkable, Text,
+        CrossAxisAlignment, DragBarSide, DispatchEventResult, Element, EventHandler, Flex, Hoverable,
+        MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Radius, Resizable,
+        ResizableStateHandle, Shrinkable, Text,
     },
     fonts::{Properties, Weight},
+    keymap::Keystroke,
     platform::Cursor,
     ui_components::{
         button::ButtonVariant,
@@ -115,10 +117,22 @@ pub struct ActionsPanelView {
     edit_group_editor: ViewHandle<EditorView>,
     /// Optional timeout in seconds (numeric string).
     edit_timeout_editor: ViewHandle<EditorView>,
-    /// Optional keyboard shortcut label.
-    edit_hotkey_editor: ViewHandle<EditorView>,
-    /// Hotkey editor for triggers.
-    edit_trigger_hotkey_editor: ViewHandle<EditorView>,
+    /// Captured hotkey string for the action being edited.
+    hotkey_value: String,
+    /// Captured hotkey string for the trigger being edited.
+    trigger_hotkey_value: String,
+    /// Whether the action hotkey capture field is in recording mode.
+    hotkey_recording: bool,
+    /// Whether the trigger hotkey capture field is in recording mode.
+    trigger_hotkey_recording: bool,
+    /// Mouse state for the action hotkey capture button.
+    hotkey_field_state: MouseStateHandle,
+    /// Mouse state for the trigger hotkey capture button.
+    trigger_hotkey_field_state: MouseStateHandle,
+    /// Set of group labels (and section headers like "PINNED") that are currently collapsed.
+    collapsed_groups: RefCell<HashSet<String>>,
+    /// Mouse states for clickable group/section headers, keyed by header label.
+    group_header_states: RefCell<HashMap<String, MouseStateHandle>>,
     /// One single-line editor per command, each paired with a stable UUID for mouse-state keying.
     edit_command_editors: Vec<(Uuid, ViewHandle<EditorView>)>,
     /// Per-command delete-button mouse states, keyed by the command's stable UUID.
@@ -174,10 +188,6 @@ impl ActionsPanelView {
             ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
         let edit_timeout_editor =
             ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
-        let edit_hotkey_editor =
-            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
-        let edit_trigger_hotkey_editor =
-            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
         let trigger_search_editor =
             ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
         let palette_search_editor =
@@ -197,12 +207,6 @@ impl ActionsPanelView {
         });
         edit_timeout_editor.update(ctx, |editor, ctx| {
             editor.set_placeholder_text("Seconds (default: 5)", ctx);
-        });
-        edit_hotkey_editor.update(ctx, |editor, ctx| {
-            editor.set_placeholder_text("e.g. ⌘⇧R", ctx);
-        });
-        edit_trigger_hotkey_editor.update(ctx, |editor, ctx| {
-            editor.set_placeholder_text("e.g. ⌘⇧T", ctx);
         });
         trigger_search_editor.update(ctx, |editor, ctx| {
             editor.set_placeholder_text("Search actions…", ctx);
@@ -256,8 +260,14 @@ impl ActionsPanelView {
             edit_tab_name_editor,
             edit_group_editor,
             edit_timeout_editor,
-            edit_hotkey_editor,
-            edit_trigger_hotkey_editor,
+            hotkey_value: String::new(),
+            trigger_hotkey_value: String::new(),
+            hotkey_recording: false,
+            trigger_hotkey_recording: false,
+            hotkey_field_state: Default::default(),
+            trigger_hotkey_field_state: Default::default(),
+            collapsed_groups: Default::default(),
+            group_header_states: Default::default(),
             edit_command_editors: Vec::new(),
             edit_command_remove_states: Default::default(),
             add_command_state: Default::default(),
@@ -323,6 +333,9 @@ impl ActionsPanelView {
             (String::new(), String::new(), String::new(), String::new(), String::new(), String::new(), vec![String::new()])
         };
 
+        self.hotkey_value = hotkey;
+        self.hotkey_recording = false;
+
         self.edit_name_editor.update(ctx, |e, ctx| {
             e.set_buffer_text_with_base_buffer(&name, ctx);
         });
@@ -337,9 +350,6 @@ impl ActionsPanelView {
         });
         self.edit_timeout_editor.update(ctx, |e, ctx| {
             e.set_buffer_text_with_base_buffer(&timeout, ctx);
-        });
-        self.edit_hotkey_editor.update(ctx, |e, ctx| {
-            e.set_buffer_text_with_base_buffer(&hotkey, ctx);
         });
 
         // Build one editor per command (at least one empty row for new actions).
@@ -375,6 +385,8 @@ impl ActionsPanelView {
             (String::new(), String::new(), String::new(), Vec::new())
         };
 
+        self.trigger_hotkey_value = hotkey;
+        self.trigger_hotkey_recording = false;
         self.edit_selected_action_ids = ordered_ids;
         self.trigger_search_query = String::new();
 
@@ -383,9 +395,6 @@ impl ActionsPanelView {
         });
         self.edit_desc_editor.update(ctx, |e, ctx| {
             e.set_buffer_text_with_base_buffer(&desc, ctx);
-        });
-        self.edit_trigger_hotkey_editor.update(ctx, |e, ctx| {
-            e.set_buffer_text_with_base_buffer(&hotkey, ctx);
         });
         self.trigger_search_editor.update(ctx, |e, ctx| {
             e.set_buffer_text_with_base_buffer("", ctx);
@@ -663,16 +672,58 @@ impl ActionsPanelView {
 
     fn render_group_header(&self, label: &str, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
-        Container::new(
-            Text::new(label.to_string(), appearance.ui_font_family(), 10.)
-                .with_style(Properties::default().weight(Weight::Semibold))
-                .with_color(theme.sub_text_color(theme.background()).into_solid())
-                .finish(),
-        )
-        .with_padding_left(10.)
-        .with_padding_right(10.)
-        .with_padding_top(8.)
-        .with_padding_bottom(2.)
+        let font = appearance.ui_font_family();
+        let label_str = label.to_string();
+        let collapsed = self.collapsed_groups.borrow().contains(label);
+        let chevron = if collapsed { "▶" } else { "▼" };
+        let mouse_state = self
+            .group_header_states
+            .borrow_mut()
+            .entry(label_str.clone())
+            .or_insert_with(MouseStateHandle::default)
+            .clone();
+
+        let text_color = theme.sub_text_color(theme.background()).into_solid();
+        let label_for_render = label_str.clone();
+        let label_for_click = label_str;
+
+        Hoverable::new(mouse_state, move |hover_state| {
+            let bg = if hover_state.is_hovered() {
+                Some(pathfinder_color::ColorU::new(255, 255, 255, 8))
+            } else {
+                None
+            };
+            let inner = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(4.)
+                .with_child(
+                    Text::new(chevron.to_string(), font, 9.)
+                        .with_color(text_color)
+                        .finish(),
+                )
+                .with_child(
+                    Text::new(label_for_render.clone(), font, 10.)
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .with_color(text_color)
+                        .finish(),
+                )
+                .finish();
+            let mut c = Container::new(inner)
+                .with_padding_left(10.)
+                .with_padding_right(10.)
+                .with_padding_top(8.)
+                .with_padding_bottom(2.);
+            if let Some(bg) = bg {
+                c = c.with_background(bg);
+            }
+            c.finish()
+        })
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(ActionsPanelAction::ToggleGroupCollapse(
+                label_for_click.clone(),
+            ));
+        })
+        .with_cursor(Cursor::PointingHand)
         .finish()
     }
 
@@ -754,29 +805,39 @@ impl ActionsPanelView {
             // ── Built-ins ─────────────────────────────────────────────────
             if !builtin.is_empty() {
                 col = col.with_child(self.render_group_header("BUILT-IN", appearance));
-                for action in &builtin {
-                    col = col.with_child(self.render_action_row(action, appearance));
+                if !self.collapsed_groups.borrow().contains("BUILT-IN") {
+                    for action in &builtin {
+                        col = col.with_child(self.render_action_row(action, appearance));
+                    }
                 }
             }
 
             // ── Pinned ────────────────────────────────────────────────────
             if !pinned.is_empty() {
                 col = col.with_child(self.render_group_header("PINNED", appearance));
-                for action in &pinned {
-                    col = col.with_child(self.render_action_row(action, appearance));
+                if !self.collapsed_groups.borrow().contains("PINNED") {
+                    for action in &pinned {
+                        col = col.with_child(self.render_action_row(action, appearance));
+                    }
                 }
             }
 
             // ── Grouped user actions ──────────────────────────────────────
             for (group_label, group_actions) in &groups {
                 if !group_actions.is_empty() {
-                    if let Some(label) = group_label {
+                    let header_key = if let Some(label) = group_label {
                         col = col.with_child(self.render_group_header(label, appearance));
+                        label.clone()
                     } else if !pinned.is_empty() || !builtin.is_empty() {
                         col = col.with_child(self.render_group_header("OTHER", appearance));
-                    }
-                    for action in group_actions {
-                        col = col.with_child(self.render_action_row(action, appearance));
+                        "OTHER".to_string()
+                    } else {
+                        String::new()
+                    };
+                    if !self.collapsed_groups.borrow().contains(&header_key) {
+                        for action in group_actions {
+                            col = col.with_child(self.render_action_row(action, appearance));
+                        }
                     }
                 }
             }
@@ -885,15 +946,23 @@ impl ActionsPanelView {
             let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
             if !pinned.is_empty() {
                 col = col.with_child(self.render_group_header("PINNED", appearance));
-                for trigger in &pinned {
-                    col = col.with_child(self.render_trigger_row(trigger, appearance));
+                if !self.collapsed_groups.borrow().contains("PINNED") {
+                    for trigger in &pinned {
+                        col = col.with_child(self.render_trigger_row(trigger, appearance));
+                    }
                 }
                 if !unpinned.is_empty() {
                     col = col.with_child(self.render_group_header("OTHER", appearance));
+                    if !self.collapsed_groups.borrow().contains("OTHER") {
+                        for trigger in &unpinned {
+                            col = col.with_child(self.render_trigger_row(trigger, appearance));
+                        }
+                    }
                 }
-            }
-            for trigger in unpinned {
-                col = col.with_child(self.render_trigger_row(trigger, appearance));
+            } else {
+                for trigger in &unpinned {
+                    col = col.with_child(self.render_trigger_row(trigger, appearance));
+                }
             }
             Shrinkable::new(1.0, col.finish()).finish()
         };
@@ -1446,6 +1515,77 @@ impl ActionsPanelView {
             .clone()
     }
 
+    /// Renders a click-to-record hotkey capture field.
+    /// `is_trigger` selects which pair of state fields to use.
+    fn render_hotkey_capture_field(&self, is_trigger: bool, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+        let recording = if is_trigger { self.trigger_hotkey_recording } else { self.hotkey_recording };
+        let value = if is_trigger { self.trigger_hotkey_value.clone() } else { self.hotkey_value.clone() };
+        let field_state = if is_trigger {
+            self.trigger_hotkey_field_state.clone()
+        } else {
+            self.hotkey_field_state.clone()
+        };
+
+        let recording_bg = pathfinder_color::ColorU::new(255, 140, 0, 40);
+        let normal_bg = pathfinder_color::ColorU::new(255, 255, 255, 10);
+        let border_radius = CornerRadius::with_all(Radius::Pixels(4.));
+
+        let inner: Box<dyn Element> = if recording {
+            // Recording mode: show instructions; key capture handled by the EventHandler in render()
+            let text_color = theme.sub_text_color(theme.background()).into_solid();
+            let content = Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Text::new(
+                            "⌨  Press a key combination… (Esc to cancel)".to_string(),
+                            font,
+                            12.,
+                        )
+                        .with_color(text_color)
+                        .finish(),
+                    )
+                    .finish(),
+            )
+            .with_background(recording_bg)
+            .with_corner_radius(border_radius)
+            .with_padding_left(10.)
+            .with_padding_right(10.)
+            .finish();
+            ConstrainedBox::new(content).with_height(FIELD_HEIGHT).finish()
+        } else {
+            // Normal mode: display value or placeholder; clicking enters recording mode
+            let is_empty = value.is_empty();
+            let display = if is_empty { "Click to record shortcut…".to_string() } else { value.clone() };
+            let sub_color = theme.sub_text_color(theme.background()).into_solid();
+            let main_color = theme.main_text_color(theme.background()).into_solid();
+            Hoverable::new(field_state, move |_| {
+                let text_color = if is_empty { sub_color } else { main_color };
+                let text_el = Text::new(display.clone(), font, 12.).with_color(text_color).finish();
+                let content = Container::new(text_el)
+                    .with_background(normal_bg)
+                    .with_corner_radius(border_radius)
+                    .with_padding_left(10.)
+                    .with_padding_right(10.)
+                    .finish();
+                ConstrainedBox::new(content).with_height(FIELD_HEIGHT).finish()
+            })
+            .on_click(move |ctx, _, _| {
+                if is_trigger {
+                    ctx.dispatch_typed_action(ActionsPanelAction::StartTriggerHotkeyRecording);
+                } else {
+                    ctx.dispatch_typed_action(ActionsPanelAction::StartHotkeyRecording);
+                }
+            })
+            .with_cursor(Cursor::PointingHand)
+            .finish()
+        };
+
+        Container::new(inner).with_margin_bottom(FIELD_SPACING).finish()
+    }
+
     fn render_action_editor(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
         let font = appearance.ui_font_family();
@@ -1467,7 +1607,7 @@ impl ActionsPanelView {
         col = col.with_child(self.render_text_field(&self.edit_group_editor, Some(FIELD_HEIGHT), appearance));
 
         col = col.with_child(self.render_field_label("HOTKEY", appearance));
-        col = col.with_child(self.render_text_field(&self.edit_hotkey_editor, Some(FIELD_HEIGHT), appearance));
+        col = col.with_child(self.render_hotkey_capture_field(false, appearance));
 
         col = col.with_child(self.render_field_label("TIMEOUT (SECS)", appearance));
         col = col.with_child(self.render_text_field(&self.edit_timeout_editor, Some(FIELD_HEIGHT), appearance));
@@ -1800,7 +1940,7 @@ impl ActionsPanelView {
         col = col.with_child(self.render_text_field(&self.edit_desc_editor, Some(FIELD_HEIGHT), appearance));
 
         col = col.with_child(self.render_field_label("HOTKEY", appearance));
-        col = col.with_child(self.render_text_field(&self.edit_trigger_hotkey_editor, Some(FIELD_HEIGHT), appearance));
+        col = col.with_child(self.render_hotkey_capture_field(true, appearance));
 
         // ── Selected actions (ordered list) ───────────────────────────────
         if !self.edit_selected_action_ids.is_empty() {
@@ -2048,6 +2188,24 @@ pub enum ActionsPanelAction {
     PinAction(Uuid),
     /// Toggle the `pinned` flag on a trigger by ID.
     PinTrigger(Uuid),
+    /// Expand or collapse a group/section header.
+    ToggleGroupCollapse(String),
+    /// Enter recording mode for the action hotkey field.
+    StartHotkeyRecording,
+    /// Cancel recording mode for the action hotkey field without changing the value.
+    StopHotkeyRecording,
+    /// Enter recording mode for the trigger hotkey field.
+    StartTriggerHotkeyRecording,
+    /// Cancel recording mode for the trigger hotkey field without changing the value.
+    StopTriggerHotkeyRecording,
+    /// Commit a recorded keystroke display string to the action hotkey field.
+    RecordedHotkey(String),
+    /// Commit a recorded keystroke display string to the trigger hotkey field.
+    RecordedTriggerHotkey(String),
+    /// Clear the action hotkey field.
+    ClearHotkey,
+    /// Clear the trigger hotkey field.
+    ClearTriggerHotkey,
 }
 
 // ── View impl ─────────────────────────────────────────────────────────────────
@@ -2086,7 +2244,7 @@ impl View for ActionsPanelView {
             PanelMode::Palette => self.render_palette(&actions, &triggers, &workspaces, appearance),
         };
 
-        let panel_content = Container::new(
+        let panel_content: Box<dyn Element> = Container::new(
             Flex::column()
                 .with_child(header)
                 .with_child(Shrinkable::new(1.0, content).finish())
@@ -2094,6 +2252,57 @@ impl View for ActionsPanelView {
                 .finish(),
         )
         .finish();
+
+        // When recording a hotkey, intercept all key presses to capture them.
+        let is_trigger_recording = self.trigger_hotkey_recording;
+        let panel_content: Box<dyn Element> = if self.hotkey_recording || self.trigger_hotkey_recording {
+            EventHandler::new(panel_content)
+                .on_keydown(move |ctx, _, keystroke: &Keystroke| {
+                    let key = keystroke.key.to_lowercase();
+                    // Ignore bare modifier-key presses (wait for a real key).
+                    if matches!(
+                        key.as_str(),
+                        "shift"
+                            | "ctrl"
+                            | "control"
+                            | "alt"
+                            | "option"
+                            | "cmd"
+                            | "command"
+                            | "super"
+                            | "meta"
+                            | "hyper"
+                            | "func"
+                            | "function"
+                            | "capslock"
+                            | "caps lock"
+                    ) {
+                        return DispatchEventResult::StopPropagation;
+                    }
+                    if key == "escape" {
+                        if is_trigger_recording {
+                            ctx.dispatch_typed_action(
+                                ActionsPanelAction::StopTriggerHotkeyRecording,
+                            );
+                        } else {
+                            ctx.dispatch_typed_action(ActionsPanelAction::StopHotkeyRecording);
+                        }
+                        return DispatchEventResult::StopPropagation;
+                    }
+                    let displayed = keystroke.displayed();
+                    if is_trigger_recording {
+                        ctx.dispatch_typed_action(ActionsPanelAction::RecordedTriggerHotkey(
+                            displayed,
+                        ));
+                    } else {
+                        ctx.dispatch_typed_action(ActionsPanelAction::RecordedHotkey(displayed));
+                    }
+                    DispatchEventResult::StopPropagation
+                })
+                .finish()
+        } else {
+            panel_content
+        };
 
         if warpui::platform::is_mobile_device() {
             return panel_content;
@@ -2238,6 +2447,9 @@ impl warpui::TypedActionView for ActionsPanelView {
                 self.palette_search_editor.update(ctx, |e, ctx| {
                     e.set_buffer_text_with_base_buffer("", ctx);
                 });
+                // Reset hotkey recording state.
+                self.hotkey_recording = false;
+                self.trigger_hotkey_recording = false;
                 ctx.notify();
             }
             ActionsPanelAction::EnterPaletteMode => {
@@ -2249,6 +2461,51 @@ impl warpui::TypedActionView for ActionsPanelView {
             }
             ActionsPanelAction::PinTrigger(id) => {
                 ctx.dispatch_typed_action(&WorkspaceAction::ToggleTriggerPin(*id));
+            }
+            ActionsPanelAction::ToggleGroupCollapse(label) => {
+                let mut set = self.collapsed_groups.borrow_mut();
+                if set.contains(label.as_str()) {
+                    set.remove(label.as_str());
+                } else {
+                    set.insert(label.clone());
+                }
+                ctx.notify();
+            }
+            ActionsPanelAction::StartHotkeyRecording => {
+                self.hotkey_recording = true;
+                ctx.notify();
+            }
+            ActionsPanelAction::StopHotkeyRecording => {
+                self.hotkey_recording = false;
+                ctx.notify();
+            }
+            ActionsPanelAction::StartTriggerHotkeyRecording => {
+                self.trigger_hotkey_recording = true;
+                ctx.notify();
+            }
+            ActionsPanelAction::StopTriggerHotkeyRecording => {
+                self.trigger_hotkey_recording = false;
+                ctx.notify();
+            }
+            ActionsPanelAction::RecordedHotkey(s) => {
+                self.hotkey_value = s.clone();
+                self.hotkey_recording = false;
+                ctx.notify();
+            }
+            ActionsPanelAction::RecordedTriggerHotkey(s) => {
+                self.trigger_hotkey_value = s.clone();
+                self.trigger_hotkey_recording = false;
+                ctx.notify();
+            }
+            ActionsPanelAction::ClearHotkey => {
+                self.hotkey_value = String::new();
+                self.hotkey_recording = false;
+                ctx.notify();
+            }
+            ActionsPanelAction::ClearTriggerHotkey => {
+                self.trigger_hotkey_value = String::new();
+                self.trigger_hotkey_recording = false;
+                ctx.notify();
             }
             ActionsPanelAction::SaveForm => {
                 // Workspace name form uses its own editor; handle it first.
@@ -2315,11 +2572,7 @@ impl warpui::TypedActionView for ActionsPanelView {
                             .to_string();
                         let group = if group_raw.is_empty() { None } else { Some(group_raw) };
 
-                        let hotkey_raw = self
-                            .edit_hotkey_editor
-                            .read(ctx, |e, ctx| e.buffer_text(ctx))
-                            .trim()
-                            .to_string();
+                        let hotkey_raw = self.hotkey_value.trim().to_string();
                         let hotkey = if hotkey_raw.is_empty() { None } else { Some(hotkey_raw) };
 
                         let timeout_raw = self
@@ -2370,11 +2623,7 @@ impl warpui::TypedActionView for ActionsPanelView {
                     PanelMode::EditTrigger(maybe_id) => {
                         let selected = self.edit_selected_action_ids.iter().cloned().collect::<Vec<_>>();
 
-                        let hotkey_raw = self
-                            .edit_trigger_hotkey_editor
-                            .read(ctx, |e, ctx| e.buffer_text(ctx))
-                            .trim()
-                            .to_string();
+                        let hotkey_raw = self.trigger_hotkey_value.trim().to_string();
                         let hotkey = if hotkey_raw.is_empty() { None } else { Some(hotkey_raw) };
 
                         let config = WarpConfig::as_ref(ctx);

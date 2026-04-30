@@ -1,4 +1,8 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use warpui::{
     elements::MouseStateHandle, AppContext, EntityId, SingletonEntity, ViewContext, ViewHandle,
     WindowId,
@@ -45,6 +49,8 @@ pub(super) struct WorkspaceMouseStates {
     pub(super) stop_trigger_button: MouseStateHandle,
     pub(super) kill_all_icon: MouseStateHandle,
     pub(super) title_bar_search_bar: MouseStateHandle,
+    /// Dynamic mouse states for pinned action/trigger toolbar quick-launch buttons.
+    pub(super) pinned_item_states: RefCell<HashMap<Uuid, MouseStateHandle>>,
     #[cfg(target_family = "wasm")]
     pub(super) warp_logo: MouseStateHandle,
 }

@@ -16900,7 +16900,7 @@ impl Workspace {
         // When a trigger is running, overlay a pulsing red "stop" dot badge on
         // the icon so the user knows something is happening.  Clicking it stops
         // the trigger immediately.
-        if self.trigger_running_name.is_some() {
+        let actions_btn: Box<dyn Element> = if self.trigger_running_name.is_some() {
             let theme = appearance.theme();
             let badge = EventHandler::new(
                 ConstrainedBox::new(
@@ -16934,7 +16934,79 @@ impl Workspace {
             badge_stack.finish()
         } else {
             icon_btn
+        };
+
+        // Collect pinned actions and triggers for quick-launch toolbar buttons.
+        let warp_config = WarpConfig::as_ref(ctx);
+        let pinned_actions: Vec<(uuid::Uuid, String)> = warp_config
+            .actions()
+            .iter()
+            .filter(|a| a.pinned && !crate::actions::model::is_builtin_action(&a.id))
+            .map(|a| (a.id, a.name.clone()))
+            .collect();
+        let pinned_triggers: Vec<(uuid::Uuid, String)> = warp_config
+            .triggers()
+            .iter()
+            .filter(|t| t.pinned)
+            .map(|t| (t.id, t.name.clone()))
+            .collect();
+        drop(warp_config);
+
+        if pinned_actions.is_empty() && pinned_triggers.is_empty() {
+            return actions_btn;
         }
+
+        let mut row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(actions_btn);
+
+        for (id, name) in pinned_actions {
+            let mouse_state = self
+                .mouse_states
+                .pinned_item_states
+                .borrow_mut()
+                .entry(id)
+                .or_insert_with(MouseStateHandle::default)
+                .clone();
+            let btn = self
+                .render_tab_bar_icon_button(
+                    appearance,
+                    icons::Icon::Lightning,
+                    &mouse_state,
+                    WorkspaceAction::RunActionInActiveTerminal(id),
+                    name,
+                    None,
+                    false,
+                    false,
+                )
+                .finish();
+            row = row.with_child(btn);
+        }
+
+        for (id, name) in pinned_triggers {
+            let mouse_state = self
+                .mouse_states
+                .pinned_item_states
+                .borrow_mut()
+                .entry(id)
+                .or_insert_with(MouseStateHandle::default)
+                .clone();
+            let btn = self
+                .render_tab_bar_icon_button(
+                    appearance,
+                    icons::Icon::Workflow,
+                    &mouse_state,
+                    WorkspaceAction::RunTrigger(id),
+                    name,
+                    None,
+                    false,
+                    false,
+                )
+                .finish();
+            row = row.with_child(btn);
+        }
+
+        row.finish()
     }
 
     /// Render the full-screen overlay that blocks interaction while a trigger
