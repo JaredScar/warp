@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use uuid::Uuid;
 use warp_core::ui::Icon;
@@ -20,7 +20,7 @@ use warpui::{
 
 use crate::appearance::Appearance;
 use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
-use crate::editor::{EditorOptions, EditorView, SingleLineEditorOptions, TextOptions};
+use crate::editor::{EditorOptions, EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
 use crate::pane_group::pane::view::header::{components::HEADER_EDGE_PADDING, PANE_HEADER_HEIGHT};
 use crate::ui_components::{
     blended_colors,
@@ -104,10 +104,18 @@ pub struct ActionsPanelView {
     edit_name_editor: ViewHandle<EditorView>,
     edit_desc_editor: ViewHandle<EditorView>,
     edit_commands_editor: ViewHandle<EditorView>,
-    /// Action IDs currently selected in the trigger editor.
-    edit_selected_action_ids: HashSet<Uuid>,
-    /// Stable toggle-button states for each action in the trigger editor (keyed by UUID).
+    /// Ordered list of action IDs selected for the trigger being edited.
+    edit_selected_action_ids: Vec<Uuid>,
+    /// Search query typed in the trigger action picker.
+    trigger_search_query: String,
+    /// Single-line editor for filtering available actions in the trigger form.
+    trigger_search_editor: ViewHandle<EditorView>,
+    /// Stable mouse states for the picker rows (add button, keyed by UUID).
     edit_action_toggle_states: RefCell<HashMap<Uuid, MouseStateHandle>>,
+    /// Stable mouse states for selected-list control buttons (up/down/remove, keyed by UUID).
+    edit_selected_move_up_states: RefCell<HashMap<Uuid, MouseStateHandle>>,
+    edit_selected_move_down_states: RefCell<HashMap<Uuid, MouseStateHandle>>,
+    edit_selected_remove_states: RefCell<HashMap<Uuid, MouseStateHandle>>,
     save_form_state: MouseStateHandle,
     cancel_form_state: MouseStateHandle,
 }
@@ -129,6 +137,8 @@ impl ActionsPanelView {
         let edit_name_editor =
             ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
         let edit_desc_editor =
+            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
+        let trigger_search_editor =
             ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts, ctx));
 
         edit_name_editor.update(ctx, |editor, ctx| {
@@ -136,6 +146,19 @@ impl ActionsPanelView {
         });
         edit_desc_editor.update(ctx, |editor, ctx| {
             editor.set_placeholder_text("Description (optional)", ctx);
+        });
+        trigger_search_editor.update(ctx, |editor, ctx| {
+            editor.set_placeholder_text("Search actions…", ctx);
+        });
+
+        // Keep trigger_search_query in sync with the search editor text.
+        ctx.subscribe_to_view(&trigger_search_editor, |me, _, event, ctx| {
+            if matches!(event, EditorEvent::Edited(_)) {
+                me.trigger_search_query = me
+                    .trigger_search_editor
+                    .read(ctx, |e, ctx| e.buffer_text(ctx));
+                ctx.notify();
+            }
         });
 
         let multi_opts = EditorOptions {
@@ -170,8 +193,13 @@ impl ActionsPanelView {
             edit_name_editor,
             edit_desc_editor,
             edit_commands_editor,
-            edit_selected_action_ids: Default::default(),
+            edit_selected_action_ids: Vec::new(),
+            trigger_search_query: String::new(),
+            trigger_search_editor,
             edit_action_toggle_states: Default::default(),
+            edit_selected_move_up_states: Default::default(),
+            edit_selected_move_down_states: Default::default(),
+            edit_selected_remove_states: Default::default(),
             save_form_state: Default::default(),
             cancel_form_state: Default::default(),
         }
@@ -198,22 +226,13 @@ impl ActionsPanelView {
         };
 
         self.edit_name_editor.update(ctx, |e, ctx| {
-            e.clear_buffer_and_reset_undo_stack(ctx);
-            if !name.is_empty() {
-                e.set_base_buffer_text(name, ctx);
-            }
+            e.set_buffer_text_with_base_buffer(&name, ctx);
         });
         self.edit_desc_editor.update(ctx, |e, ctx| {
-            e.clear_buffer_and_reset_undo_stack(ctx);
-            if !desc.is_empty() {
-                e.set_base_buffer_text(desc, ctx);
-            }
+            e.set_buffer_text_with_base_buffer(&desc, ctx);
         });
         self.edit_commands_editor.update(ctx, |e, ctx| {
-            e.clear_buffer_and_reset_undo_stack(ctx);
-            if !commands.is_empty() {
-                e.set_base_buffer_text(commands, ctx);
-            }
+            e.set_buffer_text_with_base_buffer(&commands, ctx);
         });
         ctx.notify();
     }
@@ -225,29 +244,27 @@ impl ActionsPanelView {
             .and_then(|id| config.triggers().iter().find(|t| t.id == id).cloned());
         drop(config);
 
-        let (name, desc, selected_ids) = if let Some(t) = trigger {
+        let (name, desc, ordered_ids) = if let Some(t) = trigger {
             (
                 t.name.clone(),
                 t.description.clone().unwrap_or_default(),
-                t.action_ids.iter().cloned().collect::<HashSet<_>>(),
+                t.action_ids.clone(),
             )
         } else {
-            (String::new(), String::new(), HashSet::new())
+            (String::new(), String::new(), Vec::new())
         };
 
-        self.edit_selected_action_ids = selected_ids;
+        self.edit_selected_action_ids = ordered_ids;
+        self.trigger_search_query = String::new();
 
         self.edit_name_editor.update(ctx, |e, ctx| {
-            e.clear_buffer_and_reset_undo_stack(ctx);
-            if !name.is_empty() {
-                e.set_base_buffer_text(name, ctx);
-            }
+            e.set_buffer_text_with_base_buffer(&name, ctx);
         });
         self.edit_desc_editor.update(ctx, |e, ctx| {
-            e.clear_buffer_and_reset_undo_stack(ctx);
-            if !desc.is_empty() {
-                e.set_base_buffer_text(desc, ctx);
-            }
+            e.set_buffer_text_with_base_buffer(&desc, ctx);
+        });
+        self.trigger_search_editor.update(ctx, |e, ctx| {
+            e.set_buffer_text_with_base_buffer("", ctx);
         });
         ctx.notify();
     }
@@ -274,6 +291,21 @@ impl ActionsPanelView {
 
     fn action_toggle_state(&self, id: Uuid) -> MouseStateHandle {
         let mut map = self.edit_action_toggle_states.borrow_mut();
+        map.entry(id).or_insert_with(MouseStateHandle::default).clone()
+    }
+
+    fn selected_move_up_state(&self, id: Uuid) -> MouseStateHandle {
+        let mut map = self.edit_selected_move_up_states.borrow_mut();
+        map.entry(id).or_insert_with(MouseStateHandle::default).clone()
+    }
+
+    fn selected_move_down_state(&self, id: Uuid) -> MouseStateHandle {
+        let mut map = self.edit_selected_move_down_states.borrow_mut();
+        map.entry(id).or_insert_with(MouseStateHandle::default).clone()
+    }
+
+    fn selected_remove_state(&self, id: Uuid) -> MouseStateHandle {
+        let mut map = self.edit_selected_remove_states.borrow_mut();
         map.entry(id).or_insert_with(MouseStateHandle::default).clone()
     }
 
@@ -546,15 +578,6 @@ impl ActionsPanelView {
     ) -> Box<dyn Element> {
         // Guard: can't create triggers without actions.
         if !has_actions {
-            let empty_state_mouse = {
-                let mut map = self.trigger_row_states.borrow_mut();
-                map.entry(Uuid::nil())
-                    .or_insert_with(RowMouseStates::default)
-                    .primary
-                    .clone()
-            };
-            // Reuse the empty state layout but with a "create actions first" message.
-            // We render the icon + text but disable the button.
             let theme = appearance.theme();
             let sub_color = theme.sub_text_color(theme.background()).into_solid();
             let main_color = theme.main_text_color(theme.background()).into_solid();
@@ -1093,6 +1116,9 @@ impl ActionsPanelView {
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let font = appearance.ui_font_family();
+        let sub_color = theme.sub_text_color(theme.background()).into_solid();
+        let sub_fill = theme.sub_text_color(theme.background());
+        let main_color = theme.main_text_color(theme.background()).into_solid();
 
         let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
 
@@ -1102,52 +1128,196 @@ impl ActionsPanelView {
         col = col.with_child(self.render_field_label("DESCRIPTION", appearance));
         col = col.with_child(self.render_text_field(&self.edit_desc_editor, Some(FIELD_HEIGHT), appearance));
 
-        col = col.with_child(self.render_field_label("ACTIONS  (select to include)", appearance));
+        // ── Selected actions (ordered list) ───────────────────────────────
+        if !self.edit_selected_action_ids.is_empty() {
+            col = col.with_child(self.render_field_label("SELECTED ACTIONS  (in execution order)", appearance));
 
-        if actions.is_empty() {
+            for (pos, &action_id) in self.edit_selected_action_ids.iter().enumerate() {
+                let action_name = actions
+                    .iter()
+                    .find(|a| a.id == action_id)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| "(unknown)".to_string());
+
+                let total = self.edit_selected_action_ids.len();
+                let up_state = self.selected_move_up_state(action_id);
+                let down_state = self.selected_move_down_state(action_id);
+                let remove_state = self.selected_remove_state(action_id);
+
+                let name_el = Text::new(action_name, font, 12.)
+                    .with_color(main_color)
+                    .finish();
+
+                let up_btn = icon_button_with_color(appearance, Icon::ArrowUp, false, up_state, sub_fill)
+                    .build()
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(ActionsPanelAction::MoveActionUp(action_id));
+                    })
+                    .finish();
+
+                let down_btn = icon_button_with_color(appearance, Icon::ArrowDown, false, down_state, sub_fill)
+                    .build()
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(ActionsPanelAction::MoveActionDown(action_id));
+                    })
+                    .finish();
+
+                let remove_btn = icon_button_with_color(appearance, Icon::X, false, remove_state, sub_fill)
+                    .build()
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(ActionsPanelAction::RemoveActionFromTrigger(action_id));
+                    })
+                    .finish();
+
+                // Dim up/down buttons at boundaries — still rendered but visually subdued.
+                let order_label = Text::new(
+                    format!("{}.", pos + 1),
+                    font,
+                    11.,
+                )
+                .with_color(sub_color)
+                .finish();
+
+                let mut controls = Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(2.);
+                if pos > 0 {
+                    controls = controls.with_child(up_btn);
+                }
+                if pos + 1 < total {
+                    controls = controls.with_child(down_btn);
+                }
+                controls = controls.with_child(remove_btn);
+
+                let row = Container::new(
+                    Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                        .with_main_axis_size(MainAxisSize::Max)
+                        .with_child(
+                            Flex::row()
+                                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                                .with_spacing(6.)
+                                .with_child(order_label)
+                                .with_child(name_el)
+                                .finish(),
+                        )
+                        .with_child(controls.with_main_axis_size(MainAxisSize::Min).finish())
+                        .finish(),
+                )
+                .with_padding_top(4.)
+                .with_padding_bottom(4.)
+                .finish();
+
+                col = col.with_child(row);
+            }
+
             col = col.with_child(
                 Container::new(
-                    Text::new("No actions created yet.", font, 12.)
-                        .with_color(theme.sub_text_color(theme.background()).into_solid())
-                        .finish(),
+                    Text::new(
+                        "—",
+                        font,
+                        11.,
+                    )
+                    .with_color(sub_color)
+                    .finish(),
+                )
+                .with_margin_top(4.)
+                .with_margin_bottom(8.)
+                .finish(),
+            );
+        }
+
+        // ── Action search/picker ──────────────────────────────────────────
+        col = col.with_child(self.render_field_label("ADD ACTIONS", appearance));
+
+        // Search field
+        col = col.with_child(self.render_text_field(&self.trigger_search_editor, Some(FIELD_HEIGHT), appearance));
+
+        let query = self.trigger_search_query.to_lowercase();
+        let available: Vec<&Action> = actions
+            .iter()
+            .filter(|a| {
+                !self.edit_selected_action_ids.contains(&a.id)
+                    && (query.is_empty() || a.name.to_lowercase().contains(&query))
+            })
+            .collect();
+
+        if available.is_empty() {
+            col = col.with_child(
+                Container::new(
+                    Text::new(
+                        if query.is_empty() {
+                            "All actions are already added."
+                        } else {
+                            "No matching actions."
+                        },
+                        font,
+                        12.,
+                    )
+                    .with_color(sub_color)
+                    .finish(),
                 )
                 .with_margin_bottom(FIELD_SPACING)
                 .finish(),
             );
         } else {
-            for action in actions {
+            for action in &available {
                 let action_id = action.id;
-                let is_selected = self.edit_selected_action_ids.contains(&action_id);
                 let toggle_state = self.action_toggle_state(action_id);
-                let name_color = theme.main_text_color(theme.background()).into_solid();
 
-                let check_color = if is_selected { theme.accent() } else { theme.sub_text_color(theme.background()) };
-
-                let check_icon = ConstrainedBox::new(
-                    (if is_selected { Icon::Check } else { Icon::Circle })
-                        .to_warpui_icon(check_color)
+                let plus_icon = ConstrainedBox::new(
+                    Icon::PlusCircle
+                        .to_warpui_icon(theme.accent())
                         .finish(),
                 )
                 .with_width(14.)
                 .with_height(14.)
                 .finish();
 
-                let name = Text::new(action.name.clone(), font, 12.)
-                    .with_color(name_color)
+                let name_el = Text::new(action.name.clone(), font, 12.)
+                    .with_color(main_color)
                     .finish();
 
-                let row = Hoverable::new(toggle_state, move |_| {
-                    Container::new(
+                let cmd_count = format!(
+                    "{} cmd{}",
+                    action.commands.len(),
+                    if action.commands.len() == 1 { "" } else { "s" }
+                );
+                let meta_el = Text::new(cmd_count, font, 11.)
+                    .with_color(sub_color)
+                    .finish();
+
+                let row = Hoverable::new(toggle_state, move |state| {
+                    let bg = if state.is_hovered() {
+                        Some(warpui::elements::Fill::Solid(
+                            pathfinder_color::ColorU::new(255, 255, 255, 10),
+                        ))
+                    } else {
+                        None
+                    };
+                    let mut c = Container::new(
                         Flex::row()
                             .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                            .with_spacing(8.)
-                            .with_child(check_icon)
-                            .with_child(name)
+                            .with_main_axis_size(MainAxisSize::Max)
+                            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                            .with_child(
+                                Flex::row()
+                                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                                    .with_spacing(8.)
+                                    .with_child(plus_icon)
+                                    .with_child(name_el)
+                                    .finish(),
+                            )
+                            .with_child(meta_el)
                             .finish(),
                     )
                     .with_padding_top(6.)
-                    .with_padding_bottom(6.)
-                    .finish()
+                    .with_padding_bottom(6.);
+                    if let Some(bg) = bg {
+                        c = c.with_background(bg);
+                    }
+                    c.finish()
                 })
                 .on_click(move |ctx, _, _| {
                     ctx.dispatch_typed_action(ActionsPanelAction::ToggleActionInTrigger(action_id));
@@ -1188,6 +1358,9 @@ pub enum ActionsPanelAction {
     EditAction(Uuid),
     EditTrigger(Uuid),
     ToggleActionInTrigger(Uuid),
+    MoveActionUp(Uuid),
+    MoveActionDown(Uuid),
+    RemoveActionFromTrigger(Uuid),
     SaveForm,
     CancelForm,
 }
@@ -1317,11 +1490,29 @@ impl warpui::TypedActionView for ActionsPanelView {
 
             // ── Trigger action selector ────────────────────────────────────
             ActionsPanelAction::ToggleActionInTrigger(action_id) => {
-                if self.edit_selected_action_ids.contains(action_id) {
-                    self.edit_selected_action_ids.remove(action_id);
-                } else {
-                    self.edit_selected_action_ids.insert(*action_id);
+                if !self.edit_selected_action_ids.contains(action_id) {
+                    self.edit_selected_action_ids.push(*action_id);
+                    ctx.notify();
                 }
+            }
+            ActionsPanelAction::MoveActionUp(action_id) => {
+                if let Some(pos) = self.edit_selected_action_ids.iter().position(|id| id == action_id) {
+                    if pos > 0 {
+                        self.edit_selected_action_ids.swap(pos, pos - 1);
+                        ctx.notify();
+                    }
+                }
+            }
+            ActionsPanelAction::MoveActionDown(action_id) => {
+                if let Some(pos) = self.edit_selected_action_ids.iter().position(|id| id == action_id) {
+                    if pos + 1 < self.edit_selected_action_ids.len() {
+                        self.edit_selected_action_ids.swap(pos, pos + 1);
+                        ctx.notify();
+                    }
+                }
+            }
+            ActionsPanelAction::RemoveActionFromTrigger(action_id) => {
+                self.edit_selected_action_ids.retain(|id| id != action_id);
                 ctx.notify();
             }
 
