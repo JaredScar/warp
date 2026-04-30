@@ -3,7 +3,6 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
-use uuid::Uuid;
 
 use super::model::{Action, SavedWorkspace, Trigger};
 
@@ -65,6 +64,39 @@ pub fn save_workspace(workspace: &SavedWorkspace) -> Result<PathBuf> {
     let file = crate::util::file::create_file(path.clone())?;
     let mut writer = io::BufWriter::new(file);
     writer.write_all(toml.as_bytes())?;
+    Ok(path)
+}
+
+/// Overwrite an existing action file (or create a new one keyed by UUID).
+///
+/// Use this when editing an existing action: delete the old file first if the
+/// name changed, then call `write_action` to write the updated content.
+pub fn write_action(action: &Action) -> Result<PathBuf> {
+    let path = action
+        .source_path
+        .clone()
+        .unwrap_or_else(|| actions_dir().join(format!("{}.toml", action.id)));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let toml = toml::to_string_pretty(action)?;
+    std::fs::write(&path, toml.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to write action '{}': {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Overwrite an existing trigger file (or create a new one keyed by UUID).
+pub fn write_trigger(trigger: &Trigger) -> Result<PathBuf> {
+    let path = trigger
+        .source_path
+        .clone()
+        .unwrap_or_else(|| triggers_dir().join(format!("{}.toml", trigger.id)));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let toml = toml::to_string_pretty(trigger)?;
+    std::fs::write(&path, toml.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to write trigger '{}': {e}", path.display()))?;
     Ok(path)
 }
 

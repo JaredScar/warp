@@ -142,9 +142,37 @@ impl WarpConfig {
         &self.saved_workspaces
     }
 
+    /// Add a new action to the in-memory list and emit an update event.
+    pub fn add_action(&mut self, action: Action, ctx: &mut ModelContext<Self>) {
+        self.actions.push(action);
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
+    /// Replace the action with the same ID in-memory and emit an update event.
+    pub fn update_action(&mut self, action: Action, ctx: &mut ModelContext<Self>) {
+        if let Some(existing) = self.actions.iter_mut().find(|a| a.id == action.id) {
+            *existing = action;
+        }
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
     /// Remove an action from the in-memory list by ID and emit an update event.
     pub fn remove_action(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
         self.actions.retain(|a| a.id != id);
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
+    /// Add a new trigger to the in-memory list and emit an update event.
+    pub fn add_trigger(&mut self, trigger: Trigger, ctx: &mut ModelContext<Self>) {
+        self.triggers.push(trigger);
+        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    }
+
+    /// Replace the trigger with the same ID in-memory and emit an update event.
+    pub fn update_trigger(&mut self, trigger: Trigger, ctx: &mut ModelContext<Self>) {
+        if let Some(existing) = self.triggers.iter_mut().find(|t| t.id == trigger.id) {
+            *existing = trigger;
+        }
         ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
     }
 
