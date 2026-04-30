@@ -1,5 +1,5 @@
 <a href="https://www.warp.dev">
-    <img width="1024" alt="Warp Agentic Development Environment product preview" src="https://github.com/user-attachments/assets/9976b2da-2edd-4604-a36c-8fd53719c6d4" />
+   <img width="1024" alt="Warp Agentic Development Environment product preview" src="https://github.com/user-attachments/assets/9976b2da-2edd-4604-a36c-8fd53719c6d4" />
 </a>
 
 <p align="center">
@@ -26,6 +26,104 @@
 ## About
 
 [Warp](https://www.warp.dev) is an agentic development environment, born out of the terminal. Use Warp's built-in coding agent, or bring your own CLI agent (Claude Code, Codex, Gemini CLI, and others).
+
+## Actions, Triggers & Workspaces Panel
+
+The **Actions, Triggers & Workspaces** panel is a productivity feature accessible from the toolbar. It provides a single place to author reusable shell automations, chain them into multi-step workflows, and save and restore complete window layouts.
+
+### Actions
+
+**Actions** are named, reusable groups of shell commands. Once defined, an action can be run in the active terminal with a single click, or composed into a trigger to fire multiple actions in sequence.
+
+**Creating and editing actions**
+
+- Open the panel and switch to the **Actions** tab.
+- Click the **+** button (or the **Create Action** button shown when the list is empty) to open the inline action editor.
+- Fill in:
+  - **Name** — a short, human-readable identifier (e.g. `Start Dev Server`).
+  - **Description** *(optional)* — extra context shown as secondary text in the list.
+  - **Commands** — one or more shell commands separated by newlines. Each line is sent to the active terminal in order.
+- Click **Save** to persist the action to `~/.warp/actions/<name>.toml`. Click **Cancel** to discard.
+- To edit an existing action, click the **pencil icon** on any action row. The editor opens pre-populated with the saved name, description, and commands.
+- To delete an action, click the **trash icon** on the action row.
+
+**Running actions**
+
+Click the **play icon** on any action row to immediately send all of its commands to the currently focused terminal pane.
+
+---
+
+### Triggers
+
+**Triggers** are named, ordered sequences of actions. When a trigger is run, each of its actions is executed in the terminal in the order specified.
+
+**Creating and editing triggers**
+
+- Switch to the **Triggers** tab and click **+** (or **Create Trigger** when the list is empty).
+  > If no actions have been defined yet, the create button is hidden and a hint directs you to create an action first. Triggers require at least one action to reference.
+- Fill in:
+  - **Name** — a label for the trigger (e.g. `Full Deploy`).
+  - **Description** *(optional)* — shown as secondary text in the list.
+- **Add actions** using the searchable action picker at the bottom of the editor:
+  - Type in the search box to filter available actions by name.
+  - Click the **+** button next to an action to add it to the trigger's execution list.
+  - Added actions appear in the **Selected Actions** section at the top, numbered in execution order.
+  - Use the **↑** / **↓** arrow buttons to reorder selected actions.
+  - Click **✕** on a selected action to remove it from the trigger.
+- Click **Save** to persist the trigger. Click **Cancel** to discard.
+- To edit an existing trigger, click the **pencil icon** on a trigger row. The editor opens pre-populated with all fields and the previously selected action order.
+- To delete a trigger, click the **trash icon** on the trigger row.
+
+**Running triggers**
+
+Click the **play icon** on a trigger row to run all of its actions in sequence in the active terminal.
+
+---
+
+### Workspaces
+
+**Workspaces** let you save and restore your entire window layout — every tab, its working directory, its shell type, and its tab kind — so you can switch between projects or pick up exactly where you left off.
+
+**Saving a workspace**
+
+- Switch to the **Workspaces** tab.
+- Click the **+** button (or the **Save Workspace** button shown when the list is empty).
+- The current layout is captured immediately and the new workspace appears in the list with an auto-generated name (`Workspace YYYY-MM-DD HH:MM`).
+- The workspace is persisted to `~/.warp/workspaces/<name>.toml`.
+
+**What is saved per tab**
+
+| Field | Details |
+|---|---|
+| Custom tab title | Restored verbatim if set |
+| Working directory | Restored if the path still exists on disk |
+| Shell type | The exact shell that was running — e.g. Windows PowerShell, bash.exe, zsh, a WSL distro, MSYS2, or a Docker sandbox. Falls back to the system default if the shell is no longer available. |
+| Tab kind | Regular terminal tabs and **Cloud Oz / Ambient Agent** tabs are both saved and restored to their correct type. |
+
+**Restoring a workspace**
+
+Click the **play icon** next to a saved workspace to restore it. Each saved tab is re-opened as a new tab with its original shell, working directory, and tab type.
+
+**Deleting a workspace**
+
+Click the **trash icon** next to a saved workspace to permanently delete it from disk and remove it from the list.
+
+---
+
+### Storage layout
+
+All panel data is stored as plain TOML files in the user's Warp data directory:
+
+```
+~/.warp/
+  actions/      # one .toml file per action
+  triggers/     # one .toml file per trigger
+  workspaces/   # one .toml file per saved workspace
+```
+
+Files can be inspected, version-controlled, or shared manually.
+
+---
 
 ## Installation
 
