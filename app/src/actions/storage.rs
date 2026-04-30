@@ -3,8 +3,9 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
+use uuid::Uuid;
 
-use super::model::{Action, SavedWorkspace, Trigger};
+use super::model::{Action, SavedWorkspace, Trigger, TriggerHistory};
 
 // ── Directory paths ───────────────────────────────────────────────────────────
 
@@ -18,6 +19,10 @@ pub fn triggers_dir() -> PathBuf {
 
 pub fn workspaces_dir() -> PathBuf {
     warp_core::paths::data_dir().join("workspaces")
+}
+
+pub fn trigger_history_dir() -> PathBuf {
+    warp_core::paths::data_dir().join("trigger_history")
 }
 
 // ── Save helpers ──────────────────────────────────────────────────────────────
@@ -149,6 +154,32 @@ pub fn delete_workspace(workspace: &SavedWorkspace) -> Result<()> {
         .unwrap_or_else(|| workspaces_dir().join(format!("{}.toml", slug(&workspace.name))));
     std::fs::remove_file(&path)
         .map_err(|e| anyhow::anyhow!("Failed to delete workspace '{}': {e}", path.display()))
+}
+
+// ── Trigger history helpers ───────────────────────────────────────────────────
+
+/// Load the run history for `trigger_id` from
+/// `~/.warp/trigger_history/<trigger_id>.toml`.
+///
+/// Returns an empty [`TriggerHistory`] if the file does not exist or cannot
+/// be parsed — history corruption is non-fatal.
+pub fn load_trigger_history(trigger_id: Uuid) -> TriggerHistory {
+    let path = trigger_history_dir().join(format!("{trigger_id}.toml"));
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return TriggerHistory::default();
+    };
+    toml::from_str::<TriggerHistory>(&contents).unwrap_or_default()
+}
+
+/// Persist `history` for `trigger_id` to
+/// `~/.warp/trigger_history/<trigger_id>.toml`.
+pub fn save_trigger_history(trigger_id: Uuid, history: &TriggerHistory) -> Result<()> {
+    let dir = trigger_history_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{trigger_id}.toml"));
+    let toml = toml::to_string_pretty(history)?;
+    std::fs::write(&path, toml.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to write trigger history '{}': {e}", path.display()))
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────

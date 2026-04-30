@@ -1047,6 +1047,11 @@ pub struct Workspace {
     /// Human-readable name of the trigger that is currently executing.
     /// `None` when no trigger is running.
     pub(crate) trigger_running_name: Option<String>,
+    /// UUID of the trigger currently executing (used to write run history).
+    pub(crate) trigger_running_id: Option<uuid::Uuid>,
+    /// Wall-clock time when the current trigger run started, and whether it
+    /// was fired manually or by the cron scheduler.
+    pub(crate) trigger_run_start: Option<(chrono::DateTime<chrono::Utc>, crate::actions::model::TriggerRunSource)>,
     /// The terminal that is currently being driven by the trigger queue.
     trigger_active_terminal: Option<ViewHandle<TerminalView>>,
     /// Stable `EntityId` of `trigger_active_terminal`.  Stored separately so
@@ -1369,6 +1374,36 @@ impl Workspace {
         }
     }
 
+    /// Append a [`TriggerRunRecord`] to the trigger's on-disk history file.
+    ///
+    /// Called when a trigger finishes normally (Success), is stopped by the
+    /// user (Stopped), or when the queue drains after a timeout.  Does nothing
+    /// when `trigger_running_id` or `trigger_run_start` is `None`.
+    fn record_trigger_run(&self, status: crate::actions::model::TriggerRunStatus) {
+        use crate::actions::model::{TriggerRunRecord};
+        use crate::actions::storage;
+
+        let Some(trigger_id) = self.trigger_running_id else {
+            return;
+        };
+        let Some((started_at, ref source)) = self.trigger_run_start else {
+            return;
+        };
+
+        let record = TriggerRunRecord {
+            started_at,
+            finished_at: chrono::Utc::now(),
+            status,
+            source: source.clone(),
+        };
+
+        let mut history = storage::load_trigger_history(trigger_id);
+        history.push(record);
+        if let Err(e) = storage::save_trigger_history(trigger_id, &history) {
+            log::warn!("Failed to save trigger run history for {trigger_id}: {e}");
+        }
+    }
+
     /// Advance the trigger execution queue by one step.
     ///
     /// - Called initially to kick off execution.
@@ -1390,6 +1425,12 @@ impl Workspace {
                 self.trigger_active_terminal_id = None;
                 self.trigger_queue_waiting = false;
                 self.trigger_running_name = None;
+                // Write a success history record when the run finishes normally.
+                self.record_trigger_run(
+                    crate::actions::model::TriggerRunStatus::Success,
+                );
+                self.trigger_running_id = None;
+                self.trigger_run_start = None;
                 ctx.notify();
                 return;
             };
@@ -2852,7 +2893,9 @@ impl Workspace {
         });
 
         let actions_panel_view = ctx.add_typed_action_view(|ctx| {
-            crate::actions::panel::ActionsPanelView::new(ctx)
+            let mut panel = crate::actions::panel::ActionsPanelView::new(ctx);
+            panel.init_cron_scheduler(ctx);
+            panel
         });
 
         // Get persisted filters from window snapshot if restoring.
@@ -3301,6 +3344,8 @@ impl Workspace {
                 Self::build_remove_tab_config_confirmation_dialog(ctx),
             trigger_queue: Default::default(),
             trigger_running_name: None,
+            trigger_running_id: None,
+            trigger_run_start: None,
             trigger_active_terminal: None,
             trigger_active_terminal_id: None,
             trigger_queue_waiting: false,
@@ -20745,13 +20790,40 @@ impl TypedActionView for Workspace {
                 }
             }
             RunTrigger(trigger_id) => {
+                use crate::actions::model::TriggerRunSource;
                 use crate::actions::runner::TriggerRunner;
                 use crate::user_config::WarpConfig;
+                // Skip if another trigger is already running.
+                if self.trigger_running_name.is_some() {
+                    return;
+                }
                 let config = WarpConfig::as_ref(ctx);
                 let actions = config.actions().to_vec();
                 let triggers = config.triggers().to_vec();
                 let _ = config;
                 if let Some(trigger) = triggers.iter().find(|t| t.id == *trigger_id) {
+                    self.trigger_running_id = Some(*trigger_id);
+                    self.trigger_run_start =
+                        Some((chrono::Utc::now(), TriggerRunSource::Manual));
+                    TriggerRunner::build_queue(trigger, &actions, self, ctx);
+                }
+            }
+            RunTriggerScheduled(trigger_id) => {
+                use crate::actions::model::TriggerRunSource;
+                use crate::actions::runner::TriggerRunner;
+                use crate::user_config::WarpConfig;
+                // Skip this cron occurrence if another trigger is running.
+                if self.trigger_running_name.is_some() {
+                    return;
+                }
+                let config = WarpConfig::as_ref(ctx);
+                let actions = config.actions().to_vec();
+                let triggers = config.triggers().to_vec();
+                let _ = config;
+                if let Some(trigger) = triggers.iter().find(|t| t.id == *trigger_id) {
+                    self.trigger_running_id = Some(*trigger_id);
+                    self.trigger_run_start =
+                        Some((chrono::Utc::now(), TriggerRunSource::Scheduled));
                     TriggerRunner::build_queue(trigger, &actions, self, ctx);
                 }
             }
@@ -20761,6 +20833,11 @@ impl TypedActionView for Workspace {
                 self.trigger_active_terminal_id = None;
                 self.trigger_queue_waiting = false;
                 self.trigger_running_name = None;
+                self.record_trigger_run(
+                    crate::actions::model::TriggerRunStatus::Stopped,
+                );
+                self.trigger_running_id = None;
+                self.trigger_run_start = None;
                 ctx.notify();
             }
             CloseAllTerminals => {
@@ -20949,6 +21026,8 @@ impl TypedActionView for Workspace {
                     targets: Default::default(),
                     hotkey: None,
                     pinned: false,
+                    cron_schedule: None,
+                    schedule_enabled: false,
                     source_path: None,
                 };
                 if let Err(e) = storage::save_trigger(&trigger) {

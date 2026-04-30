@@ -273,8 +273,10 @@ pub enum WorkspaceAction {
     ToggleActionsPanel,
     /// Run a single action by ID in the active terminal of the current tab.
     RunActionInActiveTerminal(Uuid),
-    /// Run a trigger by ID across its configured terminal targets.
+    /// Run a trigger by ID across its configured terminal targets (manual invocation).
     RunTrigger(Uuid),
+    /// Run a trigger by ID triggered automatically by its cron schedule.
+    RunTriggerScheduled(Uuid),
     /// Cancel any currently-running trigger execution immediately.
     StopTrigger,
     /// Close every open terminal tab.
@@ -884,6 +886,7 @@ impl WorkspaceAction {
             | ToggleActionsPanel
             | RunActionInActiveTerminal(_)
             | RunTrigger(_)
+            | RunTriggerScheduled(_)
             | StopTrigger
             | CloseAllTerminals
             | KillAllTerminalProcesses

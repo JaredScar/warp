@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -138,9 +139,66 @@ pub struct Trigger {
     /// the Triggers panel.
     #[serde(default)]
     pub pinned: bool,
+    /// Standard five-field cron expression controlling when this trigger fires
+    /// automatically (e.g. `"0 9 * * 1-5"` = weekdays at 9:00 AM UTC).
+    /// `None` means the trigger has no automatic schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_schedule: Option<String>,
+    /// When `true` and `cron_schedule` is `Some`, the scheduler arms a timer
+    /// for this trigger.  Stored so users can disable a schedule without
+    /// losing the expression.
+    #[serde(default)]
+    pub schedule_enabled: bool,
     /// Absolute path of the TOML file this trigger was loaded from.
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
+}
+
+// ── Run history ───────────────────────────────────────────────────────────────
+
+/// The outcome of a single trigger execution.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerRunStatus {
+    Success,
+    Stopped,
+    TimedOut,
+}
+
+/// How a trigger run was initiated.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerRunSource {
+    Manual,
+    Scheduled,
+}
+
+/// One entry in a trigger's run history.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TriggerRunRecord {
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub status: TriggerRunStatus,
+    pub source: TriggerRunSource,
+}
+
+/// Persisted run history for a single trigger, capped at [`TriggerHistory::MAX_RECORDS`].
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TriggerHistory {
+    #[serde(default)]
+    pub records: Vec<TriggerRunRecord>,
+}
+
+impl TriggerHistory {
+    pub const MAX_RECORDS: usize = 100;
+
+    /// Append `record`, dropping the oldest entry when the cap is exceeded.
+    pub fn push(&mut self, record: TriggerRunRecord) {
+        self.records.push(record);
+        if self.records.len() > Self::MAX_RECORDS {
+            self.records.remove(0);
+        }
+    }
 }
 
 /// A user-named snapshot of the current window layout (tabs, pane splits,

@@ -58,6 +58,8 @@ enum PanelMode {
     EditWorkspaceName(Option<Uuid>),
     /// Command-palette: full-panel fuzzy search across actions, triggers, and workspaces.
     Palette,
+    /// Run-history view for the trigger with the given ID.
+    ViewHistory(Uuid),
 }
 
 // ── Per-row stable mouse state ─────────────────────────────────────────────
@@ -162,6 +164,21 @@ pub struct ActionsPanelView {
     palette_search_editor: ViewHandle<EditorView>,
     /// Mouse state for the palette open/close toggle button in the header.
     palette_button_state: MouseStateHandle,
+    // ── cron scheduling ──
+    /// Manages per-trigger cron timers for automatic execution.
+    pub(crate) cron_scheduler: crate::actions::scheduler::CronScheduler,
+    /// Draft cron expression while the trigger editor is open.
+    draft_cron_schedule: String,
+    /// Draft enabled/disabled state of the cron schedule in the editor.
+    draft_schedule_enabled: bool,
+    /// Single-line editor for the cron expression field.
+    edit_cron_editor: ViewHandle<EditorView>,
+    /// Mouse state for the schedule enable/disable toggle button.
+    schedule_toggle_state: MouseStateHandle,
+    /// Per-trigger mouse states for the "View History" button.
+    trigger_history_states: RefCell<HashMap<Uuid, MouseStateHandle>>,
+    /// Mouse state for the "← Back" button in the history view.
+    history_back_state: MouseStateHandle,
 }
 
 impl ActionsPanelView {
@@ -241,6 +258,26 @@ impl ActionsPanelView {
             editor.set_placeholder_text("Workspace name (required)", ctx);
         });
 
+        let edit_cron_editor =
+            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
+        edit_cron_editor.update(ctx, |editor, ctx| {
+            editor.set_placeholder_text("e.g. 0 9 * * 1-5  (weekdays at 9 AM UTC)", ctx);
+        });
+
+        // Keep draft_cron_schedule in sync with the cron editor text.
+        ctx.subscribe_to_view(&edit_cron_editor, |me, _, event, ctx| {
+            if matches!(event, EditorEvent::Edited(_)) {
+                me.draft_cron_schedule = me
+                    .edit_cron_editor
+                    .read(ctx, |e, ctx| e.buffer_text(ctx));
+                ctx.notify();
+            }
+        });
+
+        // Initialise the scheduler; it starts with no active entries.  A
+        // reload happens at the call-site once the panel is mounted.
+        let cron_scheduler = crate::actions::scheduler::CronScheduler::new();
+
         Self {
             resizable_state_handle: resizable_state_handle(360.0),
             actions_tab_mouse_state: Default::default(),
@@ -284,7 +321,23 @@ impl ActionsPanelView {
             palette_query: String::new(),
             palette_search_editor,
             palette_button_state: Default::default(),
+            cron_scheduler,
+            draft_cron_schedule: String::new(),
+            draft_schedule_enabled: false,
+            edit_cron_editor,
+            schedule_toggle_state: Default::default(),
+            trigger_history_states: Default::default(),
+            history_back_state: Default::default(),
         }
+    }
+
+    /// Seed the cron scheduler from the current trigger list.
+    ///
+    /// Call once after the panel is mounted and `WarpConfig` is available.
+    pub fn init_cron_scheduler(&mut self, ctx: &mut ViewContext<Self>) {
+        use crate::user_config::WarpConfig;
+        let triggers = WarpConfig::as_ref(ctx).triggers().to_vec();
+        self.cron_scheduler.reload_all(&triggers, ctx);
     }
 
     pub fn set_active_tab(&mut self, tab: ActionsPanelTab, ctx: &mut ViewContext<Self>) {
@@ -374,21 +427,26 @@ impl ActionsPanelView {
             .and_then(|id| config.triggers().iter().find(|t| t.id == id).cloned());
         drop(config);
 
-        let (name, desc, hotkey, ordered_ids) = if let Some(t) = trigger {
-            (
-                t.name.clone(),
-                t.description.clone().unwrap_or_default(),
-                t.hotkey.clone().unwrap_or_default(),
-                t.action_ids.clone(),
-            )
-        } else {
-            (String::new(), String::new(), String::new(), Vec::new())
-        };
+        let (name, desc, hotkey, ordered_ids, cron_schedule, schedule_enabled) =
+            if let Some(ref t) = trigger {
+                (
+                    t.name.clone(),
+                    t.description.clone().unwrap_or_default(),
+                    t.hotkey.clone().unwrap_or_default(),
+                    t.action_ids.clone(),
+                    t.cron_schedule.clone().unwrap_or_default(),
+                    t.schedule_enabled,
+                )
+            } else {
+                (String::new(), String::new(), String::new(), Vec::new(), String::new(), false)
+            };
 
         self.trigger_hotkey_value = hotkey;
         self.trigger_hotkey_recording = false;
         self.edit_selected_action_ids = ordered_ids;
         self.trigger_search_query = String::new();
+        self.draft_cron_schedule = cron_schedule.clone();
+        self.draft_schedule_enabled = schedule_enabled;
 
         self.edit_name_editor.update(ctx, |e, ctx| {
             e.set_buffer_text_with_base_buffer(&name, ctx);
@@ -398,6 +456,10 @@ impl ActionsPanelView {
         });
         self.trigger_search_editor.update(ctx, |e, ctx| {
             e.set_buffer_text_with_base_buffer("", ctx);
+        });
+        let cron_schedule_for_editor = cron_schedule;
+        self.edit_cron_editor.update(ctx, |e, ctx| {
+            e.set_buffer_text_with_base_buffer(&cron_schedule_for_editor, ctx);
         });
         ctx.notify();
     }
@@ -452,6 +514,11 @@ impl ActionsPanelView {
 
     fn selected_remove_state(&self, id: Uuid) -> MouseStateHandle {
         let mut map = self.edit_selected_remove_states.borrow_mut();
+        map.entry(id).or_insert_with(MouseStateHandle::default).clone()
+    }
+
+    fn trigger_history_state(&self, id: Uuid) -> MouseStateHandle {
+        let mut map = self.trigger_history_states.borrow_mut();
         map.entry(id).or_insert_with(MouseStateHandle::default).clone()
     }
 
@@ -535,6 +602,16 @@ impl ActionsPanelView {
                 Shrinkable::new(
                     1.0,
                     Text::new(title, font, 13.)
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .with_color(theme.main_text_color(theme.background()).into_solid())
+                        .finish(),
+                )
+                .finish()
+            }
+            PanelMode::ViewHistory(_) => {
+                Shrinkable::new(
+                    1.0,
+                    Text::new("Run History", font, 13.)
                         .with_style(Properties::default().weight(Weight::Semibold))
                         .with_color(theme.main_text_color(theme.background()).into_solid())
                         .finish(),
@@ -1293,9 +1370,53 @@ impl ActionsPanelView {
                 .finish()
         };
 
-        let buttons = Flex::row()
+        // ── History button ────────────────────────────────────────────────
+        let history_state = self.trigger_history_state(trigger_id);
+        let history_button = {
+            let ui_builder = appearance.ui_builder().clone();
+            let tooltip = ui_builder.tool_tip("View run history".to_string()).build().finish();
+            icon_button_with_color(appearance, Icon::History, false, history_state, sub_fill)
+                .with_tooltip(move || tooltip)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::ViewTriggerHistory(trigger_id));
+                })
+                .finish()
+        };
+
+        // ── Clock badge (active schedule) ─────────────────────────────────
+        let schedule_badge: Option<Box<dyn Element>> =
+            if trigger.schedule_enabled && trigger.cron_schedule.as_deref().is_some_and(|e| !e.is_empty()) {
+                let accent = theme.accent();
+                Some(
+                    ConstrainedBox::new(
+                        Icon::Clock
+                            .to_warpui_icon(accent)
+                            .finish(),
+                    )
+                    .with_width(14.)
+                    .with_height(14.)
+                    .finish(),
+                )
+            } else {
+                None
+            };
+
+        let mut buttons_row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_spacing(2.0)
+            .with_spacing(2.0);
+
+        if let Some(badge) = schedule_badge {
+            buttons_row = buttons_row.with_child(
+                Container::new(badge)
+                    .with_padding_left(4.)
+                    .with_padding_right(2.)
+                    .finish(),
+            );
+        }
+
+        let buttons = buttons_row
+            .with_child(history_button)
             .with_child(run_button)
             .with_child(pin_button)
             .with_child(edit_button)
@@ -2232,6 +2353,86 @@ impl ActionsPanelView {
             }
         }
 
+        // ── Cron schedule section ─────────────────────────────────────────
+        col = col.with_child(self.render_field_label("SCHEDULE (optional)", appearance));
+        col = col.with_child(self.render_text_field(&self.edit_cron_editor, Some(FIELD_HEIGHT), appearance));
+
+        // Validation preview / error.
+        let cron_hint: Box<dyn Element> = {
+            let expr = &self.draft_cron_schedule;
+            if expr.trim().is_empty() {
+                Text::new("Leave blank for no schedule.", font, 11.)
+                    .with_color(sub_color)
+                    .finish()
+            } else {
+                match crate::actions::scheduler::CronScheduler::validate_and_describe(expr) {
+                    Ok(preview) => Text::new(preview, font, 11.)
+                        .with_color(sub_color)
+                        .finish(),
+                    Err(err_msg) => Text::new(err_msg, font, 11.)
+                        .with_color(appearance.theme().ui_error_color())
+                        .finish(),
+                }
+            }
+        };
+        col = col.with_child(
+            Container::new(cron_hint)
+                .with_margin_bottom(FIELD_SPACING)
+                .finish(),
+        );
+
+        // Enable toggle (only when there is a non-empty expression).
+        let can_enable = !self.draft_cron_schedule.trim().is_empty()
+            && crate::actions::scheduler::CronScheduler::parse_expression(
+                &self.draft_cron_schedule,
+            )
+            .is_some();
+        let toggle_label = if self.draft_schedule_enabled && can_enable {
+            "Schedule enabled"
+        } else {
+            "Schedule disabled"
+        };
+        let toggle_color = if self.draft_schedule_enabled && can_enable {
+            theme.accent().into_solid()
+        } else {
+            sub_color
+        };
+        let toggle_el = Hoverable::new(self.schedule_toggle_state.clone(), move |state| {
+            let alpha = if state.is_hovered() { 200u8 } else { 180u8 };
+            let bg = warpui::elements::Fill::Solid(pathfinder_color::ColorU::new(
+                255, 255, 255, alpha,
+            ));
+            Container::new(
+                Text::new(toggle_label.to_string(), font, 12.)
+                    .with_color(toggle_color)
+                    .finish(),
+            )
+            .with_padding_left(8.)
+            .with_padding_right(8.)
+            .with_padding_top(5.)
+            .with_padding_bottom(5.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_background(if state.is_hovered() { Some(bg) } else { None }.unwrap_or(
+                warpui::elements::Fill::Solid(pathfinder_color::ColorU::new(0, 0, 0, 0)),
+            ))
+            .finish()
+        });
+        let toggle_el = if can_enable {
+            toggle_el
+                .on_click(|ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::ToggleScheduleEnabled)
+                })
+                .with_cursor(Cursor::PointingHand)
+                .finish()
+        } else {
+            toggle_el.finish()
+        };
+        col = col.with_child(
+            Container::new(toggle_el)
+                .with_margin_bottom(FIELD_SPACING)
+                .finish(),
+        );
+
         col = col.with_child(self.render_form_buttons(appearance));
 
         Container::new(Shrinkable::new(1.0, col.finish()).finish())
@@ -2240,6 +2441,165 @@ impl ActionsPanelView {
             .with_padding_top(FORM_PADDING)
             .with_padding_bottom(FORM_PADDING)
             .finish()
+    }
+
+    // ── History panel ─────────────────────────────────────────────────────────
+
+    fn render_history_panel(
+        &self,
+        trigger_id: Uuid,
+        triggers: &[super::model::Trigger],
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        use crate::actions::model::{TriggerRunSource, TriggerRunStatus};
+        use crate::actions::storage;
+
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+        let sub_color = theme.sub_text_color(theme.background()).into_solid();
+        let main_color = theme.main_text_color(theme.background()).into_solid();
+
+        let trigger_name = triggers
+            .iter()
+            .find(|t| t.id == trigger_id)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| "Unknown Trigger".to_string());
+
+        let history = storage::load_trigger_history(trigger_id);
+
+        let back_btn = Hoverable::new(self.history_back_state.clone(), |_state| {
+            Text::new("← Back".to_string(), font, 12.)
+                .with_color(main_color)
+                .finish()
+        })
+        .on_click(|ctx, _, _| {
+            ctx.dispatch_typed_action(ActionsPanelAction::CloseHistoryView);
+        })
+        .with_cursor(Cursor::PointingHand)
+        .finish();
+
+        let header = Container::new(
+            Flex::column()
+                .with_child(back_btn)
+                .with_child(
+                    Container::new(
+                        Text::new(trigger_name, font, 13.)
+                            .with_style(Properties::default().weight(Weight::Semibold))
+                            .with_color(main_color)
+                            .finish(),
+                    )
+                    .with_margin_top(6.)
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_padding_left(10.)
+        .with_padding_right(10.)
+        .with_padding_top(10.)
+        .with_padding_bottom(8.)
+        .finish();
+
+        let mut col = Flex::column().with_child(header);
+
+        if history.records.is_empty() {
+            let empty = Container::new(
+                Text::new(
+                    "No runs yet. Run this trigger to see history here.".to_string(),
+                    font,
+                    12.,
+                )
+                .with_color(sub_color)
+                .finish(),
+            )
+            .with_padding_left(10.)
+            .with_padding_right(10.)
+            .with_padding_top(12.)
+            .finish();
+            col = col.with_child(empty);
+        } else {
+            // Newest first.
+            for record in history.records.iter().rev() {
+                let status_icon = match record.status {
+                    TriggerRunStatus::Success => "✓",
+                    TriggerRunStatus::Stopped => "■",
+                    TriggerRunStatus::TimedOut => "⏱",
+                };
+                let status_color = match record.status {
+                    TriggerRunStatus::Success => pathfinder_color::ColorU::new(76, 175, 80, 255),
+                    TriggerRunStatus::Stopped => pathfinder_color::ColorU::new(255, 152, 0, 255),
+                    TriggerRunStatus::TimedOut => pathfinder_color::ColorU::new(244, 67, 54, 255),
+                };
+
+                let duration_secs =
+                    (record.finished_at - record.started_at).num_seconds().max(0);
+                let duration_str = if duration_secs < 60 {
+                    format!("{duration_secs}s")
+                } else {
+                    format!("{}m {}s", duration_secs / 60, duration_secs % 60)
+                };
+
+                // Relative or absolute time.
+                let now = chrono::Utc::now();
+                let age_secs = (now - record.started_at).num_seconds().max(0);
+                let time_str = if age_secs < 86_400 {
+                    let mins = age_secs / 60;
+                    if mins < 2 {
+                        "just now".to_string()
+                    } else if mins < 60 {
+                        format!("{mins} minutes ago")
+                    } else {
+                        format!("{} hours ago", mins / 60)
+                    }
+                } else {
+                    let local: chrono::DateTime<chrono::Local> = record.started_at.into();
+                    local.format("%b %-d, %Y at %-I:%M %p").to_string()
+                };
+
+                let source_label = match record.source {
+                    TriggerRunSource::Manual => "manual",
+                    TriggerRunSource::Scheduled => "scheduled",
+                };
+
+                let icon_el = Text::new(status_icon.to_string(), font, 12.)
+                    .with_color(status_color)
+                    .finish();
+
+                let time_el = Text::new(time_str, font, 12.)
+                    .with_color(main_color)
+                    .finish();
+
+                let meta_el = Text::new(
+                    format!("{duration_str} · {source_label}"),
+                    font,
+                    11.,
+                )
+                .with_color(sub_color)
+                .finish();
+
+                let row = Container::new(
+                    Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_spacing(8.)
+                        .with_child(icon_el)
+                        .with_child(
+                            Flex::column()
+                                .with_child(time_el)
+                                .with_child(meta_el)
+                                .finish(),
+                        )
+                        .finish(),
+                )
+                .with_padding_left(10.)
+                .with_padding_right(10.)
+                .with_padding_top(6.)
+                .with_padding_bottom(6.)
+                .finish();
+
+                col = col.with_child(row);
+            }
+        }
+
+        Shrinkable::new(1.0, col.with_main_axis_size(MainAxisSize::Max).finish()).finish()
     }
 }
 
@@ -2295,6 +2655,12 @@ pub enum ActionsPanelAction {
     ClearHotkey,
     /// Clear the trigger hotkey field.
     ClearTriggerHotkey,
+    /// Open the run-history view for the given trigger.
+    ViewTriggerHistory(Uuid),
+    /// Close the history view and return to the trigger list.
+    CloseHistoryView,
+    /// Flip the `draft_schedule_enabled` flag in the trigger editor.
+    ToggleScheduleEnabled,
 }
 
 // ── View impl ─────────────────────────────────────────────────────────────────
@@ -2331,6 +2697,10 @@ impl View for ActionsPanelView {
             PanelMode::EditTrigger(_) => self.render_trigger_editor(&actions, appearance),
             PanelMode::EditWorkspaceName(_) => self.render_workspace_name_editor(appearance),
             PanelMode::Palette => self.render_palette(&actions, &triggers, &workspaces, appearance),
+            PanelMode::ViewHistory(id) => {
+                let id = *id;
+                self.render_history_panel(id, &triggers, appearance)
+            }
         };
 
         let panel_content: Box<dyn Element> = Container::new(
@@ -2460,6 +2830,7 @@ impl warpui::TypedActionView for ActionsPanelView {
                 ctx.dispatch_typed_action(&WorkspaceAction::DeleteAction(*id));
             }
             ActionsPanelAction::DeleteTrigger(id) => {
+                self.cron_scheduler.cancel(*id);
                 ctx.dispatch_typed_action(&WorkspaceAction::DeleteTrigger(*id));
             }
 
@@ -2715,6 +3086,30 @@ impl warpui::TypedActionView for ActionsPanelView {
                         let hotkey_raw = self.trigger_hotkey_value.trim().to_string();
                         let hotkey = if hotkey_raw.is_empty() { None } else { Some(hotkey_raw) };
 
+                        // Read the cron expression from the editor so it stays
+                        // in sync even if the user typed without dispatching an
+                        // action (the editor dispatches Edited events, but we
+                        // always re-read the buffer at save time for safety).
+                        let cron_raw = self
+                            .edit_cron_editor
+                            .read(ctx, |e, ctx| e.buffer_text(ctx))
+                            .trim()
+                            .to_string();
+                        let cron_schedule = if cron_raw.is_empty() {
+                            None
+                        } else {
+                            Some(cron_raw)
+                        };
+                        // Only persist `schedule_enabled = true` when the
+                        // expression is non-empty and parseable.
+                        let schedule_enabled = cron_schedule
+                            .as_deref()
+                            .is_some_and(|e| {
+                                crate::actions::scheduler::CronScheduler::parse_expression(e)
+                                    .is_some()
+                            })
+                            && self.draft_schedule_enabled;
+
                         let config = WarpConfig::as_ref(ctx);
                         let existing = maybe_id
                             .and_then(|id| config.triggers().iter().find(|t| t.id == id).cloned());
@@ -2734,6 +3129,8 @@ impl warpui::TypedActionView for ActionsPanelView {
                             targets: Default::default(),
                             hotkey,
                             pinned: existing_pinned,
+                            cron_schedule,
+                            schedule_enabled,
                             source_path: None,
                         };
                         let trigger_clone = new_trigger.clone();
@@ -2749,11 +3146,30 @@ impl warpui::TypedActionView for ActionsPanelView {
                                 config.update_trigger(trigger_clone, ctx);
                             }
                         });
+                        // Reload cron timers to pick up the new/updated schedule.
+                        let triggers = WarpConfig::as_ref(ctx).triggers().to_vec();
+                        self.cron_scheduler.reload_all(&triggers, ctx);
                     }
-                    PanelMode::List | PanelMode::EditWorkspaceName(_) | PanelMode::Palette => {}
+                    PanelMode::List
+                    | PanelMode::EditWorkspaceName(_)
+                    | PanelMode::Palette
+                    | PanelMode::ViewHistory(_) => {}
                 }
 
                 self.panel_mode = PanelMode::List;
+                ctx.notify();
+            }
+            ActionsPanelAction::ViewTriggerHistory(id) => {
+                self.panel_mode = PanelMode::ViewHistory(*id);
+                self.active_tab = ActionsPanelTab::Triggers;
+                ctx.notify();
+            }
+            ActionsPanelAction::CloseHistoryView => {
+                self.panel_mode = PanelMode::List;
+                ctx.notify();
+            }
+            ActionsPanelAction::ToggleScheduleEnabled => {
+                self.draft_schedule_enabled = !self.draft_schedule_enabled;
                 ctx.notify();
             }
         }
