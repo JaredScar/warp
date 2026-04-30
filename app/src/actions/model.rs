@@ -5,6 +5,41 @@ use uuid::Uuid;
 
 use crate::terminal::ShellLaunchData;
 
+// ── Built-in system actions ───────────────────────────────────────────────────
+
+/// Stable UUID for the built-in "Close All Terminals" action.
+pub const BUILTIN_CLOSE_ALL_TERMINALS_ID: Uuid =
+    uuid::uuid!("00000000-0000-0000-0000-000000000001");
+/// Stable UUID for the built-in "Kill All Terminal Processes" action.
+pub const BUILTIN_KILL_ALL_PROCESSES_ID: Uuid =
+    uuid::uuid!("00000000-0000-0000-0000-000000000002");
+
+/// Returns the list of built-in actions that are always present and cannot
+/// be deleted by the user.
+pub fn builtin_actions() -> Vec<Action> {
+    vec![
+        Action {
+            id: BUILTIN_CLOSE_ALL_TERMINALS_ID,
+            name: "Close All Terminals".to_string(),
+            description: Some("Close every open terminal tab".to_string()),
+            commands: vec![],
+            source_path: None,
+        },
+        Action {
+            id: BUILTIN_KILL_ALL_PROCESSES_ID,
+            name: "Kill All Terminal Processes".to_string(),
+            description: Some("Send SIGINT (Ctrl-C) to every running terminal process".to_string()),
+            commands: vec![],
+            source_path: None,
+        },
+    ]
+}
+
+/// Returns `true` if `id` belongs to a built-in system action.
+pub fn is_builtin_action(id: &Uuid) -> bool {
+    *id == BUILTIN_CLOSE_ALL_TERMINALS_ID || *id == BUILTIN_KILL_ALL_PROCESSES_ID
+}
+
 /// A named group of shell commands that can be run together.
 ///
 /// Actions are the atomic unit of automation — each holds an ordered list of

@@ -20429,6 +20429,26 @@ impl TypedActionView for Workspace {
                     }
                 }
             }
+            CloseAllTerminals => {
+                // Close all tabs in reverse order; remove_tab handles the case where
+                // closing the last tab closes the window entirely.
+                let count = self.tab_count();
+                for i in (0..count).rev() {
+                    self.remove_tab(i, false, true, ctx);
+                }
+            }
+            KillAllTerminalProcesses => {
+                let all_groups: Vec<_> = self.tab_views().cloned().collect();
+                for group_handle in all_groups {
+                    group_handle.update(ctx, |group, group_ctx| {
+                        for terminal_handle in group.terminal_views(group_ctx) {
+                            terminal_handle.update(group_ctx, |terminal, term_ctx| {
+                                terminal.send_interrupt(term_ctx);
+                            });
+                        }
+                    });
+                }
+            }
             SaveCurrentWorkspace => {
                 // Handled by the panel: dispatches SaveCurrentWorkspaceWithName after
                 // prompting the user for a name.  This variant is kept as a no-op here

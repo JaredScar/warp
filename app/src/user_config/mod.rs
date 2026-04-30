@@ -157,7 +157,11 @@ impl WarpConfig {
     }
 
     /// Remove an action from the in-memory list by ID and emit an update event.
+    /// Built-in actions cannot be removed and will be silently ignored.
     pub fn remove_action(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
+        if crate::actions::model::is_builtin_action(&id) {
+            return;
+        }
         self.actions.retain(|a| a.id != id);
         ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
     }

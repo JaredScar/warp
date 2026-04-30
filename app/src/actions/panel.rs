@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use uuid::Uuid;
+use crate::actions::model::is_builtin_action;
 use warp_core::ui::Icon;
 use warpui::{
     elements::{
@@ -750,17 +751,22 @@ impl ActionsPanelView {
             .with_color(theme.main_text_color(theme.background()).into_solid())
             .finish();
 
-        let cmd_count = format!(
-            "{} command{}",
-            action.commands.len(),
-            if action.commands.len() == 1 { "" } else { "s" }
-        );
-        let meta = Text::new(cmd_count, font, 11.)
+        let action_id = action.id;
+        let is_builtin = is_builtin_action(&action_id);
+        let (run_state, edit_state, delete_state) = self.action_states(action_id);
+
+        let meta_label = if is_builtin {
+            "built-in".to_string()
+        } else {
+            format!(
+                "{} command{}",
+                action.commands.len(),
+                if action.commands.len() == 1 { "" } else { "s" }
+            )
+        };
+        let meta = Text::new(meta_label, font, 11.)
             .with_color(theme.sub_text_color(theme.background()).into_solid())
             .finish();
-
-        let action_id = action.id;
-        let (run_state, edit_state, delete_state) = self.action_states(action_id);
 
         let run_button = {
             let ui_builder = appearance.ui_builder().clone();
@@ -774,40 +780,40 @@ impl ActionsPanelView {
                 .finish()
         };
 
-        let edit_button = {
-            let ui_builder = appearance.ui_builder().clone();
-            let tooltip = ui_builder.tool_tip("Edit action".to_string()).build().finish();
-            let icon_color = theme.sub_text_color(theme.background());
-            icon_button_with_color(appearance, Icon::Edit, false, edit_state, icon_color)
-                .with_tooltip(move || tooltip)
-                .build()
-                .on_click(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(ActionsPanelAction::EditAction(action_id));
-                })
-                .finish()
-        };
-
-        let delete_button = {
-            let ui_builder = appearance.ui_builder().clone();
-            let tooltip = ui_builder.tool_tip("Delete action".to_string()).build().finish();
-            let icon_color = theme.sub_text_color(theme.background());
-            icon_button_with_color(appearance, Icon::Trash, false, delete_state, icon_color)
-                .with_tooltip(move || tooltip)
-                .build()
-                .on_click(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(ActionsPanelAction::DeleteAction(action_id));
-                })
-                .finish()
-        };
-
-        let buttons = Flex::row()
+        let mut buttons_row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(2.0)
-            .with_child(run_button)
-            .with_child(edit_button)
-            .with_child(delete_button)
-            .with_main_axis_size(MainAxisSize::Min)
-            .finish();
+            .with_child(run_button);
+
+        if !is_builtin {
+            let edit_button = {
+                let ui_builder = appearance.ui_builder().clone();
+                let tooltip = ui_builder.tool_tip("Edit action".to_string()).build().finish();
+                let icon_color = theme.sub_text_color(theme.background());
+                icon_button_with_color(appearance, Icon::Edit, false, edit_state, icon_color)
+                    .with_tooltip(move || tooltip)
+                    .build()
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(ActionsPanelAction::EditAction(action_id));
+                    })
+                    .finish()
+            };
+            let delete_button = {
+                let ui_builder = appearance.ui_builder().clone();
+                let tooltip = ui_builder.tool_tip("Delete action".to_string()).build().finish();
+                let icon_color = theme.sub_text_color(theme.background());
+                icon_button_with_color(appearance, Icon::Trash, false, delete_state, icon_color)
+                    .with_tooltip(move || tooltip)
+                    .build()
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(ActionsPanelAction::DeleteAction(action_id));
+                    })
+                    .finish()
+            };
+            buttons_row = buttons_row.with_child(edit_button).with_child(delete_button);
+        }
+
+        let buttons = buttons_row.with_main_axis_size(MainAxisSize::Min).finish();
 
         Container::new(
             Flex::row()
@@ -1473,7 +1479,16 @@ impl warpui::TypedActionView for ActionsPanelView {
 
             // ── Run ────────────────────────────────────────────────────────
             ActionsPanelAction::RunAction(id) => {
-                ctx.dispatch_typed_action(&WorkspaceAction::RunActionInActiveTerminal(*id));
+                if crate::actions::model::is_builtin_action(id) {
+                    // Built-in actions dispatch directly as WorkspaceActions.
+                    if *id == crate::actions::model::BUILTIN_CLOSE_ALL_TERMINALS_ID {
+                        ctx.dispatch_typed_action(&WorkspaceAction::CloseAllTerminals);
+                    } else if *id == crate::actions::model::BUILTIN_KILL_ALL_PROCESSES_ID {
+                        ctx.dispatch_typed_action(&WorkspaceAction::KillAllTerminalProcesses);
+                    }
+                } else {
+                    ctx.dispatch_typed_action(&WorkspaceAction::RunActionInActiveTerminal(*id));
+                }
             }
             ActionsPanelAction::RunTrigger(id) => {
                 ctx.dispatch_typed_action(&WorkspaceAction::RunTrigger(*id));

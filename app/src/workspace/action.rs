@@ -275,6 +275,10 @@ pub enum WorkspaceAction {
     RunActionInActiveTerminal(Uuid),
     /// Run a trigger by ID across its configured terminal targets.
     RunTrigger(Uuid),
+    /// Close every open terminal tab.
+    CloseAllTerminals,
+    /// Send SIGINT to every running terminal process across all tabs.
+    KillAllTerminalProcesses,
     /// Snapshot the current window layout and prompt for a name to save it.
     SaveCurrentWorkspace,
     /// Snapshot the current window layout and save it with the given name.
@@ -871,6 +875,8 @@ impl WorkspaceAction {
             | ToggleActionsPanel
             | RunActionInActiveTerminal(_)
             | RunTrigger(_)
+            | CloseAllTerminals
+            | KillAllTerminalProcesses
             | SaveCurrentWorkspace
             | SaveCurrentWorkspaceWithName(_)
             | RenameWorkspace(_, _)

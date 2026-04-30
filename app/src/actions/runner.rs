@@ -2,86 +2,73 @@ use warpui::{AppContext, ViewContext, ViewHandle};
 
 use crate::pane_group::PaneGroup;
 use crate::workspace::Workspace;
+use crate::WorkspaceAction;
 
-use super::model::{Action, Trigger, TriggerTargets};
+use super::model::{
+    is_builtin_action, Action, Trigger,
+    BUILTIN_CLOSE_ALL_TERMINALS_ID, BUILTIN_KILL_ALL_PROCESSES_ID,
+};
 
-/// Resolves the terminal panes targeted by a trigger and sends each action's
-/// commands to all of them, executing actions in sequence.
+/// Executes the actions referenced by a trigger.
 ///
-/// Within each action all resolved terminal panes receive the commands
-/// concurrently (dispatched in a single pass), so multiple terminals progress
-/// in lock-step.  The trigger advances to the next action only after the
-/// current action has been sent to all targets.
+/// For each action in the trigger, a fresh terminal tab is opened and the
+/// action's commands are dispatched to it (set as a pending command that
+/// executes once the shell is ready).  This keeps trigger-run commands
+/// isolated from whatever was already open.
+///
+/// Built-in system actions (`Close All Terminals`, `Kill All Terminal
+/// Processes`) are handled via dedicated `WorkspaceAction` dispatches
+/// instead of shell commands.
 pub struct TriggerRunner;
 
 impl TriggerRunner {
-    /// Execute `trigger` using the actions found in `all_actions`.
-    ///
-    /// No-ops gracefully if the trigger references unknown action IDs or if no
-    /// terminal targets can be resolved.
     pub fn run(
         trigger: &Trigger,
         all_actions: &[Action],
         workspace: &ViewHandle<Workspace>,
         ctx: &mut AppContext,
     ) {
-        let target_groups: Vec<ViewHandle<PaneGroup>> =
-            workspace.read(ctx, |ws, app| Self::resolve_targets(ws, &trigger.targets, app));
-
-        if target_groups.is_empty() {
-            return;
-        }
-
         for action_id in &trigger.action_ids {
             let Some(action) = all_actions.iter().find(|a| &a.id == action_id) else {
                 continue;
             };
-            Self::dispatch_action(action, &target_groups, ctx);
+
+            // Built-in actions are dispatched as WorkspaceActions rather than
+            // sending shell commands.
+            if is_builtin_action(action_id) {
+                Self::dispatch_builtin(action_id, workspace, ctx);
+                continue;
+            }
+
+            if action.commands.is_empty() {
+                continue;
+            }
+
+            // Open a fresh terminal tab for this action, then dispatch the
+            // joined commands to the newly created pane.
+            workspace.update(ctx, |ws, ws_ctx| {
+                ws.add_terminal_tab(true, ws_ctx);
+            });
+
+            let new_group = workspace.read(ctx, |ws, _| ws.active_tab_pane_group().clone());
+            new_group.update(ctx, |group, group_ctx| {
+                Self::dispatch_action_to_group(action, group, group_ctx);
+            });
         }
     }
 
-    fn resolve_targets(
-        ws: &Workspace,
-        targets: &TriggerTargets,
-        ctx: &AppContext,
-    ) -> Vec<ViewHandle<PaneGroup>> {
-        let count = ws.tab_count();
-        let all: Vec<ViewHandle<PaneGroup>> = (0..count)
-            .filter_map(|i| ws.get_pane_group_view(i).cloned())
-            .collect();
-
-        match targets {
-            TriggerTargets::AllOpen => all,
-            TriggerTargets::ByIndex { indices } => all
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, g)| if indices.contains(&i) { Some(g) } else { None })
-                .collect(),
-            TriggerTargets::ByTitle { titles } => all
-                .into_iter()
-                .filter(|g| {
-                    let title = g
-                        .as_ref(ctx)
-                        .custom_title(ctx)
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    titles.iter().any(|t| title.contains(&t.to_lowercase()))
-                })
-                .collect(),
-        }
-    }
-
-    /// Send every command in `action` to every terminal pane in every target
-    /// group.  All dispatches happen synchronously so they are effectively
-    /// concurrent from the shell's perspective.
-    fn dispatch_action(
-        action: &Action,
-        groups: &[ViewHandle<PaneGroup>],
+    fn dispatch_builtin(
+        action_id: &uuid::Uuid,
+        workspace: &ViewHandle<Workspace>,
         ctx: &mut AppContext,
     ) {
-        for group_handle in groups {
-            group_handle.update(ctx, |group, group_ctx| {
-                Self::dispatch_action_to_group(action, group, group_ctx);
+        if *action_id == BUILTIN_CLOSE_ALL_TERMINALS_ID {
+            workspace.update(ctx, |_, ws_ctx| {
+                ws_ctx.dispatch_typed_action(&WorkspaceAction::CloseAllTerminals);
+            });
+        } else if *action_id == BUILTIN_KILL_ALL_PROCESSES_ID {
+            workspace.update(ctx, |_, ws_ctx| {
+                ws_ctx.dispatch_typed_action(&WorkspaceAction::KillAllTerminalProcesses);
             });
         }
     }
@@ -91,9 +78,6 @@ impl TriggerRunner {
         group: &mut PaneGroup,
         ctx: &mut ViewContext<PaneGroup>,
     ) {
-        if action.commands.is_empty() {
-            return;
-        }
         // Join all commands with newlines so they are sent as a single multi-line
         // input rather than appended one-by-one to the live input buffer.  Shells
         // with bracketed paste preserve the '\n' separators and execute each line

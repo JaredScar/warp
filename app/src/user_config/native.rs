@@ -10,7 +10,7 @@ use itertools::Itertools;
 use repo_metadata::RepositoryUpdate;
 use warpui::{ModelContext, SingletonEntity};
 
-use crate::actions::model::{Action, SavedWorkspace, Trigger};
+use crate::actions::model::{builtin_actions, Action, SavedWorkspace, Trigger};
 use crate::features::FeatureFlag;
 use crate::launch_configs::launch_config::LaunchConfig;
 use crate::tab_configs::{TabConfig, TabConfigError};
@@ -66,7 +66,10 @@ impl super::WarpConfig {
                 (actions, triggers, workspaces)
             },
             |me, (actions, triggers, workspaces), ctx| {
-                me.actions = actions;
+                // Prepend built-ins so they are always first and always present.
+                let mut all_actions = builtin_actions();
+                all_actions.extend(actions);
+                me.actions = all_actions;
                 me.triggers = triggers;
                 me.saved_workspaces = workspaces;
                 ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
@@ -157,7 +160,9 @@ impl super::WarpConfig {
                     (actions, triggers, workspaces)
                 },
                 |me, (actions, triggers, workspaces), ctx| {
-                    me.actions = actions;
+                    let mut all_actions = builtin_actions();
+                    all_actions.extend(actions);
+                    me.actions = all_actions;
                     me.triggers = triggers;
                     me.saved_workspaces = workspaces;
                     ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
