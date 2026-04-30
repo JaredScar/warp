@@ -104,6 +104,8 @@ pub struct ActionsPanelView {
     panel_mode: PanelMode,
     edit_name_editor: ViewHandle<EditorView>,
     edit_desc_editor: ViewHandle<EditorView>,
+    /// Optional tab name to use when this action's trigger opens a new terminal tab.
+    edit_tab_name_editor: ViewHandle<EditorView>,
     /// One single-line editor per command, each paired with a stable UUID for mouse-state keying.
     edit_command_editors: Vec<(Uuid, ViewHandle<EditorView>)>,
     /// Per-command delete-button mouse states, keyed by the command's stable UUID.
@@ -146,6 +148,8 @@ impl ActionsPanelView {
             ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
         let edit_desc_editor =
             ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
+        let edit_tab_name_editor =
+            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
         let trigger_search_editor =
             ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
 
@@ -154,6 +158,9 @@ impl ActionsPanelView {
         });
         edit_desc_editor.update(ctx, |editor, ctx| {
             editor.set_placeholder_text("Description (optional)", ctx);
+        });
+        edit_tab_name_editor.update(ctx, |editor, ctx| {
+            editor.set_placeholder_text("Tab name (optional)", ctx);
         });
         trigger_search_editor.update(ctx, |editor, ctx| {
             editor.set_placeholder_text("Search actions…", ctx);
@@ -190,6 +197,7 @@ impl ActionsPanelView {
             panel_mode: PanelMode::List,
             edit_name_editor,
             edit_desc_editor,
+            edit_tab_name_editor,
             edit_command_editors: Vec::new(),
             edit_command_remove_states: Default::default(),
             add_command_state: Default::default(),
@@ -238,10 +246,15 @@ impl ActionsPanelView {
         let action = action_id.and_then(|id| config.actions().iter().find(|a| a.id == id).cloned());
         drop(config);
 
-        let (name, desc, commands) = if let Some(a) = action {
-            (a.name.clone(), a.description.clone().unwrap_or_default(), a.commands.clone())
+        let (name, desc, tab_name, commands) = if let Some(a) = action {
+            (
+                a.name.clone(),
+                a.description.clone().unwrap_or_default(),
+                a.tab_name.clone().unwrap_or_default(),
+                a.commands.clone(),
+            )
         } else {
-            (String::new(), String::new(), vec![String::new()])
+            (String::new(), String::new(), String::new(), vec![String::new()])
         };
 
         self.edit_name_editor.update(ctx, |e, ctx| {
@@ -249,6 +262,9 @@ impl ActionsPanelView {
         });
         self.edit_desc_editor.update(ctx, |e, ctx| {
             e.set_buffer_text_with_base_buffer(&desc, ctx);
+        });
+        self.edit_tab_name_editor.update(ctx, |e, ctx| {
+            e.set_buffer_text_with_base_buffer(&tab_name, ctx);
         });
 
         // Build one editor per command (at least one empty row for new actions).
@@ -1150,6 +1166,9 @@ impl ActionsPanelView {
         col = col.with_child(self.render_field_label("DESCRIPTION", appearance));
         col = col.with_child(self.render_text_field(&self.edit_desc_editor, Some(FIELD_HEIGHT), appearance));
 
+        col = col.with_child(self.render_field_label("TAB NAME", appearance));
+        col = col.with_child(self.render_text_field(&self.edit_tab_name_editor, Some(FIELD_HEIGHT), appearance));
+
         // ── Commands list ─────────────────────────────────────────────────
         col = col.with_child(self.render_field_label("COMMANDS", appearance));
 
@@ -1744,6 +1763,13 @@ impl warpui::TypedActionView for ActionsPanelView {
                             .filter(|s| !s.is_empty())
                             .collect();
 
+                        let tab_name_raw = self
+                            .edit_tab_name_editor
+                            .read(ctx, |e, ctx| e.buffer_text(ctx))
+                            .trim()
+                            .to_string();
+                        let tab_name = if tab_name_raw.is_empty() { None } else { Some(tab_name_raw) };
+
                         let config = WarpConfig::as_ref(ctx);
                         let existing_source = maybe_id
                             .and_then(|id| config.actions().iter().find(|a| a.id == id).cloned())
@@ -1759,6 +1785,7 @@ impl warpui::TypedActionView for ActionsPanelView {
                             id: maybe_id.unwrap_or_else(Uuid::new_v4),
                             name,
                             description,
+                            tab_name,
                             commands,
                             source_path: None,
                         };

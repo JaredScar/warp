@@ -1046,6 +1046,15 @@ pub struct Workspace {
     pub(crate) trigger_queue: std::collections::VecDeque<crate::actions::runner::TriggerQueueItem>,
     /// The terminal that is currently being driven by the trigger queue.
     trigger_active_terminal: Option<ViewHandle<TerminalView>>,
+    /// Stable `EntityId` of `trigger_active_terminal`.  Stored separately so
+    /// that subscription closures (which capture a copy) can check whether the
+    /// event came from the *current* active terminal without holding a
+    /// `ViewHandle` across the borrow.
+    trigger_active_terminal_id: Option<warpui::EntityId>,
+    /// `true` while we are waiting for the active terminal to emit
+    /// `PendingCommandCompleted`.  Used to guard both the subscription
+    /// callback and the 5-second fallback timer against double-advance.
+    trigger_queue_waiting: bool,
 }
 
 impl Workspace {
@@ -1345,36 +1354,70 @@ impl Workspace {
 
     // ── Trigger sequential execution ──────────────────────────────────────
 
+    /// Fallback timer callback: if the queue is still waiting after
+    /// `TRIGGER_COMMAND_TIMEOUT_SECS`, assume the command started a
+    /// long-running process and advance to the next queue item anyway.
+    fn trigger_queue_timeout(&mut self, terminal_id: warpui::EntityId, ctx: &mut ViewContext<Self>) {
+        if self.trigger_queue_waiting
+            && self.trigger_active_terminal_id == Some(terminal_id)
+        {
+            self.trigger_queue_waiting = false;
+            self.advance_trigger_queue(ctx);
+        }
+    }
+
     /// Advance the trigger execution queue by one step.
     ///
-    /// Called:
-    /// - at the start of trigger execution (to kick off the first step), and
-    /// - by the `PendingCommandCompleted` subscription on the active terminal
-    ///   (so each command waits for the previous one to finish).
+    /// - Called initially to kick off execution.
+    /// - Called by the `PendingCommandCompleted` subscription when the active
+    ///   terminal finishes a block.
+    /// - Called by `trigger_queue_timeout` when a command takes longer than
+    ///   `TRIGGER_COMMAND_TIMEOUT_SECS` (long-running processes).
     pub(crate) fn advance_trigger_queue(&mut self, ctx: &mut ViewContext<Self>) {
+        use std::time::Duration;
         use crate::actions::runner::TriggerQueueItem;
+
+        /// Seconds to wait for a command to complete before assuming it started
+        /// a long-running process and moving on to the next action.
+        const TRIGGER_COMMAND_TIMEOUT_SECS: u64 = 5;
 
         loop {
             let Some(item) = self.trigger_queue.pop_front() else {
                 self.trigger_active_terminal = None;
+                self.trigger_active_terminal_id = None;
+                self.trigger_queue_waiting = false;
                 return;
             };
 
             match item {
-                TriggerQueueItem::OpenNewTab => {
-                    // Open a fresh terminal tab and find its TerminalView handle.
+                TriggerQueueItem::OpenNewTab { tab_name } => {
                     self.add_terminal_tab(true, ctx);
+
+                    // Optionally rename the newly opened tab.
+                    if let Some(name) = tab_name {
+                        self.set_active_tab_name(&name, ctx);
+                    }
+
                     let group = self.active_tab_pane_group().clone();
                     let terminal_handle: Option<ViewHandle<TerminalView>> =
                         group.read(ctx, |g, ctx| {
                             g.terminal_views(ctx).into_iter().next()
                         });
                     if let Some(terminal) = terminal_handle {
+                        let terminal_id = terminal.id();
                         self.trigger_active_terminal = Some(terminal.clone());
-                        // Subscribe so the next queue item fires after each
-                        // command in this terminal finishes.
-                        ctx.subscribe_to_view(&terminal, |me, _, event, ctx| {
-                            if matches!(event, terminal::Event::PendingCommandCompleted) {
+                        self.trigger_active_terminal_id = Some(terminal_id);
+
+                        // Subscribe so each command waits for the previous
+                        // block to complete.  We check both the waiting flag
+                        // and the terminal identity to guard against events
+                        // from previous terminals that may still fire.
+                        ctx.subscribe_to_view(&terminal, move |me, _, event, ctx| {
+                            if matches!(event, terminal::Event::PendingCommandCompleted)
+                                && me.trigger_queue_waiting
+                                && me.trigger_active_terminal_id == Some(terminal_id)
+                            {
+                                me.trigger_queue_waiting = false;
                                 me.advance_trigger_queue(ctx);
                             }
                         });
@@ -1383,12 +1426,28 @@ impl Workspace {
                 }
                 TriggerQueueItem::SendCommand(cmd) => {
                     if let Some(terminal) = self.trigger_active_terminal.clone() {
+                        let terminal_id = terminal.id();
+                        self.trigger_queue_waiting = true;
                         terminal.update(ctx, |t, ctx| {
                             t.execute_command_or_set_pending(&cmd, ctx);
                         });
+                        // Spawn a fallback timer.  If PendingCommandCompleted
+                        // fires first, trigger_queue_waiting will be false and
+                        // the timer callback will be a no-op.
+                        let _ = ctx.spawn(
+                            async move {
+                                warpui::r#async::Timer::after(Duration::from_secs(
+                                    TRIGGER_COMMAND_TIMEOUT_SECS,
+                                ))
+                                .await;
+                            },
+                            move |me: &mut Self, _: (), ctx| {
+                                me.trigger_queue_timeout(terminal_id, ctx);
+                            },
+                        );
                     }
-                    // Stop here; the subscription will call us again after
-                    // the command's block completes.
+                    // Stop here; the subscription (or fallback timer) will
+                    // call us again when the time is right.
                     return;
                 }
             }
@@ -3235,6 +3294,8 @@ impl Workspace {
                 Self::build_remove_tab_config_confirmation_dialog(ctx),
             trigger_queue: Default::default(),
             trigger_active_terminal: None,
+            trigger_active_terminal_id: None,
+            trigger_queue_waiting: false,
         };
 
         ws.configure_new_workspace(workspace_setting, ctx);
@@ -20656,6 +20717,7 @@ impl TypedActionView for Workspace {
                     id: uuid::Uuid::new_v4(),
                     name,
                     description: None,
+                    tab_name: None,
                     commands: vec![],
                     source_path: None,
                 };

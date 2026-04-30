@@ -23,6 +23,7 @@ pub fn builtin_actions() -> Vec<Action> {
             name: "Close All Terminals".to_string(),
             description: Some("Close every open terminal tab".to_string()),
             commands: vec![],
+            tab_name: None,
             source_path: None,
         },
         Action {
@@ -30,6 +31,7 @@ pub fn builtin_actions() -> Vec<Action> {
             name: "Kill All Terminal Processes".to_string(),
             description: Some("Send SIGINT (Ctrl-C) to every running terminal process".to_string()),
             commands: vec![],
+            tab_name: None,
             source_path: None,
         },
     ]
@@ -59,6 +61,10 @@ pub struct Action {
     /// that will be sent to the target terminal exactly as written.
     #[serde(default)]
     pub commands: Vec<String>,
+    /// Optional name to apply to the terminal tab opened for this action.
+    /// When set, the new tab is renamed to this value immediately after it opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_name: Option<String>,
     /// Absolute path of the TOML file this action was loaded from.
     /// Skipped during serialisation — it is set by the loader.
     #[serde(skip)]

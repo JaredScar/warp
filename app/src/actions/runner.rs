@@ -12,18 +12,20 @@ use super::model::{
 
 /// A single step in the sequential trigger execution queue.
 ///
-/// The workspace pops these one at a time, waiting for
-/// `terminal::Event::PendingCommandCompleted` before advancing to the next
-/// step.  This ensures:
+/// The workspace pops one item at a time, waiting for either
+/// `terminal::Event::PendingCommandCompleted` or a 5-second fallback timer
+/// before advancing to the next step.  This ensures:
 ///
-/// - Commands within an action run one after the other (each waits for the
-///   previous shell block to complete before the next is submitted).
-/// - A new terminal tab is opened for the next action only after all commands
-///   in the current action have finished.
+/// - Commands within an action run one after the other.
+/// - The next action's tab is opened only after the last command of the
+///   current action completes (or times out — for long-running processes).
 #[derive(Debug)]
 pub enum TriggerQueueItem {
-    /// Open a fresh terminal tab and make it the active target.
-    OpenNewTab,
+    /// Open a fresh terminal tab, then optionally rename it.
+    OpenNewTab {
+        /// If `Some`, rename the newly opened tab to this string.
+        tab_name: Option<String>,
+    },
     /// Send this command to the currently-active terminal target.
     SendCommand(String),
 }
@@ -33,12 +35,9 @@ pub struct TriggerRunner;
 impl TriggerRunner {
     /// Build the sequential execution queue for a trigger and kick it off.
     ///
-    /// Built-in actions (`CloseAllTerminals`, `KillAllTerminalProcesses`) are
-    /// dispatched immediately as `WorkspaceAction`s (they have no shell
-    /// commands to wait for).  All regular actions are decomposed into an
-    /// `OpenNewTab` sentinel followed by one `SendCommand` entry per command.
-    /// The workspace's `advance_trigger_queue` method drains the queue step
-    /// by step, waiting for each command's block to complete before moving on.
+    /// Built-in actions are dispatched immediately as `WorkspaceAction`s.
+    /// All regular actions are decomposed into:
+    ///   `OpenNewTab { tab_name } → SendCommand(cmd1) → SendCommand(cmd2) → …`
     pub fn build_queue(
         trigger: &Trigger,
         all_actions: &[Action],
@@ -53,8 +52,6 @@ impl TriggerRunner {
             };
 
             if is_builtin_action(action_id) {
-                // Built-ins are instant — dispatch them right now so they run
-                // before the first shell command in the queue.
                 Self::dispatch_builtin(action_id, ctx);
                 continue;
             }
@@ -63,7 +60,9 @@ impl TriggerRunner {
                 continue;
             }
 
-            queue.push_back(TriggerQueueItem::OpenNewTab);
+            queue.push_back(TriggerQueueItem::OpenNewTab {
+                tab_name: action.tab_name.clone(),
+            });
             for cmd in &action.commands {
                 if !cmd.trim().is_empty() {
                     queue.push_back(TriggerQueueItem::SendCommand(cmd.clone()));
