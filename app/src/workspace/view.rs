@@ -20426,12 +20426,9 @@ impl TypedActionView for Workspace {
                 let config = WarpConfig::as_ref(ctx);
                 let actions = config.actions().to_vec();
                 let triggers = config.triggers().to_vec();
-                drop(config);
+                let _ = config;
                 if let Some(trigger) = triggers.iter().find(|t| t.id == *trigger_id) {
-                    let weak_handle = ctx.handle();
-                    if let Some(workspace_handle) = weak_handle.upgrade(ctx) {
-                        TriggerRunner::run(trigger, &actions, &workspace_handle, ctx);
-                    }
+                    TriggerRunner::run(trigger, &actions, self, ctx);
                 }
             }
             CloseAllTerminals => {

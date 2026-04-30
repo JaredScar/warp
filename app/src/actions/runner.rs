@@ -1,4 +1,4 @@
-use warpui::{AppContext, ViewContext, ViewHandle};
+use warpui::ViewContext;
 
 use crate::pane_group::PaneGroup;
 use crate::workspace::Workspace;
@@ -22,11 +22,16 @@ use super::model::{
 pub struct TriggerRunner;
 
 impl TriggerRunner {
+    /// Run all actions for a trigger.
+    ///
+    /// Takes `&mut Workspace` and `&mut ViewContext<Workspace>` directly so we
+    /// can call workspace methods without an extra re-entrant `update()` call
+    /// (which would be silently ignored by the UI framework).
     pub fn run(
         trigger: &Trigger,
         all_actions: &[Action],
-        workspace: &ViewHandle<Workspace>,
-        ctx: &mut AppContext,
+        workspace: &mut Workspace,
+        ctx: &mut ViewContext<Workspace>,
     ) {
         for action_id in &trigger.action_ids {
             let Some(action) = all_actions.iter().find(|a| &a.id == action_id) else {
@@ -36,7 +41,7 @@ impl TriggerRunner {
             // Built-in actions are dispatched as WorkspaceActions rather than
             // sending shell commands.
             if is_builtin_action(action_id) {
-                Self::dispatch_builtin(action_id, workspace, ctx);
+                Self::dispatch_builtin(action_id, ctx);
                 continue;
             }
 
@@ -46,11 +51,9 @@ impl TriggerRunner {
 
             // Open a fresh terminal tab for this action, then dispatch the
             // joined commands to the newly created pane.
-            workspace.update(ctx, |ws, ws_ctx| {
-                ws.add_terminal_tab(true, ws_ctx);
-            });
+            workspace.add_terminal_tab(true, ctx);
 
-            let new_group = workspace.read(ctx, |ws, _| ws.active_tab_pane_group().clone());
+            let new_group = workspace.active_tab_pane_group().clone();
             new_group.update(ctx, |group, group_ctx| {
                 Self::dispatch_action_to_group(action, group, group_ctx);
             });
@@ -59,17 +62,12 @@ impl TriggerRunner {
 
     fn dispatch_builtin(
         action_id: &uuid::Uuid,
-        workspace: &ViewHandle<Workspace>,
-        ctx: &mut AppContext,
+        ctx: &mut ViewContext<Workspace>,
     ) {
         if *action_id == BUILTIN_CLOSE_ALL_TERMINALS_ID {
-            workspace.update(ctx, |_, ws_ctx| {
-                ws_ctx.dispatch_typed_action(&WorkspaceAction::CloseAllTerminals);
-            });
+            ctx.dispatch_typed_action(&WorkspaceAction::CloseAllTerminals);
         } else if *action_id == BUILTIN_KILL_ALL_PROCESSES_ID {
-            workspace.update(ctx, |_, ws_ctx| {
-                ws_ctx.dispatch_typed_action(&WorkspaceAction::KillAllTerminalProcesses);
-            });
+            ctx.dispatch_typed_action(&WorkspaceAction::KillAllTerminalProcesses);
         }
     }
 
