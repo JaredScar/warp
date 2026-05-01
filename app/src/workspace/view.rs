@@ -2696,6 +2696,9 @@ impl Workspace {
                 me.sync_settings_error_state_into_settings_pane(ctx);
                 ctx.notify();
             }
+            WarpConfigUpdateEvent::TabNamingRules => {
+                me.apply_tab_naming_rules(ctx);
+            }
             _ => {}
         });
     }
@@ -5338,6 +5341,20 @@ impl Workspace {
             return;
         }
 
+        // Normalize a path string for comparison: expand `~`, unify separators to `/`,
+        // and lowercase for case-insensitive matching on Windows.
+        let home_prefix = dirs::home_dir()
+            .map(|h| h.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let normalize = |p: &str| -> String {
+            let expanded = if p.starts_with('~') {
+                p.replacen('~', &home_prefix, 1)
+            } else {
+                p.to_string()
+            };
+            expanded.replace('\\', "/").to_lowercase()
+        };
+
         for tab in &self.tabs {
             let pane_group = tab.pane_group.clone();
             let Some(terminal_view_handle) = pane_group.as_ref(ctx).focused_session_view(ctx)
@@ -5351,23 +5368,11 @@ impl Workspace {
             if cwd.is_empty() {
                 continue;
             }
-            // Expand home dir for matching
-            let home_prefix = dirs::home_dir()
-                .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let expanded_cwd = if cwd.starts_with('~') {
-                cwd.replacen('~', &home_prefix, 1)
-            } else {
-                cwd.clone()
-            };
+            let norm_cwd = normalize(&cwd);
 
             for rule in &rules {
-                let expanded_prefix = if rule.path_prefix.starts_with('~') {
-                    rule.path_prefix.replacen('~', &home_prefix, 1)
-                } else {
-                    rule.path_prefix.clone()
-                };
-                if expanded_cwd.starts_with(&expanded_prefix) {
+                let norm_prefix = normalize(&rule.path_prefix);
+                if !norm_prefix.is_empty() && norm_cwd.starts_with(&norm_prefix) {
                     let new_name = rule.tab_name.clone();
                     pane_group.update(ctx, |pg, ctx| {
                         pg.set_title(&new_name, ctx);
@@ -13290,6 +13295,16 @@ impl Workspace {
                 self.update_resource_center_action_target(ctx);
                 self.update_active_session(ctx);
                 self.apply_tab_naming_rules(ctx);
+                // Retry after a short delay: on new tabs the CWD may not be
+                // populated in the first AppStateChanged fire.
+                let _ = ctx.spawn(
+                    async {
+                        warpui::r#async::Timer::after(std::time::Duration::from_millis(800)).await;
+                    },
+                    |me: &mut Self, _: (), ctx| {
+                        me.apply_tab_naming_rules(ctx);
+                    },
+                );
 
                 if FeatureFlag::DirectoryTabColors.is_enabled() {
                     if let Some(tab) = self

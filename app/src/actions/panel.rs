@@ -7,7 +7,7 @@ use warp_core::ui::Icon;
 use warpui::{
     elements::{
         resizable_state_handle, Align, ConstrainedBox, Container, CornerRadius,
-        CrossAxisAlignment, DragBarSide, DispatchEventResult, Element, EventHandler, Flex, Hoverable,
+        CrossAxisAlignment, DragBarSide, DispatchEventResult, Element, EventHandler, Expanded, Flex, Hoverable,
         MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Radius, Resizable,
         ResizableStateHandle, Shrinkable, Text,
     },
@@ -312,7 +312,7 @@ impl ActionsPanelView {
         let cron_scheduler = crate::actions::scheduler::CronScheduler::new();
 
         Self {
-            resizable_state_handle: resizable_state_handle(360.0),
+            resizable_state_handle: resizable_state_handle(520.0),
             actions_tab_mouse_state: Default::default(),
             triggers_tab_mouse_state: Default::default(),
             workspaces_tab_mouse_state: Default::default(),
@@ -587,18 +587,18 @@ impl ActionsPanelView {
         // In editing / palette mode show a back arrow + form title instead of tabs.
         let left_side: Box<dyn Element> = match &self.panel_mode {
             PanelMode::List => {
-                let tab_row = Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_spacing(4.0)
+        let tab_row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(4.0)
                     .with_child(self.render_tab_button(appearance, "Actions", ActionsPanelTab::Actions))
                     .with_child(self.render_tab_button(appearance, "Triggers", ActionsPanelTab::Triggers))
                     .with_child(self.render_tab_button(appearance, "Workspaces", ActionsPanelTab::Workspaces))
                     .with_child(self.render_tab_button(appearance, "Rules", ActionsPanelTab::NamingRules))
-                    .with_main_axis_size(MainAxisSize::Min)
-                    .finish();
+            .with_main_axis_size(MainAxisSize::Min)
+            .finish();
                 // Also render the palette search icon to the right.
                 let search_btn = Hoverable::new(self.palette_button_state.clone(), |_| {
-                    Container::new(
+        Container::new(
                         Text::new("⌕", font, 14.)
                             .with_color(theme.sub_text_color(theme.background()).into_solid())
                             .finish()
@@ -612,14 +612,14 @@ impl ActionsPanelView {
                 .finish();
                 Shrinkable::new(
                     1.0,
-                    Flex::row()
-                        .with_main_axis_size(MainAxisSize::Max)
-                        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
                         .with_child(tab_row)
                         .with_child(search_btn)
-                        .finish(),
-                )
+                    .finish(),
+            )
                 .finish()
             }
             PanelMode::Palette => {
@@ -679,8 +679,8 @@ impl ActionsPanelView {
 
         Container::new(
             ConstrainedBox::new(left_side)
-                .with_height(PANE_HEADER_HEIGHT)
-                .finish(),
+            .with_height(PANE_HEADER_HEIGHT)
+            .finish(),
         )
         .with_padding_left(10.)
         .with_padding_right(HEADER_EDGE_PADDING)
@@ -737,6 +737,27 @@ impl ActionsPanelView {
         create_action: ActionsPanelAction,
         create_mouse_state: MouseStateHandle,
     ) -> Box<dyn Element> {
+        self.render_empty_state_with_label(
+            appearance,
+            icon,
+            title,
+            subtitle,
+            &format!("+ Create {}", title.split_whitespace().next().unwrap_or(title)),
+            create_action,
+            create_mouse_state,
+        )
+    }
+
+    fn render_empty_state_with_label(
+        &self,
+        appearance: &Appearance,
+        icon: icons::Icon,
+        title: &'static str,
+        subtitle: &'static str,
+        button_label: &str,
+        create_action: ActionsPanelAction,
+        create_mouse_state: MouseStateHandle,
+    ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let sub_color = theme.sub_text_color(theme.background()).into_solid();
         let main_color = theme.main_text_color(theme.background()).into_solid();
@@ -746,7 +767,7 @@ impl ActionsPanelView {
         )
         .with_width(32.)
         .with_height(32.)
-        .finish();
+            .finish();
 
         let title_el = Text::new(title, appearance.ui_font_family(), 14.)
             .with_style(Properties::default().weight(Weight::Semibold))
@@ -757,6 +778,7 @@ impl ActionsPanelView {
             .with_color(sub_color)
             .finish();
 
+        let button_label = button_label.to_string();
         let create_btn = {
             let ui_builder = appearance.ui_builder().clone();
             ui_builder
@@ -771,29 +793,29 @@ impl ActionsPanelView {
                     }),
                     ..Default::default()
                 })
-                .with_text_label(format!("+ Create {}", title.split_whitespace().next().unwrap_or(title)))
-                .build()
-                .on_click(move |ctx, _, _| {
+                .with_text_label(button_label)
+            .build()
+            .on_click(move |ctx, _, _| {
                     ctx.dispatch_typed_action(create_action.clone());
-                })
-                .with_cursor(Cursor::PointingHand)
-                .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .finish()
         };
 
         Flex::column()
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_alignment(MainAxisAlignment::Center)
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_child(
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_child(
                 Container::new(icon_el)
                     .with_margin_bottom(12.)
-                    .finish(),
-            )
+                        .finish(),
+                )
             .with_child(
                 Container::new(title_el)
                     .with_margin_bottom(6.)
-                    .finish(),
-            )
+                .finish(),
+        )
             .with_child(
                 Container::new(subtitle_el)
                     .with_margin_bottom(20.)
@@ -844,8 +866,8 @@ impl ActionsPanelView {
                 )
                 .finish();
             let mut c = Container::new(inner)
-                .with_padding_left(10.)
-                .with_padding_right(10.)
+        .with_padding_left(10.)
+        .with_padding_right(10.)
                 .with_padding_top(8.)
                 .with_padding_bottom(2.);
             if let Some(bg) = bg {
@@ -935,7 +957,7 @@ impl ActionsPanelView {
             ))
             .finish()
         } else {
-            let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
+        let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
 
             // ── Built-ins ─────────────────────────────────────────────────
             if !builtin.is_empty() {
@@ -977,7 +999,7 @@ impl ActionsPanelView {
                 }
             }
 
-            Shrinkable::new(1.0, col.finish()).finish()
+        Shrinkable::new(1.0, col.finish()).finish()
         };
 
         Flex::column()
@@ -995,7 +1017,7 @@ impl ActionsPanelView {
     ) -> Box<dyn Element> {
         // Guard: can't create triggers without actions.
         if !has_actions {
-            let theme = appearance.theme();
+        let theme = appearance.theme();
             let sub_color = theme.sub_text_color(theme.background()).into_solid();
             let main_color = theme.main_text_color(theme.background()).into_solid();
             let icon_el = ConstrainedBox::new(
@@ -1030,7 +1052,7 @@ impl ActionsPanelView {
                     .with_color(sub_color)
                     .finish(),
                 )
-                .finish();
+            .finish();
             return Align::new(no_actions_hint).finish();
         }
 
@@ -1038,12 +1060,12 @@ impl ActionsPanelView {
             let ui_builder = appearance.ui_builder().clone();
             let tooltip = ui_builder.tool_tip("Create new trigger".to_string()).build().finish();
             icon_button(appearance, Icon::Plus, false, self.new_trigger_mouse_state.clone())
-                .with_tooltip(move || tooltip)
-                .build()
-                .on_click(move |ctx, _, _| {
+            .with_tooltip(move || tooltip)
+            .build()
+            .on_click(move |ctx, _, _| {
                     ctx.dispatch_typed_action(ActionsPanelAction::NewTrigger);
-                })
-                .finish()
+            })
+            .finish()
         };
 
         let toolbar = Container::new(
@@ -1074,7 +1096,7 @@ impl ActionsPanelView {
                 ActionsPanelAction::NewTrigger,
                 empty_state_mouse,
             ))
-            .finish()
+        .finish()
         } else {
             let pinned: Vec<&Trigger> = triggers.iter().filter(|t| t.pinned).collect();
             let unpinned: Vec<&Trigger> = triggers.iter().filter(|t| !t.pinned).collect();
@@ -1121,12 +1143,12 @@ impl ActionsPanelView {
                 .build()
                 .finish();
             icon_button(appearance, Icon::Plus, false, self.save_workspace_mouse_state.clone())
-                .with_tooltip(move || tooltip)
-                .build()
-                .on_click(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(ActionsPanelAction::SaveWorkspace);
-                })
-                .finish()
+            .with_tooltip(move || tooltip)
+            .build()
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(ActionsPanelAction::SaveWorkspace);
+            })
+            .finish()
         };
 
         let save_row = Container::new(
@@ -1307,11 +1329,12 @@ impl ActionsPanelView {
                     .primary
                     .clone()
             };
-            Align::new(self.render_empty_state(
+            Align::new(self.render_empty_state_with_label(
                 appearance,
                 icons::Icon::Folder,
                 "Tab Rules",
                 "Auto-rename tabs based on working directory",
+                "+ Create Rule",
                 ActionsPanelAction::NewNamingRule,
                 empty_mouse,
             ))
@@ -1370,8 +1393,7 @@ impl ActionsPanelView {
             icon_button(appearance, icons::Icon::Edit, false, edit_state)
                 .build()
                 .on_click(move |ctx, _, _| {
-                    // TODO: pre-fill the form for editing
-                    ctx.dispatch_typed_action(ActionsPanelAction::NewNamingRule);
+                    ctx.dispatch_typed_action(ActionsPanelAction::EditNamingRule(id));
                 })
                 .finish();
         let delete_btn =
@@ -1385,7 +1407,7 @@ impl ActionsPanelView {
         let row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max)
-            .with_child(Flex::row().with_child(label_row).with_main_axis_size(MainAxisSize::Max).finish())
+            .with_child(Box::new(Expanded::new(1., label_row)))
             .with_child(edit_btn)
             .with_child(delete_btn)
             .finish();
@@ -1724,7 +1746,7 @@ impl ActionsPanelView {
         .with_padding_right(10.)
         .with_padding_top(6.)
         .with_padding_bottom(6.)
-        .finish()
+            .finish()
     }
 
     fn render_workspace_row(
@@ -1756,12 +1778,12 @@ impl ActionsPanelView {
             let ui_builder = appearance.ui_builder().clone();
             let tooltip = ui_builder.tool_tip("Restore workspace".to_string()).build().finish();
             icon_button(appearance, Icon::Refresh, false, restore_state)
-                .with_tooltip(move || tooltip)
-                .build()
-                .on_click(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(ActionsPanelAction::RestoreWorkspace(workspace_id));
-                })
-                .finish()
+            .with_tooltip(move || tooltip)
+            .build()
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(ActionsPanelAction::RestoreWorkspace(workspace_id));
+            })
+            .finish()
         };
 
         let rename_button = {
@@ -1829,8 +1851,8 @@ impl ActionsPanelView {
                 .with_style(Properties::default().weight(Weight::Semibold))
                 .with_color(
                     appearance
-                        .theme()
-                        .sub_text_color(appearance.theme().background())
+            .theme()
+            .sub_text_color(appearance.theme().background())
                         .into_solid(),
                 )
                 .finish(),
@@ -1899,7 +1921,7 @@ impl ActionsPanelView {
             Flex::row()
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_main_axis_alignment(MainAxisAlignment::End)
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_spacing(8.)
                 .with_child(cancel_btn)
                 .with_child(save_btn)
@@ -2577,15 +2599,15 @@ impl ActionsPanelView {
                     Flex::row()
                         .with_cross_axis_alignment(CrossAxisAlignment::Center)
                         .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-                        .with_main_axis_size(MainAxisSize::Max)
-                        .with_child(
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(
                             Flex::row()
                                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                                 .with_spacing(6.)
                                 .with_child(order_label)
                                 .with_child(name_el)
-                                .finish(),
-                        )
+                    .finish(),
+            )
                         .with_child(controls.with_main_axis_size(MainAxisSize::Min).finish())
                         .finish(),
                 )
@@ -2723,7 +2745,7 @@ impl ActionsPanelView {
             if expr.trim().is_empty() {
                 Text::new("Leave blank for no schedule.", font, 11.)
                     .with_color(sub_color)
-                    .finish()
+            .finish()
             } else {
                 match crate::actions::scheduler::CronScheduler::validate_and_describe(expr) {
                     Ok(preview) => Text::new(preview, font, 11.)
@@ -3028,6 +3050,7 @@ pub enum ActionsPanelAction {
     SelectToolbarIcon(super::model::PinnedIcon),
     // ── Naming rules ──────────────────────────────────────────────────────────
     NewNamingRule,
+    EditNamingRule(Uuid),
     DeleteNamingRule(Uuid),
     SaveNamingRule,
 }
@@ -3056,11 +3079,11 @@ impl View for ActionsPanelView {
 
         let content: Box<dyn Element> = match &self.panel_mode {
             PanelMode::List => match self.active_tab {
-                ActionsPanelTab::Actions => self.render_actions_tab(&actions, appearance),
+            ActionsPanelTab::Actions => self.render_actions_tab(&actions, appearance),
                 ActionsPanelTab::Triggers => {
                     self.render_triggers_tab(&triggers, !actions.is_empty(), appearance)
                 }
-                ActionsPanelTab::Workspaces => self.render_workspaces_tab(&workspaces, appearance),
+            ActionsPanelTab::Workspaces => self.render_workspaces_tab(&workspaces, appearance),
                 ActionsPanelTab::NamingRules => {
                     let rules = WarpConfig::as_ref(app).tab_naming_rules().to_vec();
                     self.render_naming_rules_tab(&rules, appearance)
@@ -3177,7 +3200,7 @@ impl warpui::TypedActionView for ActionsPanelView {
                         ctx.dispatch_typed_action(&WorkspaceAction::KillAllTerminalProcesses);
                     }
                 } else {
-                    ctx.dispatch_typed_action(&WorkspaceAction::RunActionInActiveTerminal(*id));
+                ctx.dispatch_typed_action(&WorkspaceAction::RunActionInActiveTerminal(*id));
                 }
             }
             ActionsPanelAction::RunTrigger(id) => {
@@ -3562,6 +3585,23 @@ impl warpui::TypedActionView for ActionsPanelView {
                 self.edit_rule_tab_name_editor
                     .update(ctx, |e, ctx| e.set_buffer_text("", ctx));
                 ctx.notify();
+            }
+            ActionsPanelAction::EditNamingRule(id) => {
+                use crate::user_config::WarpConfig;
+                let id = *id;
+                let config = WarpConfig::as_ref(ctx);
+                if let Some(rule) = config.tab_naming_rules().iter().find(|r| r.id == id).cloned() {
+                    drop(config);
+                    let prefix = rule.path_prefix.clone();
+                    let tab_name = rule.tab_name.clone();
+                    self.edit_naming_rule_id = Some(id);
+                    self.naming_rule_form_open = true;
+                    self.edit_rule_prefix_editor
+                        .update(ctx, |e, ctx| e.set_buffer_text_with_base_buffer(&prefix, ctx));
+                    self.edit_rule_tab_name_editor
+                        .update(ctx, |e, ctx| e.set_buffer_text_with_base_buffer(&tab_name, ctx));
+                    ctx.notify();
+                }
             }
             ActionsPanelAction::DeleteNamingRule(id) => {
                 use crate::user_config::WarpConfig;
