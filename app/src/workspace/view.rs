@@ -1063,6 +1063,8 @@ pub struct Workspace {
     /// `PendingCommandCompleted`.  Used to guard both the subscription
     /// callback and the 5-second fallback timer against double-advance.
     trigger_queue_waiting: bool,
+    /// Named, collapsible tab groups.  Indexed by `TabData::group_id`.
+    tab_groups: Vec<crate::tab::TabGroup>,
 }
 
 impl Workspace {
@@ -3349,6 +3351,7 @@ impl Workspace {
             trigger_active_terminal: None,
             trigger_active_terminal_id: None,
             trigger_queue_waiting: false,
+            tab_groups: Vec::new(),
         };
 
         ws.configure_new_workspace(workspace_setting, ctx);
@@ -16792,6 +16795,69 @@ impl Workspace {
         .finish()
     }
 
+    fn render_tab_group_header(
+        &self,
+        group: &crate::tab::TabGroup,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+        let text_color = theme.accent().into_solid();
+
+        let chevron_icon = if group.collapsed { icons::Icon::ChevronRight } else { icons::Icon::ChevronDown };
+
+        let name_label = Text::new(group.name.clone(), font, 11.)
+            .with_color(text_color)
+            .with_style(warpui::fonts::Properties::default().weight(warpui::fonts::Weight::Semibold))
+            .finish();
+
+        let chevron = ConstrainedBox::new(
+            chevron_icon
+                .to_warpui_icon(theme.sub_text_color(theme.background()))
+                .finish(),
+        )
+        .with_width(12.)
+        .with_height(12.)
+        .finish();
+
+        let group_id = group.id;
+        let header = Hoverable::new(group.header_mouse_state.clone(), move |state| {
+            let bg = if state.is_hovered() {
+                Some(warpui::elements::Fill::Solid(
+                    pathfinder_color::ColorU::new(255, 255, 255, 15),
+                ))
+            } else {
+                None
+            };
+            let mut c = Container::new(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(4.)
+                    .with_child(chevron)
+                    .with_child(name_label)
+                    .finish(),
+            )
+            .with_padding_left(6.)
+            .with_padding_right(6.)
+            .with_padding_top(3.)
+            .with_padding_bottom(3.);
+            if let Some(bg) = bg {
+                c = c.with_background(bg);
+            }
+            c.finish()
+        })
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::ToggleTabGroupCollapsed(group_id));
+        })
+        .with_cursor(warpui::platform::Cursor::PointingHand)
+        .finish();
+
+        // Add a small colored left-border accent so groups are visually distinct.
+        Container::new(header)
+            .with_margin_right(4.)
+            .finish()
+    }
+
     fn render_tab_in_tab_bar(
         &self,
         tab_index: usize,
@@ -16983,17 +17049,17 @@ impl Workspace {
 
         // Collect pinned actions and triggers for quick-launch toolbar buttons.
         let warp_config = WarpConfig::as_ref(ctx);
-        let pinned_actions: Vec<(uuid::Uuid, String)> = warp_config
+        let pinned_actions: Vec<(uuid::Uuid, String, icons::Icon)> = warp_config
             .actions()
             .iter()
             .filter(|a| a.pinned && !crate::actions::model::is_builtin_action(&a.id))
-            .map(|a| (a.id, a.name.clone()))
+            .map(|a| (a.id, a.name.clone(), a.toolbar_icon.unwrap_or_default().to_icon()))
             .collect();
-        let pinned_triggers: Vec<(uuid::Uuid, String)> = warp_config
+        let pinned_triggers: Vec<(uuid::Uuid, String, icons::Icon)> = warp_config
             .triggers()
             .iter()
             .filter(|t| t.pinned)
-            .map(|t| (t.id, t.name.clone()))
+            .map(|t| (t.id, t.name.clone(), t.toolbar_icon.unwrap_or_default().to_icon()))
             .collect();
         drop(warp_config);
 
@@ -17005,7 +17071,7 @@ impl Workspace {
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(actions_btn);
 
-        for (id, name) in pinned_actions {
+        for (id, name, icon) in pinned_actions {
             let mouse_state = self
                 .mouse_states
                 .pinned_item_states
@@ -17016,7 +17082,7 @@ impl Workspace {
             let btn = self
                 .render_tab_bar_icon_button(
                     appearance,
-                    icons::Icon::Lightning,
+                    icon,
                     &mouse_state,
                     WorkspaceAction::RunActionInActiveTerminal(id),
                     name,
@@ -17028,7 +17094,7 @@ impl Workspace {
             row = row.with_child(btn);
         }
 
-        for (id, name) in pinned_triggers {
+        for (id, name, icon) in pinned_triggers {
             let mouse_state = self
                 .mouse_states
                 .pinned_item_states
@@ -17039,7 +17105,7 @@ impl Workspace {
             let btn = self
                 .render_tab_bar_icon_button(
                     appearance,
-                    icons::Icon::Workflow,
+                    icon,
                     &mouse_state,
                     WorkspaceAction::RunTrigger(id),
                     name,
@@ -17645,6 +17711,29 @@ impl Workspace {
                 ) {
                     tab_bar.add_child(self.render_tab_hover_indicator(appearance));
                 }
+
+                let tab = &self.tabs[i];
+
+                // ── Group header ─────────────────────────────────────────────
+                // Render a group label before the first tab of each group.
+                let group_header_needed = tab.group_id.is_some() && {
+                    i == 0
+                        || self.tabs[i - 1].group_id != tab.group_id
+                };
+                if group_header_needed {
+                    if let Some(group) = self.tab_groups.iter().find(|g| Some(g.id) == tab.group_id) {
+                        tab_bar.add_child(self.render_tab_group_header(group, appearance));
+                    }
+                }
+
+                // Skip tabs that belong to a collapsed group.
+                let is_in_collapsed_group = tab.group_id.as_ref().is_some_and(|gid| {
+                    self.tab_groups.iter().any(|g| g.id == *gid && g.collapsed)
+                });
+                if is_in_collapsed_group {
+                    continue;
+                }
+
                 tab_bar.add_child(self.render_tab_in_tab_bar(i, tab_bar_state, ctx));
             }
 
@@ -20193,6 +20282,74 @@ impl TypedActionView for Workspace {
             ResetPaneName(locator) => self.clear_pane_name(*locator, ctx),
             RenameActiveTab => self.rename_tab(self.active_tab_index, ctx),
             SetActiveTabName(name) => self.set_active_tab_name(name, ctx),
+
+            // ── Tab group handlers ─────────────────────────────────────────
+            AddTabToNewGroup(tab_index) => {
+                let group = crate::tab::TabGroup {
+                    id: uuid::Uuid::new_v4(),
+                    name: format!("Group {}", self.tab_groups.len() + 1),
+                    collapsed: false,
+                    header_mouse_state: Default::default(),
+                    rename_mouse_state: Default::default(),
+                };
+                let group_id = group.id;
+                self.tab_groups.push(group);
+                if let Some(tab) = self.tabs.get_mut(*tab_index) {
+                    tab.group_id = Some(group_id);
+                }
+                ctx.notify();
+            }
+            AddTabToGroup { tab_index, group_id } => {
+                if let Some(tab) = self.tabs.get_mut(*tab_index) {
+                    tab.group_id = Some(*group_id);
+                }
+                ctx.notify();
+            }
+            RemoveTabFromGroup(tab_index) => {
+                if let Some(tab) = self.tabs.get_mut(*tab_index) {
+                    tab.group_id = None;
+                }
+                ctx.notify();
+            }
+            ToggleTabGroupCollapsed(group_id) => {
+                if let Some(g) = self.tab_groups.iter_mut().find(|g| g.id == *group_id) {
+                    g.collapsed = !g.collapsed;
+                    // If collapsing and the active tab is inside this group,
+                    // move the active tab to the first non-collapsed tab.
+                    if g.collapsed {
+                        let active_is_in_group = self.tabs
+                            .get(self.active_tab_index)
+                            .map(|t| t.group_id == Some(*group_id))
+                            .unwrap_or(false);
+                        if active_is_in_group {
+                            if let Some(first_visible) = self.tabs.iter().position(|t| {
+                                t.group_id.as_ref().map_or(true, |gid| {
+                                    !self.tab_groups.iter().any(|g| g.id == *gid && g.collapsed)
+                                })
+                            }) {
+                                self.set_active_tab_index(first_visible, ctx);
+                            }
+                        }
+                    }
+                }
+                ctx.notify();
+            }
+            RenameTabGroup { group_id, name } => {
+                if let Some(g) = self.tab_groups.iter_mut().find(|g| g.id == *group_id) {
+                    g.name = name.clone();
+                }
+                ctx.notify();
+            }
+            DeleteTabGroup(group_id) => {
+                // Ungroup all tabs that were in this group.
+                for tab in &mut self.tabs {
+                    if tab.group_id == Some(*group_id) {
+                        tab.group_id = None;
+                    }
+                }
+                self.tab_groups.retain(|g| g.id != *group_id);
+                ctx.notify();
+            }
             SetActiveTabColor(color) => self.set_tab_color(self.active_tab_index, *color, ctx),
             ToggleTabRightClickMenu { tab_index, anchor } => {
                 self.toggle_tab_right_click_menu(*tab_index, *anchor, ctx)
@@ -21006,6 +21163,7 @@ impl TypedActionView for Workspace {
                     timeout_secs: None,
                     hotkey: None,
                     pinned: false,
+                    toolbar_icon: None,
                     commands: vec![],
                     source_path: None,
                 };
@@ -21026,6 +21184,7 @@ impl TypedActionView for Workspace {
                     targets: Default::default(),
                     hotkey: None,
                     pinned: false,
+                    toolbar_icon: None,
                     cron_schedule: None,
                     schedule_enabled: false,
                     source_path: None,

@@ -54,6 +54,20 @@ use warpui::{AppContext, SingletonEntity, ViewHandle};
 pub const TAB_BAR_BORDER_HEIGHT: f32 = 1.0;
 const TAB_INDICATOR_HEIGHT: f32 = 14.0;
 
+// ── Tab groups ────────────────────────────────────────────────────────────────
+
+/// A named, collapsible group of terminal tabs.
+#[derive(Clone)]
+pub struct TabGroup {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub collapsed: bool,
+    /// Mouse state for the group header label / clickable area.
+    pub header_mouse_state: MouseStateHandle,
+    /// Mouse state for the rename button on the group header.
+    pub rename_mouse_state: MouseStateHandle,
+}
+
 /// True when the user has opted into vertical tabs and the feature flag is on.
 /// Exposed so binding-description overrides in `workspace/mod.rs` and context-
 /// menu builders here can share a single predicate.
@@ -144,6 +158,8 @@ pub struct TabData {
     pub indicator_hover_state: MouseStateHandle,
     // Used by a later drag-tab branch to distinguish tabs that have moved into detached windows.
     pub detached: bool,
+    /// The tab group this tab belongs to, if any.
+    pub group_id: Option<uuid::Uuid>,
 }
 
 const TAB_COLOR_ICON_PATH: &str = "bundled/svg/ellipse.svg";
@@ -161,6 +177,7 @@ impl TabData {
             selected_color: SelectedTabColor::Unset,
             indicator_hover_state: Default::default(),
             detached: false,
+            group_id: None,
         }
     }
 
@@ -339,6 +356,21 @@ impl TabData {
                 .into_item(),
             );
         }
+
+        // ── Tab group items ──────────────────────────────────────────────
+        if self.group_id.is_some() {
+            menu_items.push(
+                MenuItemFields::new("Remove from Group")
+                    .with_on_select_action(WorkspaceAction::RemoveTabFromGroup(index))
+                    .into_item(),
+            );
+        }
+        menu_items.push(
+            MenuItemFields::new("Add to New Group")
+                .with_on_select_action(WorkspaceAction::AddTabToNewGroup(index))
+                .into_item(),
+        );
+
         menu_items
     }
 

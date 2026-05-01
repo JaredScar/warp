@@ -115,6 +115,19 @@ pub enum WorkspaceAction {
     ResetPaneName(PaneViewLocator),
     RenameActiveTab,
     SetActiveTabName(String),
+    // ── Tab groups ──────────────────────────────────────────────────────────
+    /// Place the tab at `tab_index` into a newly-created, unnamed tab group.
+    AddTabToNewGroup(usize),
+    /// Move tab at `tab_index` into an existing tab group.
+    AddTabToGroup { tab_index: usize, group_id: Uuid },
+    /// Remove the tab at `tab_index` from its group (becomes ungrouped).
+    RemoveTabFromGroup(usize),
+    /// Toggle collapsed/expanded state for the given group.
+    ToggleTabGroupCollapsed(Uuid),
+    /// Rename the given tab group.
+    RenameTabGroup { group_id: Uuid, name: String },
+    /// Delete a tab group (tabs become ungrouped, not closed).
+    DeleteTabGroup(Uuid),
     /// Sets the manual color override for the active tab.
     ///
     /// - `Color(_)` — apply that color.
@@ -1009,7 +1022,13 @@ impl WorkspaceAction {
             | TabConfigSidecarRemoveConfig { .. }
             | OpenSettingsFile
             | FixSettingsWithOz { .. }
-            | OpenNetworkLogPane => false,
+            | OpenNetworkLogPane
+            | AddTabToNewGroup(_)
+            | AddTabToGroup { .. }
+            | RemoveTabFromGroup(_)
+            | ToggleTabGroupCollapsed(_)
+            | RenameTabGroup { .. }
+            | DeleteTabGroup(_) => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,
             #[cfg(target_family = "wasm")]

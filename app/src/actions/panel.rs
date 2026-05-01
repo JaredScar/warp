@@ -179,6 +179,15 @@ pub struct ActionsPanelView {
     trigger_history_states: RefCell<HashMap<Uuid, MouseStateHandle>>,
     /// Mouse state for the "← Back" button in the history view.
     history_back_state: MouseStateHandle,
+    // ── toolbar pinning ──
+    /// Whether the action/trigger currently being edited is pinned to the toolbar.
+    edit_pinned: bool,
+    /// The toolbar icon chosen for the action/trigger currently being edited.
+    edit_toolbar_icon: super::model::PinnedIcon,
+    /// Mouse state for the "Pin to toolbar" toggle button.
+    pin_toggle_state: MouseStateHandle,
+    /// One mouse state per `PinnedIcon` variant (index matches `PinnedIcon::all()`).
+    edit_icon_states: Vec<MouseStateHandle>,
 }
 
 impl ActionsPanelView {
@@ -328,6 +337,13 @@ impl ActionsPanelView {
             schedule_toggle_state: Default::default(),
             trigger_history_states: Default::default(),
             history_back_state: Default::default(),
+            edit_pinned: false,
+            edit_toolbar_icon: Default::default(),
+            pin_toggle_state: Default::default(),
+            edit_icon_states: super::model::PinnedIcon::all()
+                .iter()
+                .map(|_| MouseStateHandle::default())
+                .collect(),
         }
     }
 
@@ -372,7 +388,7 @@ impl ActionsPanelView {
         let action = action_id.and_then(|id| config.actions().iter().find(|a| a.id == id).cloned());
         drop(config);
 
-        let (name, desc, tab_name, group, timeout, hotkey, commands) = if let Some(a) = action {
+        let (name, desc, tab_name, group, timeout, hotkey, commands, pinned, toolbar_icon) = if let Some(ref a) = action {
             (
                 a.name.clone(),
                 a.description.clone().unwrap_or_default(),
@@ -381,10 +397,15 @@ impl ActionsPanelView {
                 a.timeout_secs.map(|t| t.to_string()).unwrap_or_default(),
                 a.hotkey.clone().unwrap_or_default(),
                 a.commands.clone(),
+                a.pinned,
+                a.toolbar_icon.unwrap_or_default(),
             )
         } else {
-            (String::new(), String::new(), String::new(), String::new(), String::new(), String::new(), vec![String::new()])
+            (String::new(), String::new(), String::new(), String::new(), String::new(), String::new(), vec![String::new()], false, Default::default())
         };
+
+        self.edit_pinned = pinned;
+        self.edit_toolbar_icon = toolbar_icon;
 
         self.hotkey_value = hotkey;
         self.hotkey_recording = false;
@@ -427,7 +448,7 @@ impl ActionsPanelView {
             .and_then(|id| config.triggers().iter().find(|t| t.id == id).cloned());
         drop(config);
 
-        let (name, desc, hotkey, ordered_ids, cron_schedule, schedule_enabled) =
+        let (name, desc, hotkey, ordered_ids, cron_schedule, schedule_enabled, pinned, toolbar_icon) =
             if let Some(ref t) = trigger {
                 (
                     t.name.clone(),
@@ -436,11 +457,15 @@ impl ActionsPanelView {
                     t.action_ids.clone(),
                     t.cron_schedule.clone().unwrap_or_default(),
                     t.schedule_enabled,
+                    t.pinned,
+                    t.toolbar_icon.unwrap_or_default(),
                 )
             } else {
-                (String::new(), String::new(), String::new(), Vec::new(), String::new(), false)
+                (String::new(), String::new(), String::new(), Vec::new(), String::new(), false, false, Default::default())
             };
 
+        self.edit_pinned = pinned;
+        self.edit_toolbar_icon = toolbar_icon;
         self.trigger_hotkey_value = hotkey;
         self.trigger_hotkey_recording = false;
         self.edit_selected_action_ids = ordered_ids;
@@ -1796,6 +1821,84 @@ impl ActionsPanelView {
         Container::new(inner).with_margin_bottom(FIELD_SPACING).finish()
     }
 
+    fn render_toolbar_pin_section(&self, appearance: &Appearance) -> Box<dyn Element> {
+        use super::model::PinnedIcon;
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+        let accent = theme.accent();
+        let sub_fill = theme.sub_text_color(theme.background());
+        let sub_color = sub_fill.into_solid();
+        let main_color = theme.main_text_color(theme.background()).into_solid();
+
+        let mut col = Flex::column().with_main_axis_size(MainAxisSize::Min);
+
+        // ── "Pin to toolbar" toggle row ───────────────────────────────────
+        let checkbox_icon = if self.edit_pinned { Icon::Check } else { Icon::Circle };
+        let checkbox_color = if self.edit_pinned { accent } else { sub_fill };
+        let checkbox_btn = icon_button_with_color(
+            appearance, checkbox_icon, self.edit_pinned, self.pin_toggle_state.clone(), checkbox_color,
+        )
+        .build()
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(ActionsPanelAction::ToggleEditPinned))
+        .with_cursor(Cursor::PointingHand)
+        .finish();
+
+        let toggle_label = Text::new("Pin to toolbar", font, 12.)
+            .with_color(main_color)
+            .finish();
+
+        let toggle_row = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(6.)
+                .with_child(checkbox_btn)
+                .with_child(toggle_label)
+                .finish(),
+        )
+        .with_margin_bottom(6.)
+        .finish();
+        col = col.with_child(toggle_row);
+
+        // ── Icon picker (only shown when pinned) ─────────────────────────
+        if self.edit_pinned {
+            let hint = Text::new("Pick an icon:", font, 11.)
+                .with_color(sub_color)
+                .finish();
+            col = col.with_child(
+                Container::new(hint).with_margin_bottom(4.).finish(),
+            );
+
+            let mut icons_row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_spacing(4.);
+
+            for (idx, &pinned_icon) in PinnedIcon::all().iter().enumerate() {
+                let is_selected = self.edit_toolbar_icon == pinned_icon;
+                let btn_color = if is_selected { accent } else { sub_fill };
+                let state = self.edit_icon_states.get(idx).cloned().unwrap_or_default();
+                let btn = icon_button_with_color(
+                    appearance, pinned_icon.to_icon(), is_selected, state, btn_color,
+                )
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::SelectToolbarIcon(pinned_icon));
+                })
+                .with_cursor(Cursor::PointingHand)
+                .finish();
+                icons_row = icons_row.with_child(btn);
+            }
+
+            col = col.with_child(
+                Container::new(icons_row.finish())
+                    .with_margin_bottom(FIELD_SPACING)
+                    .finish(),
+            );
+        }
+
+        col.finish()
+    }
+
     fn render_action_editor(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
         let font = appearance.ui_font_family();
@@ -1895,6 +1998,7 @@ impl ActionsPanelView {
                 .finish(),
         );
 
+        col = col.with_child(self.render_toolbar_pin_section(appearance));
         col = col.with_child(self.render_form_buttons(appearance));
 
         Container::new(col.finish())
@@ -2433,6 +2537,7 @@ impl ActionsPanelView {
                 .finish(),
         );
 
+        col = col.with_child(self.render_toolbar_pin_section(appearance));
         col = col.with_child(self.render_form_buttons(appearance));
 
         Container::new(Shrinkable::new(1.0, col.finish()).finish())
@@ -2661,6 +2766,10 @@ pub enum ActionsPanelAction {
     CloseHistoryView,
     /// Flip the `draft_schedule_enabled` flag in the trigger editor.
     ToggleScheduleEnabled,
+    /// Toggle the "pin to toolbar" state in the current editor form.
+    ToggleEditPinned,
+    /// Select a toolbar icon in the current editor form.
+    SelectToolbarIcon(super::model::PinnedIcon),
 }
 
 // ── View impl ─────────────────────────────────────────────────────────────────
@@ -3046,7 +3155,6 @@ impl warpui::TypedActionView for ActionsPanelView {
                         let existing = maybe_id
                             .and_then(|id| config.actions().iter().find(|a| a.id == id).cloned());
                         let existing_source = existing.as_ref().and_then(|a| a.source_path.clone());
-                        let existing_pinned = existing.as_ref().map(|a| a.pinned).unwrap_or(false);
                         drop(config);
 
                         // Delete old file if editing and name changed.
@@ -3062,7 +3170,8 @@ impl warpui::TypedActionView for ActionsPanelView {
                             group,
                             timeout_secs,
                             hotkey,
-                            pinned: existing_pinned,
+                            pinned: self.edit_pinned,
+                            toolbar_icon: if self.edit_pinned { Some(self.edit_toolbar_icon) } else { None },
                             commands,
                             source_path: None,
                         };
@@ -3114,7 +3223,6 @@ impl warpui::TypedActionView for ActionsPanelView {
                         let existing = maybe_id
                             .and_then(|id| config.triggers().iter().find(|t| t.id == id).cloned());
                         let existing_source = existing.as_ref().and_then(|t| t.source_path.clone());
-                        let existing_pinned = existing.as_ref().map(|t| t.pinned).unwrap_or(false);
                         drop(config);
 
                         if let Some(old_path) = existing_source.as_ref() {
@@ -3128,7 +3236,8 @@ impl warpui::TypedActionView for ActionsPanelView {
                             action_ids: selected,
                             targets: Default::default(),
                             hotkey,
-                            pinned: existing_pinned,
+                            pinned: self.edit_pinned,
+                            toolbar_icon: if self.edit_pinned { Some(self.edit_toolbar_icon) } else { None },
                             cron_schedule,
                             schedule_enabled,
                             source_path: None,
@@ -3170,6 +3279,14 @@ impl warpui::TypedActionView for ActionsPanelView {
             }
             ActionsPanelAction::ToggleScheduleEnabled => {
                 self.draft_schedule_enabled = !self.draft_schedule_enabled;
+                ctx.notify();
+            }
+            ActionsPanelAction::ToggleEditPinned => {
+                self.edit_pinned = !self.edit_pinned;
+                ctx.notify();
+            }
+            ActionsPanelAction::SelectToolbarIcon(icon) => {
+                self.edit_toolbar_icon = *icon;
                 ctx.notify();
             }
         }

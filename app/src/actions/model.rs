@@ -6,6 +6,74 @@ use uuid::Uuid;
 
 use crate::terminal::ShellLaunchData;
 
+// ── Toolbar icon picker ───────────────────────────────────────────────────────
+
+/// Icon variants the user can choose when pinning an action or trigger to the
+/// toolbar.  A small curated set that covers the most common use cases.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PinnedIcon {
+    #[default]
+    Lightning,
+    Play,
+    Refresh,
+    Rocket,
+    Terminal,
+    Folder,
+    Gear,
+    Code,
+    Globe,
+    Check,
+}
+
+impl PinnedIcon {
+    pub fn to_icon(self) -> warp_core::ui::icons::Icon {
+        use warp_core::ui::icons::Icon;
+        match self {
+            Self::Lightning => Icon::Lightning,
+            Self::Play => Icon::Play,
+            Self::Refresh => Icon::Refresh,
+            Self::Rocket => Icon::Rocket,
+            Self::Terminal => Icon::Terminal,
+            Self::Folder => Icon::Folder,
+            Self::Gear => Icon::Gear,
+            Self::Code => Icon::Code1,
+            Self::Globe => Icon::Globe,
+            Self::Check => Icon::Check,
+        }
+    }
+
+    pub fn all() -> &'static [PinnedIcon] {
+        &[
+            Self::Lightning,
+            Self::Play,
+            Self::Refresh,
+            Self::Rocket,
+            Self::Terminal,
+            Self::Folder,
+            Self::Gear,
+            Self::Code,
+            Self::Globe,
+            Self::Check,
+        ]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lightning => "Lightning",
+            Self::Play => "Play",
+            Self::Refresh => "Refresh",
+            Self::Rocket => "Rocket",
+            Self::Terminal => "Terminal",
+            Self::Folder => "Folder",
+            Self::Gear => "Gear",
+            Self::Code => "Code",
+            Self::Globe => "Globe",
+            Self::Check => "Check",
+        }
+    }
+}
+
 // ── Built-in system actions ───────────────────────────────────────────────────
 
 /// Stable UUID for the built-in "Close All Terminals" action.
@@ -29,6 +97,7 @@ pub fn builtin_actions() -> Vec<Action> {
             timeout_secs: None,
             hotkey: None,
             pinned: false,
+            toolbar_icon: None,
             source_path: None,
         },
         Action {
@@ -41,6 +110,7 @@ pub fn builtin_actions() -> Vec<Action> {
             timeout_secs: None,
             hotkey: None,
             pinned: false,
+            toolbar_icon: None,
             source_path: None,
         },
     ]
@@ -90,6 +160,9 @@ pub struct Action {
     /// the Actions panel.
     #[serde(default)]
     pub pinned: bool,
+    /// Icon to display when this action is pinned to the toolbar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolbar_icon: Option<PinnedIcon>,
     /// Absolute path of the TOML file this action was loaded from.
     /// Skipped during serialisation — it is set by the loader.
     #[serde(skip)]
@@ -139,6 +212,9 @@ pub struct Trigger {
     /// the Triggers panel.
     #[serde(default)]
     pub pinned: bool,
+    /// Icon to display when this trigger is pinned to the toolbar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolbar_icon: Option<PinnedIcon>,
     /// Standard five-field cron expression controlling when this trigger fires
     /// automatically (e.g. `"0 9 * * 1-5"` = weekdays at 9:00 AM UTC).
     /// `None` means the trigger has no automatic schedule.
