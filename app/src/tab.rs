@@ -623,6 +623,8 @@ enum Indicator {
     /// This pane's inputs are being synced.
     Synced,
     Error,
+    /// A command is actively running in this tab (long-running process).
+    Running,
     /// At least one of the panes in this tab is being shared.
     Shared,
     /// One of the panes in this tab is maximized.
@@ -639,7 +641,7 @@ impl From<TerminalViewState> for Indicator {
     fn from(value: TerminalViewState) -> Self {
         match value {
             TerminalViewState::Errored => Indicator::Error,
-            TerminalViewState::LongRunning => Indicator::None,
+            TerminalViewState::LongRunning => Indicator::Running,
             TerminalViewState::Normal => Indicator::None,
         }
     }
@@ -671,6 +673,7 @@ pub struct TabComponent<'a> {
 struct TabStyles {
     background: Option<ThemeFill>,
     error_color: ColorU,
+    running_color: ColorU,
     sharing_color: ColorU,
     synced_input_indicator_color: ColorU,
 
@@ -696,6 +699,8 @@ impl TabStyles {
         let active_tab_bar_color: Option<ThemeFill> =
             tab_color.map(|color| color.to_ansi_color(&theme.terminal_colors().normal).into());
         let error_color = theme.ui_error_color();
+        // A distinct green for the "running" activity dot.
+        let running_color = ColorU::new(34, 197, 94, 255); // green-500
         let sharing_color = shared_session_indicator_color(appearance);
         let background = active_tab_bar_color.map(|color| {
             ThemeFill::VerticalGradient(VerticalGradient::new(
@@ -706,6 +711,7 @@ impl TabStyles {
         TabStyles {
             background,
             error_color,
+            running_color,
             sharing_color,
             synced_input_indicator_color: ColorU::from_u32(TAB_INDICATOR_SYNCED_COLOR),
             default: UiComponentStyles::default()
@@ -1153,6 +1159,17 @@ impl<'a> TabComponent<'a> {
                 Icon::AlertTriangle
                     .to_warpui_icon(self.styles.error_color.into())
                     .finish(),
+            ),
+            Indicator::Running => Some(
+                // A small filled green circle to indicate an active running process.
+                Container::new(
+                    Rect::new()
+                        .with_background_color(self.styles.running_color.into())
+                        .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)))
+                        .finish(),
+                )
+                .with_uniform_margin(3.)
+                .finish(),
             ),
             Indicator::Shared => Some(
                 Icon::Sharing

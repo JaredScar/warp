@@ -1555,10 +1555,22 @@ fn render_vertical_tabs_panel(
 }
 
 /// Renders a collapsible section header for a user-defined tab group in the vertical tabs sidebar.
+/// Aggregate health state for a tab group, computed from all its tabs.
+#[derive(Clone, Copy, PartialEq)]
+enum GroupHealth {
+    /// No tabs, or all terminals are idle with no errors.
+    Idle,
+    /// At least one terminal is actively running a process.
+    Running,
+    /// At least one terminal has a failed last command (error takes precedence over running).
+    Errored,
+}
+
 fn render_user_tab_group_header(
     state: &VerticalTabsPanelState,
     group: &crate::tab::TabGroup,
     rename_editor: Option<&ViewHandle<EditorView>>,
+    group_health: GroupHealth,
     app: &AppContext,
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
@@ -1670,24 +1682,54 @@ fn render_user_tab_group_header(
         } else {
             ElementFill::None
         };
-        Container::new(
-            Flex::row()
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(4.)
-                .with_child(chevron)
-                .with_child(Shrinkable::new(1., name_el).finish())
-                .with_child(rename_btn)
-                .with_child(delete_btn)
+        // Health badge: green dot (running) or red triangle (errored).
+        let health_badge: Option<Box<dyn Element>> = match group_health {
+            GroupHealth::Running => Some(
+                ConstrainedBox::new(
+                    Container::new(Empty::new().finish())
+                        .with_background(ElementFill::Solid(
+                            pathfinder_color::ColorU::new(34, 197, 94, 255),
+                        ))
+                        .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)))
+                        .finish(),
+                )
+                .with_width(6.)
+                .with_height(6.)
                 .finish(),
-        )
-        .with_padding(
-            Padding::uniform(4.)
-                .with_left(GROUP_HORIZONTAL_PADDING)
-                .with_right(GROUP_HORIZONTAL_PADDING),
-        )
-        .with_background(bg)
-        .finish()
+            ),
+            GroupHealth::Errored => Some(
+                ConstrainedBox::new(
+                    WarpIcon::AlertTriangle
+                        .to_warpui_icon(warp_core::ui::theme::Fill::Solid(
+                            pathfinder_color::ColorU::new(239, 68, 68, 255),
+                        ))
+                        .finish(),
+                )
+                .with_width(10.)
+                .with_height(10.)
+                .finish(),
+            ),
+            GroupHealth::Idle => None,
+        };
+        let mut row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(4.)
+            .with_child(chevron)
+            .with_child(Shrinkable::new(1., name_el).finish());
+        if let Some(badge) = health_badge {
+            row.add_child(badge);
+        }
+        row.add_child(rename_btn);
+        row.add_child(delete_btn);
+        Container::new(row.finish())
+            .with_padding(
+                Padding::uniform(4.)
+                    .with_left(GROUP_HORIZONTAL_PADDING)
+                    .with_right(GROUP_HORIZONTAL_PADDING),
+            )
+            .with_background(bg)
+            .finish()
     })
     .on_click(move |ctx, _, _| {
         ctx.dispatch_typed_action(WorkspaceAction::ToggleTabGroupCollapsed(group_id));
@@ -1878,10 +1920,32 @@ fn render_groups(
                     } else {
                         None
                     };
+                    // Compute aggregate health for this group from all its tabs.
+                    let group_health = {
+                        let mut health = GroupHealth::Idle;
+                        for t in &workspace.tabs {
+                            if t.group_id == Some(group_id) {
+                                let pane_state = t.pane_group.as_ref(app).most_recent_pane_state(app);
+                                match pane_state {
+                                    TerminalViewState::Errored => {
+                                        health = GroupHealth::Errored;
+                                        break; // error takes highest priority
+                                    }
+                                    TerminalViewState::LongRunning => {
+                                        health = GroupHealth::Running;
+                                        // keep looping — an error in another tab wins
+                                    }
+                                    TerminalViewState::Normal => {}
+                                }
+                            }
+                        }
+                        health
+                    };
                     groups.add_child(render_user_tab_group_header(
                         state,
                         user_group,
                         rename_editor.as_ref(),
+                        group_health,
                         app,
                     ));
                     last_rendered_user_group = Some(group_id);
@@ -3535,6 +3599,9 @@ fn render_terminal_row_content(
         }
     };
 
+    let terminal_state = terminal_view.current_state().state;
+    let is_running = terminal_state == TerminalViewState::LongRunning;
+
     let first_line_element = if has_unread_activity(&props.typed, app) {
         Flex::row()
             .with_main_axis_size(MainAxisSize::Max)
@@ -3546,6 +3613,26 @@ fn render_terminal_row_content(
                     .with_margin_left(4.)
                     .finish(),
             )
+            .finish()
+    } else if is_running {
+        // Green activity dot alongside the first line when a process is running.
+        let running_dot = ConstrainedBox::new(
+            Container::new(Empty::new().finish())
+                .with_background(ElementFill::Solid(
+                    pathfinder_color::ColorU::new(34, 197, 94, 255),
+                ))
+                .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)))
+                .finish(),
+        )
+        .with_width(6.)
+        .with_height(6.)
+        .finish();
+        Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+            .with_child(Shrinkable::new(1., first_line).finish())
+            .with_child(Container::new(running_dot).with_margin_left(4.).finish())
             .finish()
     } else {
         first_line
