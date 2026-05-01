@@ -25,6 +25,8 @@ pub use imp::load_workflows;
 pub use imp::{load_launch_configs, load_theme_configs};
 #[cfg(feature = "local_fs")]
 pub use imp::save_naming_rules;
+#[cfg(feature = "local_fs")]
+pub use imp::save_color_rules;
 
 lazy_static! {
     pub static ref LAUNCH_CONFIG_COMMENT: String = format!(
@@ -53,6 +55,23 @@ lazy_static! {
 ",
         warp_core::paths::home_relative_path(&crate::user_config::launch_configs_dir())
     );
+}
+
+/// A rule that auto-colors a tab when the working directory matches a prefix.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
+pub struct TabColorRule {
+    pub id: uuid::Uuid,
+    /// Path prefix to match (e.g. `~/projects/frontend`).
+    pub path_prefix: String,
+    /// The ANSI color to assign to the tab when the rule matches.
+    pub color: warp_core::ui::theme::AnsiColorIdentifier,
+    /// Whether the rule is enabled.
+    #[serde(default = "tab_color_rule_enabled_default")]
+    pub enabled: bool,
+}
+
+fn tab_color_rule_enabled_default() -> bool {
+    true
 }
 
 /// A rule that auto-renames a tab when the working directory matches a prefix.
@@ -100,6 +119,9 @@ pub enum WarpConfigUpdateEvent {
     /// Runbooks on disk changed.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     Runbooks,
+    /// Tab color rules on disk changed.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    TabColorRules,
 }
 
 /// Singleton model containing user configurable file entities like themes, launch configs, and
@@ -127,6 +149,8 @@ pub struct WarpConfig {
     tab_naming_rules: Vec<TabNamingRule>,
     /// User-authored runbooks loaded from `~/.warp/runbooks/*.toml`.
     runbooks: Vec<Runbook>,
+    /// User-authored tab color rules loaded from `~/.warp/color_rules.toml`.
+    tab_color_rules: Vec<TabColorRule>,
 }
 
 /// Platform-independent parts of WarpConfig.
@@ -240,6 +264,27 @@ impl WarpConfig {
     pub fn remove_runbook(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
         self.runbooks.retain(|r| r.id != id);
         ctx.emit(WarpConfigUpdateEvent::Runbooks);
+    }
+
+    pub fn tab_color_rules(&self) -> &[TabColorRule] {
+        &self.tab_color_rules
+    }
+
+    pub fn add_tab_color_rule(&mut self, rule: TabColorRule, ctx: &mut ModelContext<Self>) {
+        self.tab_color_rules.push(rule);
+        ctx.emit(WarpConfigUpdateEvent::TabColorRules);
+    }
+
+    pub fn update_tab_color_rule(&mut self, rule: TabColorRule, ctx: &mut ModelContext<Self>) {
+        if let Some(existing) = self.tab_color_rules.iter_mut().find(|r| r.id == rule.id) {
+            *existing = rule;
+        }
+        ctx.emit(WarpConfigUpdateEvent::TabColorRules);
+    }
+
+    pub fn remove_tab_color_rule(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
+        self.tab_color_rules.retain(|r| r.id != id);
+        ctx.emit(WarpConfigUpdateEvent::TabColorRules);
     }
 
     /// Add a new action to the in-memory list and emit an update event.
@@ -402,6 +447,12 @@ pub fn saved_workspaces_dir() -> PathBuf {
 #[cfg_attr(target_family = "wasm", expect(dead_code))]
 pub fn runbooks_dir() -> PathBuf {
     base_dir().join("runbooks")
+}
+
+/// Returns the path to the user's tab color rules file.
+#[cfg_attr(target_family = "wasm", expect(dead_code))]
+pub fn color_rules_file() -> PathBuf {
+    base_dir().join("color_rules.toml")
 }
 
 /// Returns the path to the user's tab naming rules file.

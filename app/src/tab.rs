@@ -174,6 +174,8 @@ pub struct TabData {
     pub detached: bool,
     /// The tab group this tab belongs to, if any.
     pub group_id: Option<uuid::Uuid>,
+    /// When `true` this tab is protected from bulk-close operations.
+    pub pinned: bool,
 }
 
 const TAB_COLOR_ICON_PATH: &str = "bundled/svg/ellipse.svg";
@@ -192,6 +194,7 @@ impl TabData {
             indicator_hover_state: Default::default(),
             detached: false,
             group_id: None,
+            pinned: false,
         }
     }
 
@@ -329,6 +332,14 @@ impl TabData {
     ) -> Vec<MenuItem<WorkspaceAction>> {
         let mut menu_items = vec![];
         let uses_vertical_tabs = uses_vertical_tabs(ctx);
+
+        // Pin / Unpin
+        let pin_label = if self.pinned { "Unpin Tab" } else { "Pin Tab" };
+        menu_items.push(
+            MenuItemFields::new(pin_label)
+                .with_on_select_action(WorkspaceAction::TogglePinTab(index))
+                .into_item(),
+        );
 
         // TODO add option to show the keybinding once we figure out a nice API to retrieve
         // the actual keybinding (based on the user's preferences etc.)
@@ -1029,8 +1040,13 @@ impl<'a> TabComponent<'a> {
             )
             .finish()
         } else {
+            let display = if self.tab.pinned {
+                format!("📌 {}", self.title)
+            } else {
+                self.title.clone()
+            };
             Text::new_inline(
-                self.title.clone(),
+                display,
                 self.styles
                     .default
                     .font_family_id

@@ -2699,6 +2699,9 @@ impl Workspace {
             WarpConfigUpdateEvent::TabNamingRules => {
                 me.apply_tab_naming_rules(ctx);
             }
+            WarpConfigUpdateEvent::TabColorRules => {
+                me.apply_tab_color_rules(ctx);
+            }
             _ => {}
         });
     }
@@ -5382,6 +5385,138 @@ impl Workspace {
             }
         }
         ctx.notify();
+    }
+
+    /// Apply all tab color rules to every open tab.
+    fn apply_tab_color_rules(&mut self, ctx: &mut ViewContext<Self>) {
+        use crate::tab::SelectedTabColor;
+        use crate::user_config::WarpConfig;
+        let config = WarpConfig::handle(ctx);
+        let rules: Vec<_> = config
+            .as_ref(ctx)
+            .tab_color_rules()
+            .iter()
+            .filter(|r| r.enabled)
+            .cloned()
+            .collect();
+        if rules.is_empty() {
+            return;
+        }
+
+        let home_prefix = dirs::home_dir()
+            .map(|h| h.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let normalize = |p: &str| -> String {
+            let expanded = if p.starts_with('~') {
+                p.replacen('~', &home_prefix, 1)
+            } else {
+                p.to_string()
+            };
+            expanded.replace('\\', "/").to_lowercase()
+        };
+
+        // Collect per-tab data to avoid simultaneous borrows during mutation.
+        let tab_info: Vec<(usize, bool, ViewHandle<PaneGroup>)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(idx, tab)| {
+                (
+                    idx,
+                    matches!(tab.selected_color, SelectedTabColor::Color(_)),
+                    tab.pane_group.clone(),
+                )
+            })
+            .collect();
+
+        for (idx, manually_colored, pane_group) in tab_info {
+            if manually_colored {
+                continue;
+            }
+            let Some(terminal_view_handle) = pane_group.as_ref(ctx).focused_session_view(ctx)
+            else {
+                continue;
+            };
+            let cwd = terminal_view_handle
+                .as_ref(ctx)
+                .display_working_directory(ctx)
+                .unwrap_or_default();
+            if cwd.is_empty() {
+                continue;
+            }
+            let norm_cwd = normalize(&cwd);
+
+            for rule in &rules {
+                let norm_prefix = normalize(&rule.path_prefix);
+                if !norm_prefix.is_empty() && norm_cwd.starts_with(&norm_prefix) {
+                    if let Some(tab) = self.tabs.get_mut(idx) {
+                        tab.default_directory_color = Some(rule.color);
+                    }
+                    break;
+                }
+            }
+        }
+        ctx.notify();
+    }
+
+    /// Apply color rules to a single pane group / tab index.
+    fn apply_color_rules_to_pane(&mut self, tab_index: usize, ctx: &mut ViewContext<Self>) {
+        use crate::tab::SelectedTabColor;
+        use crate::user_config::WarpConfig;
+        let config = WarpConfig::handle(ctx);
+        let rules: Vec<_> = config
+            .as_ref(ctx)
+            .tab_color_rules()
+            .iter()
+            .filter(|r| r.enabled)
+            .cloned()
+            .collect();
+        drop(config);
+        if rules.is_empty() {
+            return;
+        }
+        // Extract what we need from the tab before any mutable borrow.
+        let (is_manually_colored, pane_group) = {
+            let Some(tab) = self.tabs.get(tab_index) else { return; };
+            (matches!(tab.selected_color, SelectedTabColor::Color(_)), tab.pane_group.clone())
+        };
+        if is_manually_colored {
+            return;
+        }
+        let Some(terminal_view_handle) = pane_group.as_ref(ctx).focused_session_view(ctx) else {
+            return;
+        };
+        let cwd = terminal_view_handle
+            .as_ref(ctx)
+            .display_working_directory(ctx)
+            .unwrap_or_default();
+        if cwd.is_empty() {
+            return;
+        }
+
+        let home_prefix = dirs::home_dir()
+            .map(|h| h.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let normalize = |p: &str| -> String {
+            let expanded = if p.starts_with('~') {
+                p.replacen('~', &home_prefix, 1)
+            } else {
+                p.to_string()
+            };
+            expanded.replace('\\', "/").to_lowercase()
+        };
+        let norm_cwd = normalize(&cwd);
+
+        for rule in &rules {
+            let norm_prefix = normalize(&rule.path_prefix);
+            if !norm_prefix.is_empty() && norm_cwd.starts_with(&norm_prefix) {
+                if let Some(tab) = self.tabs.get_mut(tab_index) {
+                    tab.default_directory_color = Some(rule.color);
+                    ctx.notify();
+                }
+                break;
+            }
+        }
     }
 
     /// Apply naming rules to a single pane group. Returns true if the CWD was
@@ -10631,7 +10766,10 @@ impl Workspace {
         add_to_undo_stack: bool,
         ctx: &mut ViewContext<Self>,
     ) -> bool {
-        let tab_indices_vec = tab_indices.collect_vec();
+        // Filter out pinned tabs — they cannot be closed via bulk operations.
+        let tab_indices_vec: Vec<usize> = tab_indices
+            .filter(|&i| !self.tabs.get(i).map(|t| t.pinned).unwrap_or(false))
+            .collect();
         // Check if there are any tabs that can't be closed without confirmation
         if !skip_confirmation && self.should_confirm_close_session(ctx) {
             for i in tab_indices_vec.iter() {
@@ -13379,6 +13517,15 @@ impl Workspace {
                     {
                         Self::sync_codebase_tab_color(tab, ctx);
                     }
+                }
+
+                // Apply user-defined color rules whenever the CWD changes.
+                if let Some(idx) = self
+                    .tabs
+                    .iter()
+                    .position(|t| t.pane_group.id() == pane_group.id())
+                {
+                    self.apply_color_rules_to_pane(idx, ctx);
                 }
             }
             pane_group::Event::ActiveSessionChanged => {
@@ -20658,6 +20805,12 @@ impl TypedActionView for Workspace {
             ToggleTabBarOverflowMenu => self.toggle_tab_bar_overflow_menu(ctx),
             ToggleBlockSnackbar => self.toggle_block_snackbar(ctx),
             ToggleWelcomeTips => self.toggle_welcome_tips_visiblity(ctx),
+            TogglePinTab(index) => {
+                if let Some(tab) = self.tabs.get_mut(*index) {
+                    tab.pinned = !tab.pinned;
+                    ctx.notify();
+                }
+            }
             CloseTab(index) => self.close_tab(*index, false, true, ctx),
             CloseActiveTab => self.close_tab(self.active_tab_index, false, true, ctx),
             CloseOtherTabs(index) => self.close_other_tabs(*index, false, ctx),
@@ -21305,17 +21458,22 @@ impl TypedActionView for Workspace {
                 ctx.notify();
             }
             CloseAllTerminals => {
+                // Collect non-pinned tab indices first.
+                let closeable: Vec<usize> = (0..self.tab_count())
+                    .filter(|&i| !self.tabs.get(i).map(|t| t.pinned).unwrap_or(false))
+                    .collect();
+                if closeable.is_empty() {
+                    // All tabs are pinned — nothing to close.
+                    return;
+                }
                 // Open one fresh terminal tab first so the window always has at
                 // least one tab while we close the old ones (the UI requires ≥1
                 // tab to be present at all times).
-                let old_count = self.tab_count();
                 self.add_terminal_tab(true, ctx);
 
-                // Now close all of the original tabs (indices 0..old_count) in
-                // reverse order so indices stay stable.  remove_tab is safe here
-                // because the newly opened tab is always present.
+                // Close non-pinned tabs in reverse order so indices stay stable.
                 self.cancel_tab_rename(ctx);
-                for i in (0..old_count).rev() {
+                for i in closeable.into_iter().rev() {
                     self.remove_tab(i, false, true, ctx);
                 }
             }
@@ -21349,10 +21507,11 @@ impl TypedActionView for Workspace {
                 let mut ws_snapshot =
                     WorkspaceSnapshot::from_window_snapshot(&window_snapshot);
 
-                // Enrich each tab snapshot with its group_id from the live tab list.
+                // Enrich each tab snapshot with group_id and pinned state.
                 for (idx, tab_snap) in ws_snapshot.tabs.iter_mut().enumerate() {
                     if let Some(tab) = self.tabs.get(idx) {
                         tab_snap.group_id = tab.group_id;
+                        tab_snap.pinned = tab.pinned;
                     }
                 }
 
@@ -21493,14 +21652,15 @@ impl TypedActionView for Workspace {
                             );
                         }
 
-                        // Assign the restored tab to its group if one was saved.
-                        if let Some(snap_group_id) = tab_snapshot.group_id {
-                            if let Some(&live_group_id) = group_id_map.get(&snap_group_id) {
-                                let tab_index = base_tab_index + rel_idx;
-                                if let Some(tab) = self.tabs.get_mut(tab_index) {
+                        // Restore group assignment and pinned state.
+                        let tab_index = base_tab_index + rel_idx;
+                        if let Some(tab) = self.tabs.get_mut(tab_index) {
+                            if let Some(snap_group_id) = tab_snapshot.group_id {
+                                if let Some(&live_group_id) = group_id_map.get(&snap_group_id) {
                                     tab.group_id = Some(live_group_id);
                                 }
                             }
+                            tab.pinned = tab_snapshot.pinned;
                         }
                     }
                 }

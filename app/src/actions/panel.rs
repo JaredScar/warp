@@ -211,6 +211,13 @@ pub struct ActionsPanelView {
     edit_rule_tab_name_editor: ViewHandle<EditorView>,
     /// Whether the naming rule form is open.
     naming_rule_form_open: bool,
+    // ── color rule form ──
+    new_color_rule_mouse_state: MouseStateHandle,
+    color_rule_row_states: RefCell<HashMap<Uuid, RowMouseStates>>,
+    edit_color_rule_prefix_editor: ViewHandle<EditorView>,
+    color_rule_form_open: bool,
+    draft_color_rule_color: warp_core::ui::theme::AnsiColorIdentifier,
+    color_rule_color_picker_states: RefCell<HashMap<String, MouseStateHandle>>,
     // ── runbooks tab ──
     runbooks_tab_mouse_state: MouseStateHandle,
     new_runbook_mouse_state: MouseStateHandle,
@@ -412,6 +419,14 @@ impl ActionsPanelView {
             edit_rule_prefix_editor,
             edit_rule_tab_name_editor,
             naming_rule_form_open: false,
+            new_color_rule_mouse_state: Default::default(),
+            color_rule_row_states: Default::default(),
+            edit_color_rule_prefix_editor: ctx.add_view(|ctx| {
+                EditorView::single_line(single_line_opts.clone(), ctx)
+            }),
+            color_rule_form_open: false,
+            draft_color_rule_color: warp_core::ui::theme::AnsiColorIdentifier::Blue,
+            color_rule_color_picker_states: Default::default(),
             runbooks_tab_mouse_state: Default::default(),
             new_runbook_mouse_state: Default::default(),
             runbook_row_states: Default::default(),
@@ -1254,6 +1269,7 @@ impl ActionsPanelView {
     fn render_naming_rules_tab(
         &self,
         rules: &[crate::user_config::TabNamingRule],
+        color_rules: &[crate::user_config::TabColorRule],
         appearance: &Appearance,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
@@ -1409,7 +1425,286 @@ impl ActionsPanelView {
         if let Some(f) = form {
             outer = outer.with_child(f);
         }
-        outer.with_child(Shrinkable::new(1.0, list).finish()).finish()
+        outer = outer.with_child(Shrinkable::new(1.0, list).finish());
+
+        // ── Tab Colors section ─────────────────────────────────────────────────────
+        let font = appearance.ui_font_family();
+        let theme = appearance.theme();
+        let section_label = Container::new(
+            Text::new("Tab Colors", font, 11.)
+                .with_color(theme.sub_text_color(theme.background()).into_solid())
+                .finish(),
+        )
+        .with_padding_left(10.)
+        .with_padding_top(8.)
+        .with_padding_bottom(4.)
+        .finish();
+
+        let add_color_rule_btn = icon_button(
+            appearance,
+            icons::Icon::Plus,
+            false,
+            self.new_color_rule_mouse_state.clone(),
+        )
+        .build()
+        .on_click(|ctx, _, _| {
+            ctx.dispatch_typed_action(ActionsPanelAction::NewColorRule);
+        })
+        .finish();
+
+        let color_toolbar = Container::new(
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_main_axis_alignment(MainAxisAlignment::End)
+                .with_child(add_color_rule_btn)
+                .finish(),
+        )
+        .with_padding_left(10.)
+        .with_padding_right(10.)
+        .with_padding_bottom(4.)
+        .finish();
+
+        let color_form: Option<Box<dyn Element>> = if self.color_rule_form_open {
+            Some(self.render_color_rule_form(appearance))
+        } else {
+            None
+        };
+
+        let color_list: Box<dyn Element> = if color_rules.is_empty() && !self.color_rule_form_open {
+            Container::new(
+                Text::new(
+                    "No color rules. Click + to add one.",
+                    font,
+                    12.,
+                )
+                .with_color(theme.sub_text_color(theme.background()).into_solid())
+                .finish(),
+            )
+            .with_padding_left(10.)
+            .with_padding_bottom(8.)
+            .finish()
+        } else {
+            let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
+            for rule in color_rules {
+                col = col.with_child(self.render_color_rule_row(rule, appearance));
+            }
+            col.finish()
+        };
+
+        outer = outer.with_child(section_label);
+        outer = outer.with_child(color_toolbar);
+        if let Some(cf) = color_form {
+            outer = outer.with_child(cf);
+        }
+        outer.with_child(color_list).finish()
+    }
+
+    fn color_swatch(color: warp_core::ui::theme::AnsiColorIdentifier, size: f32, appearance: &Appearance) -> Box<dyn Element> {
+        use warp_core::ui::theme::AnsiColorIdentifier;
+        let tc = appearance.theme().terminal_colors();
+        let c = match color {
+            AnsiColorIdentifier::Red     => tc.normal.red,
+            AnsiColorIdentifier::Green   => tc.normal.green,
+            AnsiColorIdentifier::Yellow  => tc.normal.yellow,
+            AnsiColorIdentifier::Blue    => tc.normal.blue,
+            AnsiColorIdentifier::Magenta => tc.normal.magenta,
+            AnsiColorIdentifier::Cyan    => tc.normal.cyan,
+            AnsiColorIdentifier::White   => tc.normal.white,
+            AnsiColorIdentifier::Black   => tc.normal.black,
+        };
+        ConstrainedBox::new(
+            Container::new(
+                ConstrainedBox::new(warpui::elements::Empty::new().finish())
+                    .with_min_width(size)
+                    .finish(),
+            )
+            .with_background(warpui::elements::Fill::Solid(pathfinder_color::ColorU {
+                r: c.r, g: c.g, b: c.b, a: 255,
+            }))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(size / 2.)))
+            .finish(),
+        )
+        .with_min_width(size)
+        .with_max_height(size)
+        .finish()
+    }
+
+    fn render_color_rule_form(&self, appearance: &Appearance) -> Box<dyn Element> {
+        use warp_core::ui::theme::AnsiColorIdentifier;
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+
+        let prefix_label = Text::new("Path prefix", font, LABEL_SIZE)
+            .with_color(theme.sub_text_color(theme.background()).into_solid())
+            .finish();
+        let prefix_row = Flex::column()
+            .with_child(prefix_label)
+            .with_child(
+                Container::new(
+                    warpui::elements::ChildView::new(&self.edit_color_rule_prefix_editor).finish(),
+                )
+                .with_uniform_padding(4.)
+                .with_border(
+                    warpui::elements::Border::all(1.)
+                        .with_border_color(theme.sub_text_color(theme.background()).into_solid()),
+                )
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+                .finish(),
+            )
+            .with_spacing(4.)
+            .finish();
+
+        let color_label = Text::new("Color", font, LABEL_SIZE)
+            .with_color(theme.sub_text_color(theme.background()).into_solid())
+            .finish();
+
+        let all_colors = [
+            AnsiColorIdentifier::Red,
+            AnsiColorIdentifier::Green,
+            AnsiColorIdentifier::Yellow,
+            AnsiColorIdentifier::Blue,
+            AnsiColorIdentifier::Magenta,
+            AnsiColorIdentifier::Cyan,
+            AnsiColorIdentifier::White,
+        ];
+
+        let mut color_row = Flex::row().with_spacing(8.).with_cross_axis_alignment(CrossAxisAlignment::Center);
+        for c in all_colors {
+            let is_selected = self.draft_color_rule_color == c;
+            let key = format!("{c:?}");
+            let state = self
+                .color_rule_color_picker_states
+                .borrow_mut()
+                .entry(key)
+                .or_insert_with(MouseStateHandle::default)
+                .clone();
+            let swatch = Self::color_swatch(c, 16., appearance);
+            let border_color = if is_selected {
+                theme.main_text_color(theme.background()).into_solid()
+            } else {
+                theme.background().into_solid()
+            };
+            let btn = Hoverable::new(state, move |_hover| {
+                Container::new(swatch)
+                    .with_uniform_padding(2.)
+                    .with_border(
+                        warpui::elements::Border::all(2.).with_border_color(border_color),
+                    )
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+                    .finish()
+            })
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(ActionsPanelAction::SelectColorRuleColor(c));
+            })
+            .with_cursor(warpui::platform::Cursor::PointingHand)
+            .finish();
+            color_row = color_row.with_child(btn);
+        }
+
+        let color_section = Flex::column()
+            .with_child(color_label)
+            .with_child(color_row.finish())
+            .with_spacing(4.)
+            .finish();
+
+        let save_btn = appearance
+            .ui_builder()
+            .button(ButtonVariant::Accent, self.save_form_state.clone())
+            .with_text_label("Save Color Rule".to_string())
+            .build()
+            .on_click(|ctx, _, _| {
+                ctx.dispatch_typed_action(ActionsPanelAction::SaveColorRule);
+            })
+            .with_cursor(warpui::platform::Cursor::PointingHand)
+            .finish();
+
+        let cancel_btn = appearance
+            .ui_builder()
+            .button(ButtonVariant::Secondary, self.cancel_form_state.clone())
+            .with_text_label("Cancel".to_string())
+            .build()
+            .on_click(|ctx, _, _| {
+                ctx.dispatch_typed_action(ActionsPanelAction::CancelForm);
+            })
+            .with_cursor(warpui::platform::Cursor::PointingHand)
+            .finish();
+
+        let btns = Flex::row()
+            .with_spacing(8.)
+            .with_main_axis_alignment(MainAxisAlignment::End)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(cancel_btn)
+            .with_child(save_btn)
+            .finish();
+
+        Container::new(
+            Flex::column()
+                .with_spacing(10.)
+                .with_child(prefix_row)
+                .with_child(color_section)
+                .with_child(btns)
+                .finish(),
+        )
+        .with_uniform_padding(FORM_PADDING)
+        .with_border(
+            warpui::elements::Border::bottom(1.)
+                .with_border_color(theme.sub_text_color(theme.background()).into_solid()),
+        )
+        .finish()
+    }
+
+    fn render_color_rule_row(
+        &self,
+        rule: &crate::user_config::TabColorRule,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+        let id = rule.id;
+
+        let delete_state = {
+            let mut map = self.color_rule_row_states.borrow_mut();
+            map.entry(id)
+                .or_insert_with(RowMouseStates::default)
+                .delete
+                .clone()
+        };
+
+        let swatch = Self::color_swatch(rule.color, 12., appearance);
+
+        let prefix_text = Text::new(rule.path_prefix.clone(), font, 12.)
+            .with_color(theme.sub_text_color(theme.background()).into_solid())
+            .finish();
+
+        let delete_btn = icon_button(appearance, icons::Icon::Trash, false, delete_state)
+            .build()
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(ActionsPanelAction::DeleteColorRule(id));
+            })
+            .finish();
+
+        Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_child(
+                    Container::new(swatch)
+                        .with_margin_right(6.)
+                        .finish(),
+                )
+                .with_child(prefix_text)
+                .with_child(delete_btn)
+                .finish(),
+        )
+        .with_padding_left(10.)
+        .with_padding_right(10.)
+        .with_padding_top(4.)
+        .with_padding_bottom(4.)
+        .with_border(
+            warpui::elements::Border::bottom(1.)
+                .with_border_color(theme.sub_text_color(theme.background()).into_solid()),
+        )
+        .finish()
     }
 
     fn render_naming_rule_row(
@@ -3603,6 +3898,11 @@ pub enum ActionsPanelAction {
     EditNamingRule(Uuid),
     DeleteNamingRule(Uuid),
     SaveNamingRule,
+    // ── Color rules ───────────────────────────────────────────────────────────
+    NewColorRule,
+    DeleteColorRule(Uuid),
+    SaveColorRule,
+    SelectColorRuleColor(warp_core::ui::theme::AnsiColorIdentifier),
     // ── Runbooks ──────────────────────────────────────────────────────────────
     NewRunbook,
     EditRunbook(Uuid),
@@ -3648,8 +3948,11 @@ impl View for ActionsPanelView {
                 }
             ActionsPanelTab::Workspaces => self.render_workspaces_tab(&workspaces, appearance),
                 ActionsPanelTab::NamingRules => {
-                    let rules = WarpConfig::as_ref(app).tab_naming_rules().to_vec();
-                    self.render_naming_rules_tab(&rules, appearance)
+                    let config = WarpConfig::as_ref(app);
+                    let rules = config.tab_naming_rules().to_vec();
+                    let color_rules = config.tab_color_rules().to_vec();
+                    drop(config);
+                    self.render_naming_rules_tab(&rules, &color_rules, appearance)
                 }
                 ActionsPanelTab::Runbooks => {
                     let runbooks = WarpConfig::as_ref(app).runbooks().to_vec();
@@ -3751,6 +4054,7 @@ impl warpui::TypedActionView for ActionsPanelView {
         match action {
             ActionsPanelAction::SetTab(tab) => {
                 self.naming_rule_form_open = false;
+                self.color_rule_form_open = false;
                 self.runbook_form_open = false;
                 self.running_runbook_id = None;
                 self.runbook_step_statuses.clear();
@@ -3877,9 +4181,10 @@ impl warpui::TypedActionView for ActionsPanelView {
                 // Reset hotkey recording state.
                 self.hotkey_recording = false;
                 self.trigger_hotkey_recording = false;
-                // Close any open runbook form.
+                // Close any open runbook or color rule form.
                 self.runbook_form_open = false;
                 self.edit_runbook_id = None;
+                self.color_rule_form_open = false;
                 ctx.notify();
             }
             ActionsPanelAction::EnterPaletteMode => {
@@ -4228,6 +4533,65 @@ impl warpui::TypedActionView for ActionsPanelView {
                 }
                 self.naming_rule_form_open = false;
                 self.edit_naming_rule_id = None;
+                ctx.notify();
+            }
+
+            // ── Color Rules ───────────────────────────────────────────────────
+            ActionsPanelAction::NewColorRule => {
+                self.color_rule_form_open = true;
+                self.draft_color_rule_color = warp_core::ui::theme::AnsiColorIdentifier::Blue;
+                self.edit_color_rule_prefix_editor
+                    .update(ctx, |e, ctx| e.set_buffer_text("", ctx));
+                ctx.notify();
+            }
+            ActionsPanelAction::DeleteColorRule(id) => {
+                use crate::user_config::WarpConfig;
+                let id = *id;
+                WarpConfig::handle(ctx).update(ctx, |cfg, ctx| {
+                    cfg.remove_tab_color_rule(id, ctx);
+                });
+                #[cfg(feature = "local_fs")]
+                {
+                    let config = WarpConfig::handle(ctx);
+                    let rules: Vec<_> = config.as_ref(ctx).tab_color_rules().to_vec();
+                    let _ = crate::user_config::save_color_rules(&rules);
+                }
+                ctx.notify();
+            }
+            ActionsPanelAction::SaveColorRule => {
+                use crate::user_config::{TabColorRule, WarpConfig};
+                let prefix = self
+                    .edit_color_rule_prefix_editor
+                    .read(ctx, |e, ctx| e.buffer_text(ctx))
+                    .trim()
+                    .to_string();
+                if prefix.is_empty() {
+                    ctx.notify();
+                    return;
+                }
+                let color = self.draft_color_rule_color;
+                WarpConfig::handle(ctx).update(ctx, |cfg, ctx| {
+                    cfg.add_tab_color_rule(
+                        TabColorRule {
+                            id: Uuid::new_v4(),
+                            path_prefix: prefix,
+                            color,
+                            enabled: true,
+                        },
+                        ctx,
+                    );
+                });
+                #[cfg(feature = "local_fs")]
+                {
+                    let config = WarpConfig::handle(ctx);
+                    let rules: Vec<_> = config.as_ref(ctx).tab_color_rules().to_vec();
+                    let _ = crate::user_config::save_color_rules(&rules);
+                }
+                self.color_rule_form_open = false;
+                ctx.notify();
+            }
+            ActionsPanelAction::SelectColorRuleColor(c) => {
+                self.draft_color_rule_color = *c;
                 ctx.notify();
             }
 

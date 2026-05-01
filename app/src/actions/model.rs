@@ -384,6 +384,9 @@ pub struct WorkspaceTabSnapshot {
     /// The ID of the group this tab belonged to (references a `WorkspaceGroupSnapshot`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<uuid::Uuid>,
+    /// Whether this tab was pinned when the workspace was saved.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl WorkspaceSnapshot {
@@ -432,6 +435,7 @@ impl WorkspaceSnapshot {
                     shell_launch_data: terminal.and_then(|t| t.shell_launch_data.clone()),
                     is_ambient_agent: ambient,
                     group_id: None,
+                    pinned: false,
                 }
             })
             .collect();

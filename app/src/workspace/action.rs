@@ -293,6 +293,8 @@ pub enum WorkspaceAction {
     ToggleRightPanel,
     /// Toggles the Actions & Triggers panel. This happens as an explicit action from the user.
     ToggleActionsPanel,
+    /// Toggle the pinned state of the tab at the given index.
+    TogglePinTab(usize),
     /// Run a single action by ID in the active terminal of the current tab.
     RunActionInActiveTerminal(Uuid),
     /// Send a raw command string to the active terminal of the current tab.
@@ -908,6 +910,7 @@ impl WorkspaceAction {
             | ClosePanel
             | ToggleRightPanel
             | ToggleActionsPanel
+            | TogglePinTab(_)
             | RunActionInActiveTerminal(_)
             | RunCommandInActiveTerminal(_)
             | RunTrigger(_)

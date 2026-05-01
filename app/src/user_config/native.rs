@@ -27,9 +27,9 @@ use super::util::{
     parse_multi_workflow_dir_entry, parse_single_theme_dir_entry, parse_tab_config_dir_entry,
 };
 use super::{
-    actions_dir, launch_configs_dir, naming_rules_file, runbooks_dir, saved_workspaces_dir,
-    tab_configs_dir, themes_dir, triggers_dir, workflows_dir, TabNamingRule, WarpConfigUpdateEvent,
-    LAUNCH_CONFIG_COMMENT,
+    actions_dir, color_rules_file, launch_configs_dir, naming_rules_file, runbooks_dir,
+    saved_workspaces_dir, tab_configs_dir, themes_dir, triggers_dir, workflows_dir, TabColorRule,
+    TabNamingRule, WarpConfigUpdateEvent, LAUNCH_CONFIG_COMMENT,
 };
 
 impl super::WarpConfig {
@@ -66,10 +66,11 @@ impl super::WarpConfig {
                 let triggers = load_triggers(&triggers_dir());
                 let workspaces = load_saved_workspaces(&saved_workspaces_dir());
                 let naming_rules = load_naming_rules(&naming_rules_file());
+                let color_rules = load_color_rules(&color_rules_file());
                 let runbooks = load_runbooks(&runbooks_dir());
-                (actions, triggers, workspaces, naming_rules, runbooks)
+                (actions, triggers, workspaces, naming_rules, color_rules, runbooks)
             },
-            |me, (actions, triggers, workspaces, naming_rules, runbooks), ctx| {
+            |me, (actions, triggers, workspaces, naming_rules, color_rules, runbooks), ctx| {
                 // Prepend built-ins so they are always first and always present.
                 let mut all_actions = builtin_actions();
                 all_actions.extend(actions);
@@ -77,6 +78,7 @@ impl super::WarpConfig {
                 me.triggers = triggers;
                 me.saved_workspaces = workspaces;
                 me.tab_naming_rules = naming_rules;
+                me.tab_color_rules = color_rules;
                 me.runbooks = runbooks;
                 ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
             },
@@ -182,6 +184,16 @@ impl super::WarpConfig {
                 |me, naming_rules, ctx| {
                     me.tab_naming_rules = naming_rules;
                     ctx.emit(WarpConfigUpdateEvent::TabNamingRules);
+                },
+            );
+        }
+
+        if repository_update_touches_path(update, &color_rules_file()) {
+            let _ = ctx.spawn(
+                async move { load_color_rules(&color_rules_file()) },
+                |me, color_rules, ctx| {
+                    me.tab_color_rules = color_rules;
+                    ctx.emit(WarpConfigUpdateEvent::TabColorRules);
                 },
             );
         }
@@ -359,6 +371,39 @@ pub fn load_naming_rules(path: &Path) -> Vec<TabNamingRule> {
     toml::from_str::<NamingRulesFile>(&content)
         .map(|f| f.rules)
         .unwrap_or_default()
+}
+
+pub fn load_color_rules(path: &Path) -> Vec<TabColorRule> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    #[derive(serde::Deserialize)]
+    struct ColorRulesFile {
+        #[serde(default)]
+        rules: Vec<TabColorRule>,
+    }
+    toml::from_str::<ColorRulesFile>(&content)
+        .map(|f| f.rules)
+        .unwrap_or_default()
+}
+
+/// Saves tab color rules to `~/.warp/color_rules.toml`.
+pub fn save_color_rules(rules: &[TabColorRule]) -> Result<()> {
+    let path = super::color_rules_file();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[derive(serde::Serialize)]
+    struct ColorRulesFile<'a> {
+        rules: &'a [TabColorRule],
+    }
+    let content = toml::to_string_pretty(&ColorRulesFile { rules })?;
+    fs::write(&path, content)?;
+    Ok(())
 }
 
 /// Saves tab naming rules to `~/.warp/naming_rules.toml`.
