@@ -80,8 +80,12 @@ pub struct TabNamingRule {
     pub id: uuid::Uuid,
     /// Path prefix to match (e.g. `~/projects/frontend`).
     pub path_prefix: String,
-    /// The name to assign to the tab when the rule matches.
+    /// The name to assign to the tab when the rule matches. Empty means no rename.
+    #[serde(default)]
     pub tab_name: String,
+    /// An optional color to assign to the tab when the rule matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<warp_core::ui::theme::AnsiColorIdentifier>,
     /// Whether the rule is enabled.
     #[serde(default = "tab_naming_rule_enabled_default")]
     pub enabled: bool,

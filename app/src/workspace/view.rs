@@ -5358,8 +5358,15 @@ impl Workspace {
             expanded.replace('\\', "/").to_lowercase()
         };
 
-        for tab in &self.tabs {
-            let pane_group = tab.pane_group.clone();
+        // Collect pane handles before mutating tabs.
+        let tab_panes: Vec<(usize, ViewHandle<PaneGroup>)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i, t.pane_group.clone()))
+            .collect();
+
+        for (idx, pane_group) in tab_panes {
             let Some(terminal_view_handle) = pane_group.as_ref(ctx).focused_session_view(ctx)
             else {
                 continue;
@@ -5376,10 +5383,20 @@ impl Workspace {
             for rule in &rules {
                 let norm_prefix = normalize(&rule.path_prefix);
                 if !norm_prefix.is_empty() && norm_cwd.starts_with(&norm_prefix) {
-                    let new_name = rule.tab_name.clone();
-                    pane_group.update(ctx, |pg, ctx| {
-                        pg.set_title(&new_name, ctx);
-                    });
+                    if !rule.tab_name.is_empty() {
+                        let new_name = rule.tab_name.clone();
+                        pane_group.update(ctx, |pg, ctx| {
+                            pg.set_title(&new_name, ctx);
+                        });
+                    }
+                    if let Some(rule_color) = rule.color {
+                        use crate::tab::SelectedTabColor;
+                        if let Some(tab) = self.tabs.get_mut(idx) {
+                            if !matches!(tab.selected_color, SelectedTabColor::Color(_)) {
+                                tab.default_directory_color = Some(rule_color);
+                            }
+                        }
+                    }
                     break;
                 }
             }
@@ -5567,10 +5584,25 @@ impl Workspace {
         for rule in &rules {
             let norm_prefix = normalize(&rule.path_prefix);
             if !norm_prefix.is_empty() && norm_cwd.starts_with(&norm_prefix) {
-                let new_name = rule.tab_name.clone();
-                pane_group.update(ctx, |pg, ctx| {
-                    pg.set_title(&new_name, ctx);
-                });
+                if !rule.tab_name.is_empty() {
+                    let new_name = rule.tab_name.clone();
+                    pane_group.update(ctx, |pg, ctx| {
+                        pg.set_title(&new_name, ctx);
+                    });
+                }
+                // Also apply the rule's color if set and not manually overridden.
+                if let Some(rule_color) = rule.color {
+                    use crate::tab::SelectedTabColor;
+                    if let Some(tab) = self
+                        .tabs
+                        .iter_mut()
+                        .find(|t| t.pane_group.id() == pane_group.id())
+                    {
+                        if !matches!(tab.selected_color, SelectedTabColor::Color(_)) {
+                            tab.default_directory_color = Some(rule_color);
+                        }
+                    }
+                }
                 break;
             }
         }

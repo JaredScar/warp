@@ -211,7 +211,10 @@ pub struct ActionsPanelView {
     edit_rule_tab_name_editor: ViewHandle<EditorView>,
     /// Whether the naming rule form is open.
     naming_rule_form_open: bool,
-    // ── color rule form ──
+    // ── naming rule color picker (integrated into naming rule form) ──
+    draft_naming_rule_color: Option<warp_core::ui::theme::AnsiColorIdentifier>,
+    naming_rule_color_picker_states: RefCell<HashMap<String, MouseStateHandle>>,
+    // ── legacy color rule form (kept for compat, no longer shown) ──
     new_color_rule_mouse_state: MouseStateHandle,
     color_rule_row_states: RefCell<HashMap<Uuid, RowMouseStates>>,
     edit_color_rule_prefix_editor: ViewHandle<EditorView>,
@@ -419,6 +422,8 @@ impl ActionsPanelView {
             edit_rule_prefix_editor,
             edit_rule_tab_name_editor,
             naming_rule_form_open: false,
+            draft_naming_rule_color: None,
+            naming_rule_color_picker_states: Default::default(),
             new_color_rule_mouse_state: Default::default(),
             color_rule_row_states: Default::default(),
             edit_color_rule_prefix_editor: ctx.add_view(|ctx| {
@@ -1269,7 +1274,6 @@ impl ActionsPanelView {
     fn render_naming_rules_tab(
         &self,
         rules: &[crate::user_config::TabNamingRule],
-        color_rules: &[crate::user_config::TabColorRule],
         appearance: &Appearance,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
@@ -1343,6 +1347,97 @@ impl ActionsPanelView {
                 .with_spacing(4.)
                 .finish();
 
+            // ── Integrated color picker ────────────────────────────────────────
+            use warp_core::ui::theme::AnsiColorIdentifier;
+            let color_label = Text::new("Tab color (optional)", font, LABEL_SIZE)
+                .with_color(theme.sub_text_color(theme.background()).into_solid())
+                .finish();
+
+            let all_colors: &[AnsiColorIdentifier] = &[
+                AnsiColorIdentifier::Red,
+                AnsiColorIdentifier::Green,
+                AnsiColorIdentifier::Yellow,
+                AnsiColorIdentifier::Blue,
+                AnsiColorIdentifier::Magenta,
+                AnsiColorIdentifier::Cyan,
+                AnsiColorIdentifier::White,
+            ];
+
+            let mut swatch_row = Flex::row()
+                .with_spacing(6.)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center);
+
+            // "None" clear button
+            let clear_selected = self.draft_naming_rule_color.is_none();
+            let clear_state = self
+                .naming_rule_color_picker_states
+                .borrow_mut()
+                .entry("none".to_string())
+                .or_insert_with(MouseStateHandle::default)
+                .clone();
+            let clear_border = if clear_selected {
+                theme.main_text_color(theme.background()).into_solid()
+            } else {
+                theme.sub_text_color(theme.background()).into_solid()
+            };
+            let clear_btn = Hoverable::new(clear_state, move |_| {
+                Container::new(
+                    Text::new("—", font, 11.)
+                        .with_color(clear_border)
+                        .finish(),
+                )
+                .with_uniform_padding(3.)
+                .with_border(
+                    warpui::elements::Border::all(1.).with_border_color(clear_border),
+                )
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+                .finish()
+            })
+            .on_click(|ctx, _, _| {
+                ctx.dispatch_typed_action(ActionsPanelAction::SelectNamingRuleColor(None));
+            })
+            .with_cursor(warpui::platform::Cursor::PointingHand)
+            .finish();
+            swatch_row = swatch_row.with_child(clear_btn);
+
+            for &c in all_colors {
+                let is_selected = self.draft_naming_rule_color == Some(c);
+                let key = format!("{c:?}");
+                let state = self
+                    .naming_rule_color_picker_states
+                    .borrow_mut()
+                    .entry(key)
+                    .or_insert_with(MouseStateHandle::default)
+                    .clone();
+                let swatch = Self::color_swatch(c, 16., appearance);
+                let border_color = if is_selected {
+                    theme.main_text_color(theme.background()).into_solid()
+                } else {
+                    theme.background().into_solid()
+                };
+                let btn = Hoverable::new(state, move |_| {
+                    Container::new(swatch)
+                        .with_uniform_padding(2.)
+                        .with_border(
+                            warpui::elements::Border::all(2.).with_border_color(border_color),
+                        )
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+                        .finish()
+                })
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::SelectNamingRuleColor(Some(c)));
+                })
+                .with_cursor(warpui::platform::Cursor::PointingHand)
+                .finish();
+                swatch_row = swatch_row.with_child(btn);
+            }
+
+            let color_section = Flex::column()
+                .with_child(color_label)
+                .with_child(swatch_row.finish())
+                .with_spacing(4.)
+                .finish();
+
             let save_btn = appearance
                 .ui_builder()
                 .button(ButtonVariant::Accent, self.save_form_state.clone())
@@ -1379,6 +1474,7 @@ impl ActionsPanelView {
                         .with_spacing(10.)
                         .with_child(prefix_row)
                         .with_child(name_row)
+                        .with_child(color_section)
                         .with_child(btns)
                         .finish(),
                 )
@@ -1425,78 +1521,7 @@ impl ActionsPanelView {
         if let Some(f) = form {
             outer = outer.with_child(f);
         }
-        outer = outer.with_child(Shrinkable::new(1.0, list).finish());
-
-        // ── Tab Colors section ─────────────────────────────────────────────────────
-        let font = appearance.ui_font_family();
-        let theme = appearance.theme();
-        let section_label = Container::new(
-            Text::new("Tab Colors", font, 11.)
-                .with_color(theme.sub_text_color(theme.background()).into_solid())
-                .finish(),
-        )
-        .with_padding_left(10.)
-        .with_padding_top(8.)
-        .with_padding_bottom(4.)
-        .finish();
-
-        let add_color_rule_btn = icon_button(
-            appearance,
-            icons::Icon::Plus,
-            false,
-            self.new_color_rule_mouse_state.clone(),
-        )
-        .build()
-        .on_click(|ctx, _, _| {
-            ctx.dispatch_typed_action(ActionsPanelAction::NewColorRule);
-        })
-        .finish();
-
-        let color_toolbar = Container::new(
-            Flex::row()
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_main_axis_alignment(MainAxisAlignment::End)
-                .with_child(add_color_rule_btn)
-                .finish(),
-        )
-        .with_padding_left(10.)
-        .with_padding_right(10.)
-        .with_padding_bottom(4.)
-        .finish();
-
-        let color_form: Option<Box<dyn Element>> = if self.color_rule_form_open {
-            Some(self.render_color_rule_form(appearance))
-        } else {
-            None
-        };
-
-        let color_list: Box<dyn Element> = if color_rules.is_empty() && !self.color_rule_form_open {
-            Container::new(
-                Text::new(
-                    "No color rules. Click + to add one.",
-                    font,
-                    12.,
-                )
-                .with_color(theme.sub_text_color(theme.background()).into_solid())
-                .finish(),
-            )
-            .with_padding_left(10.)
-            .with_padding_bottom(8.)
-            .finish()
-        } else {
-            let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
-            for rule in color_rules {
-                col = col.with_child(self.render_color_rule_row(rule, appearance));
-            }
-            col.finish()
-        };
-
-        outer = outer.with_child(section_label);
-        outer = outer.with_child(color_toolbar);
-        if let Some(cf) = color_form {
-            outer = outer.with_child(cf);
-        }
-        outer.with_child(color_list).finish()
+        outer.with_child(Shrinkable::new(1.0, list).finish()).finish()
     }
 
     fn color_swatch(color: warp_core::ui::theme::AnsiColorIdentifier, size: f32, appearance: &Appearance) -> Box<dyn Element> {
@@ -1725,20 +1750,30 @@ impl ActionsPanelView {
         let prefix_text = Text::new(rule.path_prefix.clone(), font, 12.)
             .with_color(theme.sub_text_color(theme.background()).into_solid())
             .finish();
-        let arrow = Text::new(" → ", font, 12.)
-            .with_color(theme.sub_text_color(theme.background()).into_solid())
-            .finish();
-        let name_text = Text::new(rule.tab_name.clone(), font, 13.)
-            .with_style(warpui::fonts::Properties::default().weight(warpui::fonts::Weight::Semibold))
-            .with_color(theme.main_text_color(theme.background()).into_solid())
-            .finish();
 
-        let label_row = Flex::row()
+        let mut label_row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_child(prefix_text)
-            .with_child(arrow)
-            .with_child(name_text)
-            .finish();
+            .with_child(prefix_text);
+
+        if !rule.tab_name.is_empty() {
+            let arrow = Text::new(" → ", font, 12.)
+                .with_color(theme.sub_text_color(theme.background()).into_solid())
+                .finish();
+            let name_text = Text::new(rule.tab_name.clone(), font, 13.)
+                .with_style(warpui::fonts::Properties::default().weight(warpui::fonts::Weight::Semibold))
+                .with_color(theme.main_text_color(theme.background()).into_solid())
+                .finish();
+            label_row = label_row.with_child(arrow).with_child(name_text);
+        }
+
+        if let Some(color) = rule.color {
+            let swatch = Container::new(Self::color_swatch(color, 10., appearance))
+                .with_margin_left(6.)
+                .finish();
+            label_row = label_row.with_child(swatch);
+        }
+
+        let label_row = label_row.finish();
 
         let edit_btn =
             icon_button(appearance, icons::Icon::Edit, false, edit_state)
@@ -3898,7 +3933,9 @@ pub enum ActionsPanelAction {
     EditNamingRule(Uuid),
     DeleteNamingRule(Uuid),
     SaveNamingRule,
-    // ── Color rules ───────────────────────────────────────────────────────────
+    // ── Naming rule color picker ──────────────────────────────────────────────
+    SelectNamingRuleColor(Option<warp_core::ui::theme::AnsiColorIdentifier>),
+    // ── Color rules (legacy, kept for compat) ─────────────────────────────────
     NewColorRule,
     DeleteColorRule(Uuid),
     SaveColorRule,
@@ -3948,11 +3985,8 @@ impl View for ActionsPanelView {
                 }
             ActionsPanelTab::Workspaces => self.render_workspaces_tab(&workspaces, appearance),
                 ActionsPanelTab::NamingRules => {
-                    let config = WarpConfig::as_ref(app);
-                    let rules = config.tab_naming_rules().to_vec();
-                    let color_rules = config.tab_color_rules().to_vec();
-                    drop(config);
-                    self.render_naming_rules_tab(&rules, &color_rules, appearance)
+                    let rules = WarpConfig::as_ref(app).tab_naming_rules().to_vec();
+                    self.render_naming_rules_tab(&rules, appearance)
                 }
                 ActionsPanelTab::Runbooks => {
                     let runbooks = WarpConfig::as_ref(app).runbooks().to_vec();
@@ -4458,6 +4492,7 @@ impl warpui::TypedActionView for ActionsPanelView {
             ActionsPanelAction::NewNamingRule => {
                 self.edit_naming_rule_id = None;
                 self.naming_rule_form_open = true;
+                self.draft_naming_rule_color = None;
                 self.edit_rule_prefix_editor
                     .update(ctx, |e, ctx| e.set_buffer_text("", ctx));
                 self.edit_rule_tab_name_editor
@@ -4474,12 +4509,17 @@ impl warpui::TypedActionView for ActionsPanelView {
                     let tab_name = rule.tab_name.clone();
                     self.edit_naming_rule_id = Some(id);
                     self.naming_rule_form_open = true;
+                    self.draft_naming_rule_color = rule.color;
                     self.edit_rule_prefix_editor
                         .update(ctx, |e, ctx| e.set_buffer_text_with_base_buffer(&prefix, ctx));
                     self.edit_rule_tab_name_editor
                         .update(ctx, |e, ctx| e.set_buffer_text_with_base_buffer(&tab_name, ctx));
                     ctx.notify();
                 }
+            }
+            ActionsPanelAction::SelectNamingRuleColor(c) => {
+                self.draft_naming_rule_color = *c;
+                ctx.notify();
             }
             ActionsPanelAction::DeleteNamingRule(id) => {
                 use crate::user_config::WarpConfig;
@@ -4507,20 +4547,22 @@ impl warpui::TypedActionView for ActionsPanelView {
                     .read(ctx, |e, ctx| e.buffer_text(ctx))
                     .trim()
                     .to_string();
-                if prefix.is_empty() || tab_name.is_empty() {
+                // Require at least a prefix; name and color are both optional.
+                if prefix.is_empty() {
                     ctx.notify();
                     return;
                 }
+                let color = self.draft_naming_rule_color;
                 let editing_id = self.edit_naming_rule_id;
                 WarpConfig::handle(ctx).update(ctx, |cfg, ctx| {
                     if let Some(id) = editing_id {
                         cfg.update_naming_rule(
-                            TabNamingRule { id, path_prefix: prefix.clone(), tab_name: tab_name.clone(), enabled: true },
+                            TabNamingRule { id, path_prefix: prefix.clone(), tab_name: tab_name.clone(), color, enabled: true },
                             ctx,
                         );
                     } else {
                         cfg.add_naming_rule(
-                            TabNamingRule { id: Uuid::new_v4(), path_prefix: prefix.clone(), tab_name: tab_name.clone(), enabled: true },
+                            TabNamingRule { id: Uuid::new_v4(), path_prefix: prefix.clone(), tab_name: tab_name.clone(), color, enabled: true },
                             ctx,
                         );
                     }
