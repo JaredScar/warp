@@ -95,6 +95,27 @@ While a trigger is running:
 
 <img width="720" alt="Trigger running overlay with Stop Trigger button" src="docs/screenshots/trigger-running.png" />
 
+**CRON scheduling**
+
+Any trigger can be set to run automatically on a recurring schedule using standard CRON syntax.
+
+- In the trigger editor, toggle **Schedule Enabled** under the **Schedule (optional)** section.
+- Enter a CRON expression in the text field (e.g. `0 9 * * 1-5` for weekdays at 9 AM, `*/30 * * * *` for every 30 minutes).
+- The scheduler arms automatically at app start and whenever the trigger is saved with a valid expression and the toggle on.
+- To disable the schedule without losing the expression, toggle **Schedule Enabled** off and save.
+
+Expressions follow the standard 5-field CRON format: `minute hour day-of-month month day-of-week`.
+
+**Trigger run history**
+
+Every time a trigger executes — whether run manually or by its schedule — a run record is appended to its history, capped at the 100 most recent entries.
+
+- In the triggers list, click the **clock icon** on any trigger row to open its history view.
+- Each entry shows the start time, finish time, run source (manual or scheduled), and status (success, stopped, or timed out).
+- Click **← Back** to return to the trigger list.
+
+Run history is stored in `~/.warp/trigger_history/<trigger-id>.toml`.
+
 ---
 
 ### Workspaces
@@ -116,6 +137,7 @@ While a trigger is running:
 | Working directory | Restored if the path still exists on disk |
 | Shell type | The exact shell that was running — e.g. Windows PowerShell, bash.exe, zsh, a WSL distro, MSYS2, or a Docker sandbox. Falls back to the system default if the shell is no longer available. |
 | Tab kind | Regular terminal tabs and **Cloud Oz / Ambient Agent** tabs are both saved and restored to their correct type. |
+| Tab group membership | Each tab's group assignment, group name, accent color, and collapsed state are all saved and fully restored. |
 
 **Restoring a workspace**
 
@@ -133,9 +155,12 @@ All panel data is stored as plain TOML files in the user's Warp data directory:
 
 ```
 ~/.warp/
-  actions/      # one .toml file per action
-  triggers/     # one .toml file per trigger
-  workspaces/   # one .toml file per saved workspace
+  actions/           # one .toml file per action
+  triggers/          # one .toml file per trigger
+  trigger_history/   # one .toml file per trigger, capped at 100 run records each
+  workspaces/        # one .toml file per saved workspace
+  naming_rules.toml  # all tab naming rules in one file
+  runbooks/          # one .toml file per runbook
 ```
 
 Files can be inspected, version-controlled, or shared manually.
@@ -234,6 +259,51 @@ To delete a rule, hover over it in the list and click the trash icon.
 | `~/projects/frontend` | `Frontend` |
 | `~/projects/api` | `API Server` |
 | `~/work` | `Work` |
+
+---
+
+## Runbook Mode
+
+**Runbooks** are ordered, named lists of shell-command steps that you can execute one at a time or all in sequence from the Actions & Triggers panel. Use them to document and reliably run multi-step procedures — deployments, onboarding flows, incident response checklists, and anything else where order and repeatability matter.
+
+### Accessing runbooks
+
+Open the **Actions, Triggers & Workspaces** panel (toolbar button) and click the **Runbooks** tab (5th tab).
+
+### Creating a runbook
+
+1. Click **+** in the toolbar or **+ Create Runbook** in the empty state.
+2. Fill in:
+   - **Runbook name** — e.g. `Deploy to staging`.
+   - **Steps** — click **+ Add Step** to append a step. Each step has:
+     - **Step name** — a short label shown in the runner, e.g. `Build the project`.
+     - **Command** — the exact shell command to run, e.g. `cargo build --release`.
+   - Click **×** on any step to remove it.
+3. Click **Save Runbook** to persist it to `~/.warp/runbooks/<id>.toml`.
+
+### Running a runbook
+
+**Run All steps in sequence**
+
+Click **▶ Run All** on any runbook row in the list. This opens the **runner view**, which shows each step with a status indicator, and immediately sends all commands to the active terminal in order.
+
+**Run a single step**
+
+In the runner view, click the **▶** button on any individual step row to send just that step's command to the active terminal.
+
+**Step status indicators**
+
+| Icon | Meaning |
+|---|---|
+| `—` | Not yet run |
+| `⟳` | Running |
+| `✓` | Completed |
+
+Click **Reset** to clear all step statuses back to `—`. Click **← Back** to return to the runbook list.
+
+### Editing and deleting runbooks
+
+Click the **pencil icon** on a runbook row to re-open the editor pre-filled with the saved name and steps. To delete, open the editor and click **Delete** at the bottom.
 
 ---
 
