@@ -5384,6 +5384,65 @@ impl Workspace {
         ctx.notify();
     }
 
+    /// Apply naming rules to a single pane group. Returns true if the CWD was
+    /// available and rules were checked (even if none matched). Returns false
+    /// if the CWD was not ready yet (caller should retry).
+    fn apply_naming_rules_to_pane(
+        &mut self,
+        pane_group: &ViewHandle<PaneGroup>,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        use crate::user_config::WarpConfig;
+        let config = WarpConfig::handle(ctx);
+        let rules: Vec<_> = config
+            .as_ref(ctx)
+            .tab_naming_rules()
+            .iter()
+            .filter(|r| r.enabled)
+            .cloned()
+            .collect();
+        if rules.is_empty() {
+            return true;
+        }
+
+        let Some(terminal_view_handle) = pane_group.as_ref(ctx).focused_session_view(ctx) else {
+            return true;
+        };
+        let cwd = terminal_view_handle
+            .as_ref(ctx)
+            .display_working_directory(ctx)
+            .unwrap_or_default();
+        if cwd.is_empty() {
+            return false; // CWD not ready yet
+        }
+
+        let home_prefix = dirs::home_dir()
+            .map(|h| h.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let normalize = |p: &str| -> String {
+            let expanded = if p.starts_with('~') {
+                p.replacen('~', &home_prefix, 1)
+            } else {
+                p.to_string()
+            };
+            expanded.replace('\\', "/").to_lowercase()
+        };
+
+        let norm_cwd = normalize(&cwd);
+        for rule in &rules {
+            let norm_prefix = normalize(&rule.path_prefix);
+            if !norm_prefix.is_empty() && norm_cwd.starts_with(&norm_prefix) {
+                let new_name = rule.tab_name.clone();
+                pane_group.update(ctx, |pg, ctx| {
+                    pg.set_title(&new_name, ctx);
+                });
+                break;
+            }
+        }
+        ctx.notify();
+        true
+    }
+
     /// Programmatically sets the manual color override for a tab.
     ///
     /// - `Color(_)` applies that color.
@@ -13294,17 +13353,23 @@ impl Workspace {
                 self.refresh_working_directories_for_pane_group(&pane_group, ctx);
                 self.update_resource_center_action_target(ctx);
                 self.update_active_session(ctx);
-                self.apply_tab_naming_rules(ctx);
-                // Retry after a short delay: on new tabs the CWD may not be
-                // populated in the first AppStateChanged fire.
-                let _ = ctx.spawn(
-                    async {
-                        warpui::r#async::Timer::after(std::time::Duration::from_millis(800)).await;
-                    },
-                    |me: &mut Self, _: (), ctx| {
-                        me.apply_tab_naming_rules(ctx);
-                    },
-                );
+                // Try immediately; if CWD isn't ready yet, retry at 500ms, 1.5s, 3s.
+                if !self.apply_naming_rules_to_pane(&pane_group, ctx) {
+                    for delay_ms in [500u64, 1500, 3000] {
+                        let pg = pane_group.clone();
+                        let _ = ctx.spawn(
+                            async move {
+                                warpui::r#async::Timer::after(
+                                    std::time::Duration::from_millis(delay_ms),
+                                )
+                                .await;
+                            },
+                            move |me: &mut Self, _: (), ctx| {
+                                me.apply_naming_rules_to_pane(&pg, ctx);
+                            },
+                        );
+                    }
+                }
 
                 if FeatureFlag::DirectoryTabColors.is_enabled() {
                     if let Some(tab) = self
