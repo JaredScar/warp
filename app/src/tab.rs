@@ -56,12 +56,26 @@ const TAB_INDICATOR_HEIGHT: f32 = 14.0;
 
 // ── Tab groups ────────────────────────────────────────────────────────────────
 
+/// Predefined palette of distinct colors for tab groups (assigned round-robin).
+pub const GROUP_COLOR_PALETTE: &[pathfinder_color::ColorU] = &[
+    pathfinder_color::ColorU { r: 59,  g: 130, b: 246, a: 255 }, // blue
+    pathfinder_color::ColorU { r: 34,  g: 197, b: 94,  a: 255 }, // green
+    pathfinder_color::ColorU { r: 249, g: 115, b: 22,  a: 255 }, // orange
+    pathfinder_color::ColorU { r: 168, g: 85,  b: 247, a: 255 }, // purple
+    pathfinder_color::ColorU { r: 239, g: 68,  b: 68,  a: 255 }, // red
+    pathfinder_color::ColorU { r: 6,   g: 182, b: 212, a: 255 }, // cyan
+    pathfinder_color::ColorU { r: 234, g: 179, b: 8,   a: 255 }, // yellow
+    pathfinder_color::ColorU { r: 236, g: 72,  b: 153, a: 255 }, // pink
+];
+
 /// A named, collapsible group of terminal tabs.
 #[derive(Clone)]
 pub struct TabGroup {
     pub id: uuid::Uuid,
     pub name: String,
     pub collapsed: bool,
+    /// Accent color assigned from `GROUP_COLOR_PALETTE` when the group is created.
+    pub color: pathfinder_color::ColorU,
     /// Mouse state for the group header label / clickable area.
     pub header_mouse_state: MouseStateHandle,
     /// Mouse state for the rename button on the group header.

@@ -49,6 +49,8 @@ pub(super) struct WorkspaceMouseStates {
     pub(super) stop_trigger_button: MouseStateHandle,
     pub(super) kill_all_icon: MouseStateHandle,
     pub(super) title_bar_search_bar: MouseStateHandle,
+    /// Mouse state for the "Group active tab" quick-launch button in the tab bar.
+    pub(super) new_tab_group_button: MouseStateHandle,
     /// Dynamic mouse states for pinned action/trigger toolbar quick-launch buttons.
     pub(super) pinned_item_states: RefCell<HashMap<Uuid, MouseStateHandle>>,
     #[cfg(target_family = "wasm")]

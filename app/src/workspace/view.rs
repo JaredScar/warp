@@ -16802,7 +16802,7 @@ impl Workspace {
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let font = appearance.ui_font_family();
-        let text_color = theme.accent().into_solid();
+        let text_color = group.color;
 
         let chevron_icon = if group.collapsed { icons::Icon::ChevronRight } else { icons::Icon::ChevronDown };
 
@@ -16813,7 +16813,7 @@ impl Workspace {
 
         let chevron = ConstrainedBox::new(
             chevron_icon
-                .to_warpui_icon(theme.sub_text_color(theme.background()))
+                .to_warpui_icon(warp_core::ui::theme::Fill::Solid(group.color))
                 .finish(),
         )
         .with_width(12.)
@@ -16852,9 +16852,11 @@ impl Workspace {
         .with_cursor(warpui::platform::Cursor::PointingHand)
         .finish();
 
-        // Add a small colored left-border accent so groups are visually distinct.
+        let group_color = group.color;
+        // Add a colored bottom border under the group header so it visually "anchors" the group.
         Container::new(header)
             .with_margin_right(4.)
+            .with_border(Border::bottom(2.).with_border_color(group_color))
             .finish()
     }
 
@@ -16879,7 +16881,7 @@ impl Workspace {
                 TabBarHoverIndex::BeforeTab(_) => false,
             });
 
-        TabComponent::new(
+        let tab_el = TabComponent::new(
             tab_index,
             tab_bar_state,
             tab,
@@ -16889,6 +16891,45 @@ impl Workspace {
             ctx,
         )
         .build()
+        .finish();
+
+        // If this tab belongs to a group, wrap it with a matching colored bottom border
+        // so it's visually clear which tabs are grouped together.
+        if let Some(group_id) = tab.group_id {
+            if let Some(group) = self.tab_groups.iter().find(|g| g.id == group_id) {
+                let group_color = group.color;
+                return Container::new(tab_el)
+                    .with_border(Border::bottom(2.).with_border_color(group_color))
+                    .finish();
+            }
+        }
+
+        tab_el
+    }
+
+    fn render_new_tab_group_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let active_index = self.active_tab_index;
+        let in_group = self.tabs.get(active_index).and_then(|t| t.group_id).is_some();
+        let tooltip = if in_group {
+            "Remove from group".to_string()
+        } else {
+            "Group active tab".to_string()
+        };
+        let action: WorkspaceAction = if in_group {
+            WorkspaceAction::RemoveTabFromGroup(active_index)
+        } else {
+            WorkspaceAction::AddTabToNewGroup(active_index)
+        };
+        self.render_tab_bar_icon_button(
+            appearance,
+            icons::Icon::Folder,
+            &self.mouse_states.new_tab_group_button,
+            action,
+            tooltip,
+            None,
+            in_group,
+            false,
+        )
         .finish()
     }
 
@@ -17932,6 +17973,11 @@ impl Workspace {
             if let Some(button) = self.render_header_toolbar_button(&item, appearance, ctx) {
                 target.add_child(button);
             }
+        }
+
+        // "Group active tab" quick-access button.
+        if self.tabs.len() > 1 {
+            target.add_child(self.render_new_tab_group_button(appearance));
         }
 
         // Legacy AI assistant button (non-agent-mode only)
@@ -20285,10 +20331,13 @@ impl TypedActionView for Workspace {
 
             // ── Tab group handlers ─────────────────────────────────────────
             AddTabToNewGroup(tab_index) => {
+                let color_index = self.tab_groups.len() % crate::tab::GROUP_COLOR_PALETTE.len();
+                let color = crate::tab::GROUP_COLOR_PALETTE[color_index];
                 let group = crate::tab::TabGroup {
                     id: uuid::Uuid::new_v4(),
                     name: format!("Group {}", self.tab_groups.len() + 1),
                     collapsed: false,
+                    color,
                     header_mouse_state: Default::default(),
                     rename_mouse_state: Default::default(),
                 };
