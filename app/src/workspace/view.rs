@@ -1065,6 +1065,10 @@ pub struct Workspace {
     trigger_queue_waiting: bool,
     /// Named, collapsible tab groups.  Indexed by `TabData::group_id`.
     tab_groups: Vec<crate::tab::TabGroup>,
+    /// The id of the tab group currently being renamed inline in the sidebar, if any.
+    renaming_tab_group_id: Option<uuid::Uuid>,
+    /// Single-line editor for renaming tab groups inline in the sidebar.
+    tab_group_rename_editor: ViewHandle<EditorView>,
 }
 
 impl Workspace {
@@ -1288,6 +1292,46 @@ impl Workspace {
             me.handle_pane_rename_editor_event(event, ctx);
         });
         editor
+    }
+
+    fn tab_group_rename_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        let editor = ctx.add_typed_action_view(|ctx| {
+            let appearance = Appearance::as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                text: TextOptions::ui_text(Some(12.), appearance),
+                ..Default::default()
+            };
+            EditorView::single_line(options, ctx)
+        });
+        ctx.subscribe_to_view(&editor, move |me, _, event, ctx| {
+            me.handle_tab_group_rename_editor_event(event, ctx);
+        });
+        editor
+    }
+
+    fn handle_tab_group_rename_editor_event(
+        &mut self,
+        event: &EditorEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match event {
+            EditorEvent::Enter | EditorEvent::Blurred => {
+                let new_name = self.tab_group_rename_editor.as_ref(ctx).buffer_text(ctx);
+                if let Some(group_id) = self.renaming_tab_group_id.take() {
+                    if !new_name.trim().is_empty() {
+                        if let Some(g) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
+                            g.name = new_name.trim().to_string();
+                        }
+                    }
+                }
+                ctx.notify();
+            }
+            EditorEvent::Escape => {
+                self.renaming_tab_group_id = None;
+                ctx.notify();
+            }
+            _ => {}
+        }
     }
 
     pub fn handle_tab_rename_editor_event(
@@ -3352,6 +3396,8 @@ impl Workspace {
             trigger_active_terminal_id: None,
             trigger_queue_waiting: false,
             tab_groups: Vec::new(),
+            renaming_tab_group_id: None,
+            tab_group_rename_editor: Self::tab_group_rename_editor(ctx),
         };
 
         ws.configure_new_workspace(workspace_setting, ctx);
@@ -6685,7 +6731,7 @@ impl Workspace {
         }
 
         let tab = &self.tabs[tab_index];
-        let menu_items = tab.menu_items(tab_index, self.tabs.len(), ctx);
+        let menu_items = tab.menu_items(tab_index, self.tabs.len(), &self.tab_groups, ctx);
         ctx.update_view(&self.tab_right_click_menu, |context_menu, view_ctx| {
             context_menu.set_items(menu_items, view_ctx);
         });
@@ -6733,6 +6779,7 @@ impl Workspace {
             tab_index,
             self.tabs.len(),
             Some(pane_name_target),
+            &self.tab_groups,
             ctx,
         );
 
@@ -16800,7 +16847,7 @@ impl Workspace {
         group: &crate::tab::TabGroup,
         appearance: &Appearance,
     ) -> Box<dyn Element> {
-        let theme = appearance.theme();
+        let _theme = appearance.theme();
         let font = appearance.ui_font_family();
         let text_color = group.color;
 
@@ -20397,6 +20444,32 @@ impl TypedActionView for Workspace {
                     }
                 }
                 self.tab_groups.retain(|g| g.id != *group_id);
+                ctx.notify();
+            }
+            StartTabGroupRename(group_id) => {
+                if let Some(g) = self.tab_groups.iter().find(|g| g.id == *group_id) {
+                    let current_name = g.name.clone();
+                    self.tab_group_rename_editor.update(ctx, |editor, ctx| {
+                        editor.set_buffer_text_with_base_buffer(&current_name, ctx);
+                        editor.select_all(ctx);
+                    });
+                    self.renaming_tab_group_id = Some(*group_id);
+                    ctx.focus(&self.tab_group_rename_editor);
+                    ctx.notify();
+                }
+            }
+            FinishTabGroupRename(new_name) => {
+                if let Some(group_id) = self.renaming_tab_group_id.take() {
+                    if !new_name.trim().is_empty() {
+                        if let Some(g) = self.tab_groups.iter_mut().find(|g| g.id == group_id) {
+                            g.name = new_name.trim().to_string();
+                        }
+                    }
+                }
+                ctx.notify();
+            }
+            CancelTabGroupRename => {
+                self.renaming_tab_group_id = None;
                 ctx.notify();
             }
             SetActiveTabColor(color) => self.set_tab_color(self.active_tab_index, *color, ctx),

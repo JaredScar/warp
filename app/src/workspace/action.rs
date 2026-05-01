@@ -128,6 +128,12 @@ pub enum WorkspaceAction {
     RenameTabGroup { group_id: Uuid, name: String },
     /// Delete a tab group (tabs become ungrouped, not closed).
     DeleteTabGroup(Uuid),
+    /// Begin inline-rename for the given tab group in the sidebar.
+    StartTabGroupRename(Uuid),
+    /// Commit the pending inline-rename with the supplied new name.
+    FinishTabGroupRename(String),
+    /// Cancel the pending inline-rename without changing the name.
+    CancelTabGroupRename,
     /// Sets the manual color override for the active tab.
     ///
     /// - `Color(_)` — apply that color.
@@ -1028,7 +1034,10 @@ impl WorkspaceAction {
             | RemoveTabFromGroup(_)
             | ToggleTabGroupCollapsed(_)
             | RenameTabGroup { .. }
-            | DeleteTabGroup(_) => false,
+            | DeleteTabGroup(_)
+            | StartTabGroupRename(_)
+            | FinishTabGroupRename(_)
+            | CancelTabGroupRename => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,
             #[cfg(target_family = "wasm")]

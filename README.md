@@ -140,9 +140,72 @@ All panel data is stored as plain TOML files in the user's Warp data directory:
 
 Files can be inspected, version-controlled, or shared manually.
 
+### Toolbar Pinning for Actions & Triggers
+
+Any action or trigger can be **pinned to the main toolbar** for one-click access without opening the panel.
+
+**Pinning an action or trigger**
+
+- Open the action or trigger editor (create new or click the pencil icon to edit an existing one).
+- At the bottom of the editor, toggle **Pin to toolbar**.
+- When enabled, an **icon picker** appears — choose from: Lightning, Play, Refresh, Rocket, Terminal, Folder, Gear, Code, Globe, or Check.
+- Save the action or trigger. Its chosen icon now appears as a clickable button directly in the tab bar toolbar.
+- Clicking the toolbar button runs the action or trigger immediately, just like clicking play in the panel.
+
+To unpin, re-open the editor, toggle **Pin to toolbar** off, and save.
+
 ---
 
-## Installation
+## Tab Groups
+
+Terminal tabs can be organized into **named, collapsible groups** for better session management across projects and workflows.
+
+### Creating and managing groups
+
+**Via right-click context menu (recommended)**
+
+Right-click any tab (in the horizontal tab bar or the left sidebar) and choose:
+
+| Menu item | Effect |
+|---|---|
+| **Add to New Group** | Creates a new group and adds this tab to it |
+| **Add to Group: [name]** | Adds this tab to an existing named group |
+| **Remove from Group** | Removes this tab from its current group (tab stays open) |
+
+**Via the sidebar folder button**
+
+When the left sidebar (vertical tabs panel) is open, a **folder icon** appears in the control bar next to the + (new tab) button. Clicking it groups the active tab into a new group, or ungroups it if it is already in a group.
+
+**Via the tab bar folder button**
+
+A matching folder button in the right side of the horizontal tab bar provides the same quick-group / ungroup action for the active tab.
+
+### Visual indicators
+
+- Each tab belonging to a group displays a **2 px colored bottom border** in the group's accent color in the horizontal tab bar.
+- In the left sidebar, grouped tabs are **indented with a matching colored left border**, visually connecting them to their group header.
+- A colored **section header** (chevron + group name) appears above the first tab of each group in the sidebar.
+- Each group is assigned a distinct color automatically from a built-in palette (blue, green, orange, purple, red, cyan, yellow, pink).
+
+### Collapsing and expanding groups (sidebar)
+
+- Click a **group section header** in the left sidebar to collapse all tabs in that group out of view. The chevron changes from ▼ to ▶ to indicate the collapsed state.
+- Click the header again to expand the group and reveal its tabs.
+- When a group is collapsed and its active tab is hidden, the active tab automatically shifts to the nearest visible tab.
+
+### Renaming groups
+
+- Click the **pencil icon** on the group section header in the sidebar to enter inline rename mode. The group name becomes an editable text field pre-filled with the current name.
+- Press **Enter** or click away to commit the new name.
+- Press **Escape** to cancel without changes.
+
+### Deleting groups
+
+- Click the **× button** on the group section header in the sidebar to delete the group. All tabs that belonged to it become ungrouped — no tabs are closed.
+
+---
+
+
 
 You can [download Warp](https://www.warp.dev/download) and [read our docs](https://docs.warp.dev/) for platform-specific instructions.
 

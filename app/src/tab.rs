@@ -205,9 +205,10 @@ impl TabData {
         &self,
         index: usize,
         tabs_len: usize,
+        tab_groups: &[crate::tab::TabGroup],
         ctx: &AppContext,
     ) -> Vec<MenuItem<WorkspaceAction>> {
-        self.menu_items_with_pane_name_target(index, tabs_len, None, ctx)
+        self.menu_items_with_pane_name_target(index, tabs_len, None, tab_groups, ctx)
     }
 
     pub fn menu_items_with_pane_name_target(
@@ -215,6 +216,7 @@ impl TabData {
         index: usize,
         tabs_len: usize,
         pane_name_target: Option<PaneNameMenuTarget>,
+        tab_groups: &[crate::tab::TabGroup],
         ctx: &AppContext,
     ) -> Vec<MenuItem<WorkspaceAction>> {
         let appearance = Appearance::as_ref(ctx);
@@ -223,7 +225,7 @@ impl TabData {
 
         for section_items in [
             self.session_sharing_menu_items(index, ctx),
-            self.modify_tab_menu_items(index, tabs_len, pane_name_target, ctx),
+            self.modify_tab_menu_items(index, tabs_len, pane_name_target, tab_groups, ctx),
             self.close_tab_menu_items(index, tabs_len, ctx),
             Self::save_config_menu_items(index),
             self.color_option_menu_items(index, terminal_colors),
@@ -322,6 +324,7 @@ impl TabData {
         index: usize,
         tabs_len: usize,
         pane_name_target: Option<PaneNameMenuTarget>,
+        tab_groups: &[crate::tab::TabGroup],
         ctx: &AppContext,
     ) -> Vec<MenuItem<WorkspaceAction>> {
         let mut menu_items = vec![];
@@ -384,6 +387,21 @@ impl TabData {
                 .with_on_select_action(WorkspaceAction::AddTabToNewGroup(index))
                 .into_item(),
         );
+        // Add "Add to Group: <name>" entries for each existing group the tab is not already in.
+        for group in tab_groups {
+            if self.group_id == Some(group.id) {
+                continue; // already in this group
+            }
+            let group_id = group.id;
+            menu_items.push(
+                MenuItemFields::new(format!("Add to Group: {}", group.name))
+                    .with_on_select_action(WorkspaceAction::AddTabToGroup {
+                        tab_index: index,
+                        group_id,
+                    })
+                    .into_item(),
+            );
+        }
 
         menu_items
     }

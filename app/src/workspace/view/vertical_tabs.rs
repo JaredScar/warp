@@ -595,6 +595,14 @@ pub(super) struct VerticalTabsPanelState {
     show_diff_stats_mouse_state: MouseStateHandle,
     show_details_on_hover_mouse_state: MouseStateHandle,
     pub(super) show_settings_popup: bool,
+    /// Mouse states for each user-defined tab group header row.
+    tab_group_header_states: RefCell<HashMap<uuid::Uuid, MouseStateHandle>>,
+    /// Mouse states for the rename button on each user-defined tab group header.
+    tab_group_rename_btn_states: RefCell<HashMap<uuid::Uuid, MouseStateHandle>>,
+    /// Mouse states for the delete button on each user-defined tab group header.
+    tab_group_delete_btn_states: RefCell<HashMap<uuid::Uuid, MouseStateHandle>>,
+    /// Button for creating a new tab group (in the control bar).
+    pub(super) new_tab_group_btn_state: MouseStateHandle,
 }
 
 impl Default for VerticalTabsPanelState {
@@ -630,6 +638,10 @@ impl Default for VerticalTabsPanelState {
             show_diff_stats_mouse_state: Default::default(),
             show_details_on_hover_mouse_state: Default::default(),
             show_settings_popup: false,
+            tab_group_header_states: RefCell::default(),
+            tab_group_rename_btn_states: RefCell::default(),
+            tab_group_delete_btn_states: RefCell::default(),
+            new_tab_group_btn_state: Default::default(),
         }
     }
 }
@@ -1191,6 +1203,7 @@ fn render_control_bar(
 
     let settings_button = render_settings_button(state, appearance);
     let new_tab_button = render_new_tab_button(state, workspace, appearance, app);
+    let new_group_button = render_new_tab_group_button_sidebar(state, workspace, appearance, app);
 
     Container::new(
         Flex::row()
@@ -1199,6 +1212,7 @@ fn render_control_bar(
             .with_spacing(CONTROL_BAR_SPACING)
             .with_child(Shrinkable::new(1., search_bar).finish())
             .with_child(settings_button)
+            .with_child(new_group_button)
             .with_child(new_tab_button)
             .finish(),
     )
@@ -1417,6 +1431,59 @@ fn render_new_tab_button(
     .finish()
 }
 
+/// Renders the "Group active tab" button for the vertical tabs control bar.
+fn render_new_tab_group_button_sidebar(
+    state: &VerticalTabsPanelState,
+    workspace: &Workspace,
+    appearance: &Appearance,
+    _app: &AppContext,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let sub_text = theme.sub_text_color(theme.background());
+    // Only show when there are at least 2 tabs.
+    if workspace.tabs.len() < 2 {
+        return Empty::new().finish();
+    }
+    let active_tab = workspace.tabs.get(workspace.active_tab_index);
+    let in_group = active_tab.and_then(|t| t.group_id).is_some();
+    let active_index = workspace.active_tab_index;
+    let action: WorkspaceAction = if in_group {
+        WorkspaceAction::RemoveTabFromGroup(active_index)
+    } else {
+        WorkspaceAction::AddTabToNewGroup(active_index)
+    };
+    Hoverable::new(state.new_tab_group_btn_state.clone(), move |ms| {
+        let icon_color = if ms.is_hovered() || in_group {
+            warp_core::ui::theme::Fill::Solid(
+                pathfinder_color::ColorU::new(59, 130, 246, 255), // blue accent
+            )
+        } else {
+            warp_core::ui::theme::Fill::Solid(sub_text.into())
+        };
+        let icon_el = ConstrainedBox::new(
+            WarpIcon::Folder.to_warpui_icon(icon_color).finish(),
+        )
+        .with_width(14.)
+        .with_height(14.)
+        .finish();
+        let bg = if ms.is_hovered() {
+            ElementFill::Solid(pathfinder_color::ColorU::new(255, 255, 255, 18))
+        } else {
+            ElementFill::None
+        };
+        Container::new(icon_el)
+            .with_padding(Padding::uniform(5.))
+            .with_background(bg)
+            .with_corner_radius(CornerRadius::with_all(CONTROL_BAR_BUTTON_RADIUS))
+            .finish()
+    })
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(action.clone());
+    })
+    .with_cursor(Cursor::PointingHand)
+    .finish()
+}
+
 fn render_vertical_tabs_panel(
     state: &VerticalTabsPanelState,
     workspace: &Workspace,
@@ -1484,6 +1551,155 @@ fn render_vertical_tabs_panel(
             let max_width = window_size.x() * MAX_PANEL_WIDTH_RATIO;
             (MIN_PANEL_WIDTH, max_width.max(MIN_PANEL_WIDTH))
         }))
+        .finish()
+}
+
+/// Renders a collapsible section header for a user-defined tab group in the vertical tabs sidebar.
+fn render_user_tab_group_header(
+    state: &VerticalTabsPanelState,
+    group: &crate::tab::TabGroup,
+    rename_editor: Option<&ViewHandle<EditorView>>,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let _theme = appearance.theme();
+    let font = appearance.ui_font_family();
+    let group_color = group.color;
+    let group_id = group.id;
+
+    // Chevron indicates collapsed/expanded state.
+    let chevron_icon = if group.collapsed {
+        WarpIcon::ChevronRight
+    } else {
+        WarpIcon::ChevronDown
+    };
+    let chevron = ConstrainedBox::new(
+        chevron_icon
+            .to_warpui_icon(warp_core::ui::theme::Fill::Solid(group_color))
+            .finish(),
+    )
+    .with_width(10.)
+    .with_height(10.)
+    .finish();
+
+    // Group name label — or an inline rename editor when active.
+    let name_el: Box<dyn Element> = if let Some(editor) = rename_editor {
+        let editor_line_height = editor.as_ref(app).line_height(app.font_cache(), appearance);
+        TextInput::new(
+            editor.clone(),
+            UiComponentStyles::default()
+                .set_height(editor_line_height)
+                .set_background(ElementFill::None)
+                .set_border_radius(CornerRadius::with_all(Radius::Pixels(0.)))
+                .set_border_width(0.),
+        )
+        .build()
+        .finish()
+    } else {
+        Text::new_inline(group.name.clone(), font, 11.)
+            .with_color(group_color.into())
+            .with_style(warpui::fonts::Properties::default().weight(Weight::Semibold))
+            .finish()
+    };
+
+    // Rename button (pencil icon).
+    let rename_mouse_state = state
+        .tab_group_rename_btn_states
+        .borrow_mut()
+        .entry(group_id)
+        .or_default()
+        .clone();
+
+    let rename_btn = Hoverable::new(rename_mouse_state, move |ms| {
+        let icon_color = if ms.is_hovered() {
+            warp_core::ui::theme::Fill::Solid(pathfinder_color::ColorU::new(255, 255, 255, 200))
+        } else {
+            warp_core::ui::theme::Fill::Solid(pathfinder_color::ColorU::new(255, 255, 255, 80))
+        };
+        ConstrainedBox::new(
+            WarpIcon::Pencil.to_warpui_icon(icon_color).finish(),
+        )
+        .with_width(10.)
+        .with_height(10.)
+        .finish()
+    })
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(WorkspaceAction::StartTabGroupRename(group_id));
+    })
+    .with_cursor(Cursor::PointingHand)
+    .finish();
+
+    // Delete group button (X icon).
+    let delete_mouse_state = state
+        .tab_group_delete_btn_states
+        .borrow_mut()
+        .entry(group_id)
+        .or_default()
+        .clone();
+
+    let delete_btn = Hoverable::new(delete_mouse_state, move |ms| {
+        let icon_color = if ms.is_hovered() {
+            warp_core::ui::theme::Fill::Solid(pathfinder_color::ColorU::new(255, 80, 80, 230))
+        } else {
+            warp_core::ui::theme::Fill::Solid(pathfinder_color::ColorU::new(255, 255, 255, 80))
+        };
+        ConstrainedBox::new(
+            WarpIcon::X.to_warpui_icon(icon_color).finish(),
+        )
+        .with_width(10.)
+        .with_height(10.)
+        .finish()
+    })
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(WorkspaceAction::DeleteTabGroup(group_id));
+    })
+    .with_cursor(Cursor::PointingHand)
+    .finish();
+
+    // Header row.
+    let header_mouse_state = state
+        .tab_group_header_states
+        .borrow_mut()
+        .entry(group_id)
+        .or_default()
+        .clone();
+
+    let header = Hoverable::new(header_mouse_state, move |ms| {
+        let bg = if ms.is_hovered() {
+            ElementFill::Solid(pathfinder_color::ColorU::new(255, 255, 255, 12))
+        } else {
+            ElementFill::None
+        };
+        Container::new(
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(4.)
+                .with_child(chevron)
+                .with_child(Shrinkable::new(1., name_el).finish())
+                .with_child(rename_btn)
+                .with_child(delete_btn)
+                .finish(),
+        )
+        .with_padding(
+            Padding::uniform(4.)
+                .with_left(GROUP_HORIZONTAL_PADDING)
+                .with_right(GROUP_HORIZONTAL_PADDING),
+        )
+        .with_background(bg)
+        .finish()
+    })
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(WorkspaceAction::ToggleTabGroupCollapsed(group_id));
+    })
+    .with_cursor(Cursor::PointingHand)
+    .finish();
+
+    // Add a left border in the group's color to visually anchor the header.
+    Container::new(header)
+        .with_border(Border::left(3.).with_border_color(group_color))
+        .with_margin_top(4.)
+        .with_margin_bottom(2.)
         .finish()
 }
 
@@ -1645,15 +1861,54 @@ fn render_groups(
         groups = groups.with_spacing(TABS_MODE_ITEM_SPACING);
     }
 
+    // Track which user-defined tab group we last rendered a header for.
+    let mut last_rendered_user_group: Option<uuid::Uuid> = None;
+
     for (visible_tab_index, (tab_index, filtered_pane_ids)) in visible_tabs.iter().enumerate() {
+        let tab = &workspace.tabs[*tab_index];
+
+        // ── User-defined tab group section header ─────────────────────────
+        if let Some(group_id) = tab.group_id {
+            let is_new_group = last_rendered_user_group != Some(group_id);
+            if is_new_group {
+                if let Some(user_group) = workspace.tab_groups.iter().find(|g| g.id == group_id) {
+                    let is_renaming = workspace.renaming_tab_group_id == Some(group_id);
+                    let rename_editor = if is_renaming {
+                        Some(workspace.tab_group_rename_editor.clone())
+                    } else {
+                        None
+                    };
+                    groups.add_child(render_user_tab_group_header(
+                        state,
+                        user_group,
+                        rename_editor.as_ref(),
+                        app,
+                    ));
+                    last_rendered_user_group = Some(group_id);
+                }
+            }
+            // Skip tabs that belong to a collapsed user group.
+            let is_collapsed = workspace
+                .tab_groups
+                .iter()
+                .any(|g| g.id == group_id && g.collapsed);
+            if is_collapsed {
+                continue;
+            }
+        } else {
+            // This tab is not in a user group — reset the last-group tracker.
+            last_rendered_user_group = None;
+        }
+
         let insert_before_index = *tab_index;
         let insert_after_index =
             (visible_tab_index == visible_tabs.len() - 1).then_some(tab_index + 1);
-        groups.add_child(render_tab_group(
+
+        let tab_el = render_tab_group(
             state,
             workspace,
             *tab_index,
-            &workspace.tabs[*tab_index],
+            tab,
             filtered_pane_ids.as_deref(),
             TabGroupDragState {
                 is_any_pane_dragging,
@@ -1661,7 +1916,24 @@ fn render_groups(
                 insert_after_index,
             },
             app,
-        ));
+        );
+
+        // Wrap tabs inside a user-defined group with a coloured left border.
+        let el: Box<dyn Element> = if let Some(group_id) = tab.group_id {
+            if let Some(user_group) = workspace.tab_groups.iter().find(|g| g.id == group_id) {
+                let group_color = user_group.color;
+                Container::new(tab_el)
+                    .with_border(Border::left(2.).with_border_color(group_color))
+                    .with_padding_left(4.)
+                    .finish()
+            } else {
+                tab_el
+            }
+        } else {
+            tab_el
+        };
+
+        groups.add_child(el);
     }
 
     // Prune stale badge mouse states for panes that no longer exist.
