@@ -2817,6 +2817,10 @@ pub struct TerminalView {
     /// State handle for the shimmering text animation in the remote server loading footer.
     /// Persisted across renders so the animation doesn't restart.
     remote_server_shimmer_handle: ShimmeringTextStateHandle,
+
+    /// PID of the shell process running in this terminal pane. Set when the local PTY starts.
+    #[cfg(feature = "local_tty")]
+    shell_pid: Option<u32>,
 }
 
 /// Parameters stashed when a code review pane open is requested with
@@ -4200,6 +4204,8 @@ impl TerminalView {
             pty_recorder: ctx
                 .add_model(|ctx| PtyRecorder::new(inactive_pty_reads_rx, window_id, ctx)),
             active_viewer_driven_size: None,
+            #[cfg(feature = "local_tty")]
+            shell_pid: None,
         };
         terminal_view.register_subscriptions_for_use_agent_footer(ctx);
 
@@ -14449,6 +14455,30 @@ impl TerminalView {
             // banner to the user if the bootstrapping takes too long
             self.start_bootstrap_timer(BOOTSTRAP_FAILED_DURATION, ctx);
         }
+    }
+
+    /// Called by `TerminalManager` once the PTY child process has started, to store
+    /// the shell's PID for resource monitoring purposes.
+    #[cfg(feature = "local_tty")]
+    pub(super) fn on_shell_pid_known(&mut self, pid: u32, ctx: &mut ViewContext<Self>) {
+        self.shell_pid = Some(pid);
+        // Register the PID with the resource monitor singleton.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            use crate::system::TabResourceMonitor;
+            TabResourceMonitor::handle(ctx).update(ctx, |m, _| m.register_pid(pid));
+        }
+    }
+
+    /// Returns the PID of the shell process in this terminal pane, if available.
+    #[cfg(feature = "local_tty")]
+    pub fn shell_pid(&self) -> Option<u32> {
+        self.shell_pid
+    }
+
+    #[cfg(not(feature = "local_tty"))]
+    pub fn shell_pid(&self) -> Option<u32> {
+        None
     }
 
     pub fn is_login_shell_bootstrapped(&self) -> bool {

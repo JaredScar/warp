@@ -205,9 +205,56 @@ A matching folder button in the right side of the horizontal tab bar provides th
 
 ---
 
+## Conditional Tab Naming
 
+Define rules that **automatically rename terminal tabs** based on their current working directory, so tabs always have meaningful names without manual effort.
 
-You can [download Warp](https://www.warp.dev/download) and [read our docs](https://docs.warp.dev/) for platform-specific instructions.
+### How it works
+
+When the working directory of a terminal changes (e.g., you `cd` into a project folder), Warp checks all active naming rules. If the new path **starts with** a configured prefix, the tab is renamed to the corresponding name instantly.
+
+### Managing rules
+
+1. Open the **Actions, Triggers & Workspaces** panel (toolbar button).
+2. Click the **Rules** tab.
+3. Click **+** to add a new rule.
+4. Fill in two fields:
+   - **Path prefix** — the directory prefix to match (e.g. `~/projects/frontend`). Supports `~` for home directory.
+   - **Tab name** — the name to assign when the rule fires (e.g. `Frontend`).
+5. Click **Save Rule**.
+
+Rules are stored in `~/.warp/naming_rules.toml` and take effect immediately on the next working-directory change.
+
+To delete a rule, hover over it in the list and click the trash icon.
+
+### Example
+
+| Path prefix | Tab name |
+|---|---|
+| `~/projects/frontend` | `Frontend` |
+| `~/projects/api` | `API Server` |
+| `~/work` | `Work` |
+
+---
+
+## Resource Monitor Overlay
+
+Each terminal tab in the left sidebar now shows **live CPU and memory usage** of its underlying shell process, giving you instant visibility into which tabs are resource-intensive.
+
+### What is shown
+
+In the **left sidebar** (vertical tabs panel), each terminal row displays a third line beneath the working-directory and git-branch lines:
+
+```
+CPU 2.3% · Mem 45MB
+```
+
+- **CPU** — approximate percentage of a single CPU core used by the shell process.
+- **Mem** — resident memory in megabytes (shown as GB if ≥ 1 GB).
+
+Stats are refreshed every **3 seconds** in the background. The overlay only appears once the shell process PID is known (i.e., after the PTY has started).
+
+---
 
 ## Warp Contributions Overview Dashboard
 

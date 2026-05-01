@@ -23,6 +23,8 @@ pub(crate) use imp::load_tab_configs;
 #[cfg(feature = "local_fs")]
 pub use imp::load_workflows;
 pub use imp::{load_launch_configs, load_theme_configs};
+#[cfg(feature = "local_fs")]
+pub use imp::save_naming_rules;
 
 lazy_static! {
     pub static ref LAUNCH_CONFIG_COMMENT: String = format!(
@@ -53,7 +55,23 @@ lazy_static! {
     );
 }
 
-#[derive(Clone)]
+/// A rule that auto-renames a tab when the working directory matches a prefix.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+pub struct TabNamingRule {
+    pub id: uuid::Uuid,
+    /// Path prefix to match (e.g. `~/projects/frontend`).
+    pub path_prefix: String,
+    /// The name to assign to the tab when the rule matches.
+    pub tab_name: String,
+    /// Whether the rule is enabled.
+    #[serde(default = "tab_naming_rule_enabled_default")]
+    pub enabled: bool,
+}
+
+fn tab_naming_rule_enabled_default() -> bool {
+    true
+}
+
 pub enum WarpConfigUpdateEvent {
     Themes,
     #[cfg_attr(not(feature = "local_fs"), expect(dead_code))]
@@ -76,6 +94,9 @@ pub enum WarpConfigUpdateEvent {
     /// Actions, triggers, or saved workspaces on disk changed.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     ActionsAndTriggers,
+    /// Tab naming rules on disk changed.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    TabNamingRules,
 }
 
 /// Singleton model containing user configurable file entities like themes, launch configs, and
@@ -99,6 +120,8 @@ pub struct WarpConfig {
     triggers: Vec<Trigger>,
     /// User-saved workspace snapshots loaded from `~/.warp/workspaces/*.toml`.
     saved_workspaces: Vec<SavedWorkspace>,
+    /// User-authored tab naming rules loaded from `~/.warp/naming_rules.toml`.
+    tab_naming_rules: Vec<TabNamingRule>,
 }
 
 /// Platform-independent parts of WarpConfig.
@@ -140,6 +163,55 @@ impl WarpConfig {
 
     pub fn saved_workspaces(&self) -> &[SavedWorkspace] {
         &self.saved_workspaces
+    }
+
+    pub fn tab_naming_rules(&self) -> &[TabNamingRule] {
+        &self.tab_naming_rules
+    }
+
+    /// Find the first matching naming rule for the given working directory.
+    pub fn apply_naming_rules(&self, working_directory: &str) -> Option<&TabNamingRule> {
+        // Expand `~` for comparison
+        let home_prefix = dirs::home_dir()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let expanded_wd = if working_directory.starts_with('~') {
+            working_directory.replacen('~', &home_prefix, 1)
+        } else {
+            working_directory.to_string()
+        };
+
+        self.tab_naming_rules.iter().find(|r| {
+            if !r.enabled {
+                return false;
+            }
+            let expanded_prefix = if r.path_prefix.starts_with('~') {
+                r.path_prefix.replacen('~', &home_prefix, 1)
+            } else {
+                r.path_prefix.clone()
+            };
+            expanded_wd.starts_with(&expanded_prefix)
+        })
+    }
+
+    /// Add a new naming rule in-memory and emit an update event.
+    pub fn add_naming_rule(&mut self, rule: TabNamingRule, ctx: &mut ModelContext<Self>) {
+        self.tab_naming_rules.push(rule);
+        ctx.emit(WarpConfigUpdateEvent::TabNamingRules);
+    }
+
+    /// Replace a naming rule in-memory by ID and emit an update event.
+    pub fn update_naming_rule(&mut self, rule: TabNamingRule, ctx: &mut ModelContext<Self>) {
+        if let Some(existing) = self.tab_naming_rules.iter_mut().find(|r| r.id == rule.id) {
+            *existing = rule;
+        }
+        ctx.emit(WarpConfigUpdateEvent::TabNamingRules);
+    }
+
+    /// Remove a naming rule in-memory by ID and emit an update event.
+    pub fn remove_naming_rule(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
+        self.tab_naming_rules.retain(|r| r.id != id);
+        ctx.emit(WarpConfigUpdateEvent::TabNamingRules);
     }
 
     /// Add a new action to the in-memory list and emit an update event.
@@ -296,6 +368,12 @@ pub fn triggers_dir() -> PathBuf {
 #[cfg_attr(target_family = "wasm", expect(dead_code))]
 pub fn saved_workspaces_dir() -> PathBuf {
     base_dir().join("workspaces")
+}
+
+/// Returns the path to the user's tab naming rules file.
+#[cfg_attr(target_family = "wasm", expect(dead_code))]
+pub fn naming_rules_file() -> PathBuf {
+    base_dir().join("naming_rules.toml")
 }
 
 /// Returns the path to the directory containing the built-in default tab configs.

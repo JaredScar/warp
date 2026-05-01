@@ -158,9 +158,7 @@ pub struct TerminalManager {
     #[expect(dead_code)]
     remote_server_controller: ModelHandle<RemoteServerController>,
 
-    /// The process ID of the PTY. Purely used for integration tests. None if the PTY has not yet
-    /// been started.
-    #[cfg(feature = "integration_tests")]
+    /// The process ID of the PTY shell. None if the PTY has not yet been started.
     pid: Option<u32>,
 
     /// An inactive receiver for PTY reads that we can upgrade to an active
@@ -742,7 +740,6 @@ impl TerminalManager {
             pty_controller,
             remote_server_controller,
 
-            #[cfg(feature = "integration_tests")]
             pid: None,
 
             inactive_pty_reads_rx,
@@ -909,7 +906,6 @@ impl TerminalManager {
             }
         };
 
-        #[cfg(feature = "integration_tests")]
         let pid = pty.get_pid();
         #[cfg(unix)]
         let fd = pty.get_fd();
@@ -923,14 +919,12 @@ impl TerminalManager {
         );
 
         self.event_loop_handle = Some(event_loop_handle);
-        #[cfg(feature = "integration_tests")]
-        {
-            self.pid = Some(pid);
-        }
+        self.pid = Some(pid);
 
         self.view.update(ctx, |terminal_view, ctx| {
             terminal_view.on_shell_determined(ctx);
             terminal_view.on_active_shell_launch_data_updated(Some(shell_launch_data), ctx);
+            terminal_view.on_shell_pid_known(pid, ctx);
         });
 
         // Initialize the terminal attributes poller.
@@ -2399,6 +2393,10 @@ impl TerminalManager {
 
     #[cfg(feature = "integration_tests")]
     pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    pub fn shell_pid(&self) -> Option<u32> {
         self.pid
     }
 

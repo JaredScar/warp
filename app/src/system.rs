@@ -2,7 +2,9 @@ cfg_if::cfg_if! {
     if #[cfg(not(target_family = "wasm"))] {
         mod info;
         mod memory_footprint;
+        mod tab_resource_monitor;
         pub use info::SystemInfo;
+        pub use tab_resource_monitor::TabResourceMonitor;
     }
 }
 

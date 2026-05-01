@@ -134,6 +134,9 @@ pub enum WorkspaceAction {
     FinishTabGroupRename(String),
     /// Cancel the pending inline-rename without changing the name.
     CancelTabGroupRename,
+    // ── Tab naming rules ────────────────────────────────────────────────────
+    /// Apply all active tab naming rules to the current workspace tabs based on CWD.
+    ApplyNamingRules,
     /// Sets the manual color override for the active tab.
     ///
     /// - `Color(_)` — apply that color.
@@ -1037,7 +1040,8 @@ impl WorkspaceAction {
             | DeleteTabGroup(_)
             | StartTabGroupRename(_)
             | FinishTabGroupRename(_)
-            | CancelTabGroupRename => false,
+            | CancelTabGroupRename
+            | ApplyNamingRules => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,
             #[cfg(target_family = "wasm")]

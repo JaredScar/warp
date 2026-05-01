@@ -88,6 +88,7 @@ pub enum ActionsPanelTab {
     Actions,
     Triggers,
     Workspaces,
+    NamingRules,
 }
 
 // ── View struct ───────────────────────────────────────────────────────────────
@@ -99,16 +100,19 @@ pub struct ActionsPanelView {
     actions_tab_mouse_state: MouseStateHandle,
     triggers_tab_mouse_state: MouseStateHandle,
     workspaces_tab_mouse_state: MouseStateHandle,
+    naming_rules_tab_mouse_state: MouseStateHandle,
     palette_tab_mouse_state: MouseStateHandle,
     // ── list tab buttons ──
     save_workspace_mouse_state: MouseStateHandle,
     new_action_mouse_state: MouseStateHandle,
     new_trigger_mouse_state: MouseStateHandle,
+    new_naming_rule_mouse_state: MouseStateHandle,
     active_tab: ActionsPanelTab,
     // ── stable per-row mouse states (keyed by UUID) ──
     action_row_states: RefCell<HashMap<Uuid, RowMouseStates>>,
     trigger_row_states: RefCell<HashMap<Uuid, RowMouseStates>>,
     workspace_row_states: RefCell<HashMap<Uuid, RowMouseStates>>,
+    naming_rule_row_states: RefCell<HashMap<Uuid, RowMouseStates>>,
     // ── editor form ──
     panel_mode: PanelMode,
     edit_name_editor: ViewHandle<EditorView>,
@@ -188,6 +192,15 @@ pub struct ActionsPanelView {
     pin_toggle_state: MouseStateHandle,
     /// One mouse state per `PinnedIcon` variant (index matches `PinnedIcon::all()`).
     edit_icon_states: Vec<MouseStateHandle>,
+    // ── naming rule editor ──
+    /// ID of the naming rule currently being edited (`None` for a new rule).
+    edit_naming_rule_id: Option<Uuid>,
+    /// Path prefix editor for the naming rule form.
+    edit_rule_prefix_editor: ViewHandle<EditorView>,
+    /// Tab name editor for the naming rule form.
+    edit_rule_tab_name_editor: ViewHandle<EditorView>,
+    /// Whether the naming rule form is open.
+    naming_rule_form_open: bool,
 }
 
 impl ActionsPanelView {
@@ -273,6 +286,17 @@ impl ActionsPanelView {
             editor.set_placeholder_text("e.g. 0 9 * * 1-5  (weekdays at 9 AM UTC)", ctx);
         });
 
+        let edit_rule_prefix_editor =
+            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
+        edit_rule_prefix_editor.update(ctx, |editor, ctx| {
+            editor.set_placeholder_text("~/projects/frontend", ctx);
+        });
+        let edit_rule_tab_name_editor =
+            ctx.add_typed_action_view(|ctx| EditorView::single_line(single_line_opts.clone(), ctx));
+        edit_rule_tab_name_editor.update(ctx, |editor, ctx| {
+            editor.set_placeholder_text("Frontend", ctx);
+        });
+
         // Keep draft_cron_schedule in sync with the cron editor text.
         ctx.subscribe_to_view(&edit_cron_editor, |me, _, event, ctx| {
             if matches!(event, EditorEvent::Edited(_)) {
@@ -292,14 +316,17 @@ impl ActionsPanelView {
             actions_tab_mouse_state: Default::default(),
             triggers_tab_mouse_state: Default::default(),
             workspaces_tab_mouse_state: Default::default(),
+            naming_rules_tab_mouse_state: Default::default(),
             palette_tab_mouse_state: Default::default(),
             save_workspace_mouse_state: Default::default(),
             new_action_mouse_state: Default::default(),
             new_trigger_mouse_state: Default::default(),
+            new_naming_rule_mouse_state: Default::default(),
             active_tab: ActionsPanelTab::Actions,
             action_row_states: Default::default(),
             trigger_row_states: Default::default(),
             workspace_row_states: Default::default(),
+            naming_rule_row_states: Default::default(),
             panel_mode: PanelMode::List,
             edit_name_editor,
             edit_desc_editor,
@@ -344,6 +371,10 @@ impl ActionsPanelView {
                 .iter()
                 .map(|_| MouseStateHandle::default())
                 .collect(),
+            edit_naming_rule_id: None,
+            edit_rule_prefix_editor,
+            edit_rule_tab_name_editor,
+            naming_rule_form_open: false,
         }
     }
 
@@ -562,6 +593,7 @@ impl ActionsPanelView {
                     .with_child(self.render_tab_button(appearance, "Actions", ActionsPanelTab::Actions))
                     .with_child(self.render_tab_button(appearance, "Triggers", ActionsPanelTab::Triggers))
                     .with_child(self.render_tab_button(appearance, "Workspaces", ActionsPanelTab::Workspaces))
+                    .with_child(self.render_tab_button(appearance, "Rules", ActionsPanelTab::NamingRules))
                     .with_main_axis_size(MainAxisSize::Min)
                     .finish();
                 // Also render the palette search icon to the right.
@@ -677,6 +709,7 @@ impl ActionsPanelView {
             ActionsPanelTab::Actions => self.actions_tab_mouse_state.clone(),
             ActionsPanelTab::Triggers => self.triggers_tab_mouse_state.clone(),
             ActionsPanelTab::Workspaces => self.workspaces_tab_mouse_state.clone(),
+            ActionsPanelTab::NamingRules => self.naming_rules_tab_mouse_state.clone(),
         };
         Hoverable::new(mouse_state, move |_| {
             Container::new(text)
@@ -1140,7 +1173,230 @@ impl ActionsPanelView {
             .finish()
     }
 
-    // ── List rows ─────────────────────────────────────────────────────────
+    fn render_naming_rules_tab(
+        &self,
+        rules: &[crate::user_config::TabNamingRule],
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+
+        let new_rule_button = icon_button(
+            appearance,
+            icons::Icon::Plus,
+            false,
+            self.new_naming_rule_mouse_state.clone(),
+        )
+        .build()
+        .on_click(|ctx, _, _| {
+            ctx.dispatch_typed_action(ActionsPanelAction::NewNamingRule);
+        })
+        .finish();
+
+        let toolbar_row = Container::new(
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_main_axis_alignment(MainAxisAlignment::End)
+                .with_child(new_rule_button)
+                .finish(),
+        )
+        .with_padding_left(10.)
+        .with_padding_right(10.)
+        .with_padding_bottom(4.)
+        .finish();
+
+        // Inline create/edit form
+        let form: Option<Box<dyn Element>> = if self.naming_rule_form_open {
+            let prefix_label = Text::new("Path prefix", font, LABEL_SIZE)
+                .with_color(theme.sub_text_color(theme.background()).into_solid())
+                .finish();
+            let prefix_row = Flex::column()
+                .with_child(prefix_label)
+                .with_child(
+                    Container::new(
+                        warpui::elements::ChildView::new(&self.edit_rule_prefix_editor)
+                            .finish(),
+                    )
+                    .with_uniform_padding(4.)
+                    .with_border(
+                        warpui::elements::Border::all(1.)
+                            .with_border_color(theme.sub_text_color(theme.background()).into_solid()),
+                    )
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+                    .finish(),
+                )
+                .with_spacing(4.)
+                .finish();
+
+            let name_label = Text::new("Tab name", font, LABEL_SIZE)
+                .with_color(theme.sub_text_color(theme.background()).into_solid())
+                .finish();
+            let name_row = Flex::column()
+                .with_child(name_label)
+                .with_child(
+                    Container::new(
+                        warpui::elements::ChildView::new(&self.edit_rule_tab_name_editor)
+                            .finish(),
+                    )
+                    .with_uniform_padding(4.)
+                    .with_border(
+                        warpui::elements::Border::all(1.)
+                            .with_border_color(theme.sub_text_color(theme.background()).into_solid()),
+                    )
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+                    .finish(),
+                )
+                .with_spacing(4.)
+                .finish();
+
+            let save_btn = appearance
+                .ui_builder()
+                .button(ButtonVariant::Accent, self.save_form_state.clone())
+                .with_text_label("Save Rule".to_string())
+                .build()
+                .on_click(|ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::SaveNamingRule);
+                })
+                .with_cursor(warpui::platform::Cursor::PointingHand)
+                .finish();
+
+            let cancel_btn = appearance
+                .ui_builder()
+                .button(ButtonVariant::Secondary, self.cancel_form_state.clone())
+                .with_text_label("Cancel".to_string())
+                .build()
+                .on_click(|ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::SetTab(ActionsPanelTab::NamingRules));
+                })
+                .with_cursor(warpui::platform::Cursor::PointingHand)
+                .finish();
+
+            let btns = Flex::row()
+                .with_spacing(8.)
+                .with_main_axis_alignment(MainAxisAlignment::End)
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_child(cancel_btn)
+                .with_child(save_btn)
+                .finish();
+
+            Some(
+                Container::new(
+                    Flex::column()
+                        .with_spacing(10.)
+                        .with_child(prefix_row)
+                        .with_child(name_row)
+                        .with_child(btns)
+                        .finish(),
+                )
+                .with_uniform_padding(FORM_PADDING)
+                .with_border(
+                    warpui::elements::Border::bottom(1.)
+                        .with_border_color(theme.sub_text_color(theme.background()).into_solid()),
+                )
+                .finish(),
+            )
+        } else {
+            None
+        };
+
+        let list: Box<dyn Element> = if rules.is_empty() && !self.naming_rule_form_open {
+            let empty_mouse = {
+                let mut map = self.naming_rule_row_states.borrow_mut();
+                map.entry(Uuid::nil())
+                    .or_insert_with(RowMouseStates::default)
+                    .primary
+                    .clone()
+            };
+            Align::new(self.render_empty_state(
+                appearance,
+                icons::Icon::Folder,
+                "Tab Rules",
+                "Auto-rename tabs based on working directory",
+                ActionsPanelAction::NewNamingRule,
+                empty_mouse,
+            ))
+            .finish()
+        } else {
+            let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
+            for rule in rules {
+                col = col.with_child(self.render_naming_rule_row(rule, appearance));
+            }
+            Shrinkable::new(1.0, col.finish()).finish()
+        };
+
+        let mut outer = Flex::column()
+            .with_child(toolbar_row)
+            .with_main_axis_size(MainAxisSize::Max);
+        if let Some(f) = form {
+            outer = outer.with_child(f);
+        }
+        outer.with_child(Shrinkable::new(1.0, list).finish()).finish()
+    }
+
+    fn render_naming_rule_row(
+        &self,
+        rule: &crate::user_config::TabNamingRule,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+        let id = rule.id;
+
+        let (edit_state, delete_state) = {
+            let mut map = self.naming_rule_row_states.borrow_mut();
+            let states = map.entry(id).or_insert_with(RowMouseStates::default);
+            (states.primary.clone(), states.delete.clone())
+        };
+
+        let prefix_text = Text::new(rule.path_prefix.clone(), font, 12.)
+            .with_color(theme.sub_text_color(theme.background()).into_solid())
+            .finish();
+        let arrow = Text::new(" → ", font, 12.)
+            .with_color(theme.sub_text_color(theme.background()).into_solid())
+            .finish();
+        let name_text = Text::new(rule.tab_name.clone(), font, 13.)
+            .with_style(warpui::fonts::Properties::default().weight(warpui::fonts::Weight::Semibold))
+            .with_color(theme.main_text_color(theme.background()).into_solid())
+            .finish();
+
+        let label_row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(prefix_text)
+            .with_child(arrow)
+            .with_child(name_text)
+            .finish();
+
+        let edit_btn =
+            icon_button(appearance, icons::Icon::Edit, false, edit_state)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    // TODO: pre-fill the form for editing
+                    ctx.dispatch_typed_action(ActionsPanelAction::NewNamingRule);
+                })
+                .finish();
+        let delete_btn =
+            icon_button(appearance, icons::Icon::Trash, false, delete_state)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::DeleteNamingRule(id));
+                })
+                .finish();
+
+        let row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(Flex::row().with_child(label_row).with_main_axis_size(MainAxisSize::Max).finish())
+            .with_child(edit_btn)
+            .with_child(delete_btn)
+            .finish();
+
+        Container::new(row)
+            .with_padding_left(10.)
+            .with_padding_right(10.)
+            .with_padding_top(6.)
+            .with_padding_bottom(6.)
+            .finish()
+    }
 
     fn render_action_row(&self, action: &Action, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
@@ -2770,6 +3026,10 @@ pub enum ActionsPanelAction {
     ToggleEditPinned,
     /// Select a toolbar icon in the current editor form.
     SelectToolbarIcon(super::model::PinnedIcon),
+    // ── Naming rules ──────────────────────────────────────────────────────────
+    NewNamingRule,
+    DeleteNamingRule(Uuid),
+    SaveNamingRule,
 }
 
 // ── View impl ─────────────────────────────────────────────────────────────────
@@ -2801,6 +3061,10 @@ impl View for ActionsPanelView {
                     self.render_triggers_tab(&triggers, !actions.is_empty(), appearance)
                 }
                 ActionsPanelTab::Workspaces => self.render_workspaces_tab(&workspaces, appearance),
+                ActionsPanelTab::NamingRules => {
+                    let rules = WarpConfig::as_ref(app).tab_naming_rules().to_vec();
+                    self.render_naming_rules_tab(&rules, appearance)
+                }
             },
             PanelMode::EditAction(_) => self.render_action_editor(appearance),
             PanelMode::EditTrigger(_) => self.render_trigger_editor(&actions, appearance),
@@ -2896,6 +3160,7 @@ impl warpui::TypedActionView for ActionsPanelView {
     fn handle_action(&mut self, action: &ActionsPanelAction, ctx: &mut ViewContext<Self>) {
         match action {
             ActionsPanelAction::SetTab(tab) => {
+                self.naming_rule_form_open = false;
                 self.set_active_tab(*tab, ctx);
             }
             ActionsPanelAction::ClosePanel => {
@@ -3287,6 +3552,69 @@ impl warpui::TypedActionView for ActionsPanelView {
             }
             ActionsPanelAction::SelectToolbarIcon(icon) => {
                 self.edit_toolbar_icon = *icon;
+                ctx.notify();
+            }
+            ActionsPanelAction::NewNamingRule => {
+                self.edit_naming_rule_id = None;
+                self.naming_rule_form_open = true;
+                self.edit_rule_prefix_editor
+                    .update(ctx, |e, ctx| e.set_buffer_text("", ctx));
+                self.edit_rule_tab_name_editor
+                    .update(ctx, |e, ctx| e.set_buffer_text("", ctx));
+                ctx.notify();
+            }
+            ActionsPanelAction::DeleteNamingRule(id) => {
+                use crate::user_config::WarpConfig;
+                let id = *id;
+                WarpConfig::handle(ctx).update(ctx, |cfg, ctx| {
+                    cfg.remove_naming_rule(id, ctx);
+                });
+                #[cfg(feature = "local_fs")]
+                {
+                    let config = WarpConfig::handle(ctx);
+                    let rules: Vec<_> = config.as_ref(ctx).tab_naming_rules().to_vec();
+                    let _ = crate::user_config::save_naming_rules(&rules);
+                }
+                ctx.notify();
+            }
+            ActionsPanelAction::SaveNamingRule => {
+                use crate::user_config::{TabNamingRule, WarpConfig};
+                let prefix = self
+                    .edit_rule_prefix_editor
+                    .read(ctx, |e, ctx| e.buffer_text(ctx))
+                    .trim()
+                    .to_string();
+                let tab_name = self
+                    .edit_rule_tab_name_editor
+                    .read(ctx, |e, ctx| e.buffer_text(ctx))
+                    .trim()
+                    .to_string();
+                if prefix.is_empty() || tab_name.is_empty() {
+                    ctx.notify();
+                    return;
+                }
+                let editing_id = self.edit_naming_rule_id;
+                WarpConfig::handle(ctx).update(ctx, |cfg, ctx| {
+                    if let Some(id) = editing_id {
+                        cfg.update_naming_rule(
+                            TabNamingRule { id, path_prefix: prefix.clone(), tab_name: tab_name.clone(), enabled: true },
+                            ctx,
+                        );
+                    } else {
+                        cfg.add_naming_rule(
+                            TabNamingRule { id: Uuid::new_v4(), path_prefix: prefix.clone(), tab_name: tab_name.clone(), enabled: true },
+                            ctx,
+                        );
+                    }
+                });
+                #[cfg(feature = "local_fs")]
+                {
+                    let config = WarpConfig::handle(ctx);
+                    let rules: Vec<_> = config.as_ref(ctx).tab_naming_rules().to_vec();
+                    let _ = crate::user_config::save_naming_rules(&rules);
+                }
+                self.naming_rule_form_open = false;
+                self.edit_naming_rule_id = None;
                 ctx.notify();
             }
         }

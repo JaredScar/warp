@@ -3657,6 +3657,32 @@ fn render_terminal_row_content(
         .with_margin_top(2.)
         .finish(),
     );
+
+    // Resource stats row (CPU + memory) if available.
+    #[cfg(all(feature = "local_tty", not(target_family = "wasm")))]
+    {
+        use crate::system::TabResourceMonitor;
+        if let Some(pid) = terminal_view.shell_pid() {
+            let monitor = TabResourceMonitor::as_ref(app);
+            if let Some(stats) = monitor.stats_for_pid(pid) {
+                let cpu_str = format!("CPU {:.1}%", stats.cpu_pct);
+                let mem_mb = stats.memory_bytes / (1024 * 1024);
+                let mem_str = if mem_mb >= 1024 {
+                    format!("Mem {:.1}GB", mem_mb as f32 / 1024.0)
+                } else {
+                    format!("Mem {}MB", mem_mb)
+                };
+                let label = format!("{} · {}", cpu_str, mem_str);
+                let resource_line = Text::new(label, appearance.ui_font_family(), 10.)
+                    .with_color(sub_text_color.into_solid())
+                    .finish();
+                content.add_child(
+                    Container::new(resource_line).with_margin_top(2.).finish(),
+                );
+            }
+        }
+    }
+
     content.finish()
 }
 

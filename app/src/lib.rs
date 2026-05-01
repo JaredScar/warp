@@ -1761,6 +1761,7 @@ fn initialize_app(
     {
         ctx.add_singleton_model(LocalShellState::new);
         ctx.add_singleton_model(system::SystemInfo::new);
+        ctx.add_singleton_model(system::TabResourceMonitor::new);
     }
 
     // Add a singleton model that holds the current prompt configuration.

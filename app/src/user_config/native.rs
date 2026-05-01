@@ -26,8 +26,9 @@ use super::util::{
     parse_multi_workflow_dir_entry, parse_single_theme_dir_entry, parse_tab_config_dir_entry,
 };
 use super::{
-    actions_dir, launch_configs_dir, saved_workspaces_dir, tab_configs_dir, themes_dir,
-    triggers_dir, workflows_dir, WarpConfigUpdateEvent, LAUNCH_CONFIG_COMMENT,
+    actions_dir, launch_configs_dir, naming_rules_file, saved_workspaces_dir, tab_configs_dir,
+    themes_dir, triggers_dir, workflows_dir, TabNamingRule, WarpConfigUpdateEvent,
+    LAUNCH_CONFIG_COMMENT,
 };
 
 impl super::WarpConfig {
@@ -63,15 +64,17 @@ impl super::WarpConfig {
                 let actions = load_actions(&actions_dir());
                 let triggers = load_triggers(&triggers_dir());
                 let workspaces = load_saved_workspaces(&saved_workspaces_dir());
-                (actions, triggers, workspaces)
+                let naming_rules = load_naming_rules(&naming_rules_file());
+                (actions, triggers, workspaces, naming_rules)
             },
-            |me, (actions, triggers, workspaces), ctx| {
+            |me, (actions, triggers, workspaces, naming_rules), ctx| {
                 // Prepend built-ins so they are always first and always present.
                 let mut all_actions = builtin_actions();
                 all_actions.extend(actions);
                 me.actions = all_actions;
                 me.triggers = triggers;
                 me.saved_workspaces = workspaces;
+                me.tab_naming_rules = naming_rules;
                 ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
             },
         );
@@ -166,6 +169,16 @@ impl super::WarpConfig {
                     me.triggers = triggers;
                     me.saved_workspaces = workspaces;
                     ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+                },
+            );
+        }
+
+        if repository_update_touches_path(update, &naming_rules_file()) {
+            let _ = ctx.spawn(
+                async move { load_naming_rules(&naming_rules_file()) },
+                |me, naming_rules, ctx| {
+                    me.tab_naming_rules = naming_rules;
+                    ctx.emit(WarpConfigUpdateEvent::TabNamingRules);
                 },
             );
         }
@@ -313,4 +326,38 @@ pub fn load_saved_workspaces(dir: &Path) -> Vec<SavedWorkspace> {
         ws.source_path = Some(item.path().into());
         Some(ws)
     })
+}
+
+/// Loads tab naming rules from `~/.warp/naming_rules.toml`.
+pub fn load_naming_rules(path: &Path) -> Vec<TabNamingRule> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    #[derive(serde::Deserialize)]
+    struct NamingRulesFile {
+        #[serde(default)]
+        rules: Vec<TabNamingRule>,
+    }
+    toml::from_str::<NamingRulesFile>(&content)
+        .map(|f| f.rules)
+        .unwrap_or_default()
+}
+
+/// Saves tab naming rules to `~/.warp/naming_rules.toml`.
+pub fn save_naming_rules(rules: &[TabNamingRule]) -> Result<()> {
+    let path = super::naming_rules_file();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[derive(serde::Serialize)]
+    struct NamingRulesFile<'a> {
+        rules: &'a [TabNamingRule],
+    }
+    let content = toml::to_string_pretty(&NamingRulesFile { rules })?;
+    fs::write(&path, content)?;
+    Ok(())
 }

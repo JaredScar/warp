@@ -5322,6 +5322,63 @@ impl Workspace {
         ctx.notify();
     }
 
+    /// Checks all tabs' current working directories against the user-configured naming rules and
+    /// renames any tabs whose CWD matches a rule's prefix (using `PaneGroup::set_title`).
+    fn apply_tab_naming_rules(&mut self, ctx: &mut ViewContext<Self>) {
+        use crate::user_config::WarpConfig;
+        let config = WarpConfig::handle(ctx);
+        let rules: Vec<_> = config
+            .as_ref(ctx)
+            .tab_naming_rules()
+            .iter()
+            .filter(|r| r.enabled)
+            .cloned()
+            .collect();
+        if rules.is_empty() {
+            return;
+        }
+
+        for tab in &self.tabs {
+            let pane_group = tab.pane_group.clone();
+            let Some(terminal_view_handle) = pane_group.as_ref(ctx).focused_session_view(ctx)
+            else {
+                continue;
+            };
+            let cwd = terminal_view_handle
+                .as_ref(ctx)
+                .display_working_directory(ctx)
+                .unwrap_or_default();
+            if cwd.is_empty() {
+                continue;
+            }
+            // Expand home dir for matching
+            let home_prefix = dirs::home_dir()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let expanded_cwd = if cwd.starts_with('~') {
+                cwd.replacen('~', &home_prefix, 1)
+            } else {
+                cwd.clone()
+            };
+
+            for rule in &rules {
+                let expanded_prefix = if rule.path_prefix.starts_with('~') {
+                    rule.path_prefix.replacen('~', &home_prefix, 1)
+                } else {
+                    rule.path_prefix.clone()
+                };
+                if expanded_cwd.starts_with(&expanded_prefix) {
+                    let new_name = rule.tab_name.clone();
+                    pane_group.update(ctx, |pg, ctx| {
+                        pg.set_title(&new_name, ctx);
+                    });
+                    break;
+                }
+            }
+        }
+        ctx.notify();
+    }
+
     /// Programmatically sets the manual color override for a tab.
     ///
     /// - `Color(_)` applies that color.
@@ -10395,6 +10452,12 @@ impl Workspace {
                         {
                             terminal_view.shutdown_pty(ctx);
                         }
+                        // Deregister the shell PID from the resource monitor.
+                        #[cfg(all(feature = "local_tty", not(target_family = "wasm")))]
+                        if let Some(pid) = terminal_view.shell_pid() {
+                            use crate::system::TabResourceMonitor;
+                            TabResourceMonitor::handle(ctx).update(ctx, |m, _| m.deregister_pid(pid));
+                        }
                     },
                     ctx,
                 );
@@ -13226,6 +13289,7 @@ impl Workspace {
                 self.refresh_working_directories_for_pane_group(&pane_group, ctx);
                 self.update_resource_center_action_target(ctx);
                 self.update_active_session(ctx);
+                self.apply_tab_naming_rules(ctx);
 
                 if FeatureFlag::DirectoryTabColors.is_enabled() {
                     if let Some(tab) = self
@@ -20498,6 +20562,9 @@ impl TypedActionView for Workspace {
             CancelTabGroupRename => {
                 self.renaming_tab_group_id = None;
                 ctx.notify();
+            }
+            ApplyNamingRules => {
+                self.apply_tab_naming_rules(ctx);
             }
             SetActiveTabColor(color) => self.set_tab_color(self.active_tab_index, *color, ctx),
             ToggleTabRightClickMenu { tab_index, anchor } => {
