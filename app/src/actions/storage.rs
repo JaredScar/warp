@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use uuid::Uuid;
 
-use super::model::{Action, SavedWorkspace, Trigger, TriggerHistory};
+use super::model::{Action, Runbook, SavedWorkspace, Trigger, TriggerHistory};
 
 // ── Directory paths ───────────────────────────────────────────────────────────
 
@@ -23,6 +23,10 @@ pub fn workspaces_dir() -> PathBuf {
 
 pub fn trigger_history_dir() -> PathBuf {
     warp_core::paths::data_dir().join("trigger_history")
+}
+
+pub fn runbooks_dir() -> PathBuf {
+    warp_core::paths::data_dir().join("runbooks")
 }
 
 // ── Save helpers ──────────────────────────────────────────────────────────────
@@ -180,6 +184,56 @@ pub fn save_trigger_history(trigger_id: Uuid, history: &TriggerHistory) -> Resul
     let toml = toml::to_string_pretty(history)?;
     std::fs::write(&path, toml.as_bytes())
         .map_err(|e| anyhow::anyhow!("Failed to write trigger history '{}': {e}", path.display()))
+}
+
+// ── Runbook helpers ───────────────────────────────────────────────────────────
+
+/// Write (create or overwrite) a runbook to `~/.warp/runbooks/<id>.toml`.
+pub fn write_runbook(runbook: &Runbook) -> Result<PathBuf> {
+    let path = runbook
+        .source_path
+        .clone()
+        .unwrap_or_else(|| runbooks_dir().join(format!("{}.toml", runbook.id)));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let toml = toml::to_string_pretty(runbook)?;
+    std::fs::write(&path, toml.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to write runbook '{}': {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Delete the TOML file backing `runbook`.
+pub fn delete_runbook(runbook: &Runbook) -> Result<()> {
+    let path = runbook
+        .source_path
+        .clone()
+        .unwrap_or_else(|| runbooks_dir().join(format!("{}.toml", runbook.id)));
+    std::fs::remove_file(&path)
+        .map_err(|e| anyhow::anyhow!("Failed to delete runbook '{}': {e}", path.display()))
+}
+
+/// Load all runbooks from `dir`.  Malformed or missing files are skipped.
+pub fn load_runbooks(dir: &std::path::Path) -> Vec<Runbook> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut runbooks: Vec<Runbook> = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()?.to_str()? != "toml" {
+                return None;
+            }
+            let contents = std::fs::read_to_string(&path).ok()?;
+            let mut runbook: Runbook = toml::from_str(&contents)
+                .map_err(|e| log::warn!("Skipping malformed runbook {:?}: {e}", path))
+                .ok()?;
+            runbook.source_path = Some(path);
+            Some(runbook)
+        })
+        .collect();
+    runbooks.sort_by(|a, b| a.name.cmp(&b.name));
+    runbooks
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────

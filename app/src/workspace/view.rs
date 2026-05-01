@@ -21242,6 +21242,17 @@ impl TypedActionView for Workspace {
                     }
                 }
             }
+            RunCommandInActiveTerminal(cmd) => {
+                let cmd = cmd.clone();
+                if let Some(terminal_handle) = self
+                    .active_tab_pane_group()
+                    .read(ctx, |pg, app| pg.active_session_view(app))
+                {
+                    terminal_handle.update(ctx, |terminal, term_ctx| {
+                        terminal.execute_command_or_set_pending(&cmd, term_ctx);
+                    });
+                }
+            }
             RunTrigger(trigger_id) => {
                 use crate::actions::model::TriggerRunSource;
                 use crate::actions::runner::TriggerRunner;

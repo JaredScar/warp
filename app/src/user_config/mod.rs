@@ -4,7 +4,7 @@ pub mod util;
 #[cfg_attr(target_family = "wasm", path = "wasm.rs")]
 mod imp;
 
-use crate::actions::model::{Action, SavedWorkspace, Trigger};
+use crate::actions::model::{Action, Runbook, SavedWorkspace, Trigger};
 use crate::tab_configs::{TabConfig, TabConfigError};
 use crate::themes::theme::WarpThemeConfig;
 use crate::{
@@ -97,6 +97,9 @@ pub enum WarpConfigUpdateEvent {
     /// Tab naming rules on disk changed.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     TabNamingRules,
+    /// Runbooks on disk changed.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    Runbooks,
 }
 
 /// Singleton model containing user configurable file entities like themes, launch configs, and
@@ -122,6 +125,8 @@ pub struct WarpConfig {
     saved_workspaces: Vec<SavedWorkspace>,
     /// User-authored tab naming rules loaded from `~/.warp/naming_rules.toml`.
     tab_naming_rules: Vec<TabNamingRule>,
+    /// User-authored runbooks loaded from `~/.warp/runbooks/*.toml`.
+    runbooks: Vec<Runbook>,
 }
 
 /// Platform-independent parts of WarpConfig.
@@ -212,6 +217,29 @@ impl WarpConfig {
     pub fn remove_naming_rule(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
         self.tab_naming_rules.retain(|r| r.id != id);
         ctx.emit(WarpConfigUpdateEvent::TabNamingRules);
+    }
+
+    pub fn runbooks(&self) -> &[Runbook] {
+        &self.runbooks
+    }
+
+    pub fn add_runbook(&mut self, runbook: Runbook, ctx: &mut ModelContext<Self>) {
+        self.runbooks.push(runbook);
+        self.runbooks.sort_by(|a, b| a.name.cmp(&b.name));
+        ctx.emit(WarpConfigUpdateEvent::Runbooks);
+    }
+
+    pub fn update_runbook(&mut self, runbook: Runbook, ctx: &mut ModelContext<Self>) {
+        if let Some(existing) = self.runbooks.iter_mut().find(|r| r.id == runbook.id) {
+            *existing = runbook;
+        }
+        self.runbooks.sort_by(|a, b| a.name.cmp(&b.name));
+        ctx.emit(WarpConfigUpdateEvent::Runbooks);
+    }
+
+    pub fn remove_runbook(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
+        self.runbooks.retain(|r| r.id != id);
+        ctx.emit(WarpConfigUpdateEvent::Runbooks);
     }
 
     /// Add a new action to the in-memory list and emit an update event.
@@ -368,6 +396,12 @@ pub fn triggers_dir() -> PathBuf {
 #[cfg_attr(target_family = "wasm", expect(dead_code))]
 pub fn saved_workspaces_dir() -> PathBuf {
     base_dir().join("workspaces")
+}
+
+/// Returns the path to the directory containing the user's runbooks.
+#[cfg_attr(target_family = "wasm", expect(dead_code))]
+pub fn runbooks_dir() -> PathBuf {
+    base_dir().join("runbooks")
 }
 
 /// Returns the path to the user's tab naming rules file.

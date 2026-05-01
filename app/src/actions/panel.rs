@@ -89,9 +89,19 @@ pub enum ActionsPanelTab {
     Triggers,
     Workspaces,
     NamingRules,
+    Runbooks,
 }
 
 // ── View struct ───────────────────────────────────────────────────────────────
+
+/// Run status of a single runbook step — held in memory only, not persisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StepStatus {
+    #[default]
+    NotRun,
+    Running,
+    Done,
+}
 
 pub struct ActionsPanelView {
     // ── layout ──
@@ -201,6 +211,33 @@ pub struct ActionsPanelView {
     edit_rule_tab_name_editor: ViewHandle<EditorView>,
     /// Whether the naming rule form is open.
     naming_rule_form_open: bool,
+    // ── runbooks tab ──
+    runbooks_tab_mouse_state: MouseStateHandle,
+    new_runbook_mouse_state: MouseStateHandle,
+    runbook_row_states: RefCell<HashMap<Uuid, RowMouseStates>>,
+    // ── runbook editor form ──
+    /// ID of the runbook being edited (`None` = new).
+    edit_runbook_id: Option<Uuid>,
+    /// Single-line editor for the runbook name.
+    edit_runbook_name_editor: ViewHandle<EditorView>,
+    /// Ordered list of (step_id, name_editor, command_editor) for the steps form.
+    runbook_step_editors: Vec<(Uuid, ViewHandle<EditorView>, ViewHandle<EditorView>)>,
+    /// Whether the runbook editor form is open.
+    runbook_form_open: bool,
+    /// Mouse states for the per-step delete (×) buttons, keyed by step UUID.
+    runbook_step_remove_states: RefCell<HashMap<Uuid, MouseStateHandle>>,
+    /// Mouse state for the "+ Add Step" button.
+    add_runbook_step_state: MouseStateHandle,
+    // ── runbook runner ──
+    /// When `Some`, the runner view is shown for this runbook ID.
+    running_runbook_id: Option<Uuid>,
+    /// Per-step run status in the currently-open runner view (step_id → status).
+    runbook_step_statuses: HashMap<Uuid, StepStatus>,
+    /// Mouse states for the per-step ▶ Run buttons in the runner view.
+    runbook_step_run_states: RefCell<HashMap<Uuid, MouseStateHandle>>,
+    run_all_button_state: MouseStateHandle,
+    reset_button_state: MouseStateHandle,
+    runbook_back_button_state: MouseStateHandle,
 }
 
 impl ActionsPanelView {
@@ -375,6 +412,23 @@ impl ActionsPanelView {
             edit_rule_prefix_editor,
             edit_rule_tab_name_editor,
             naming_rule_form_open: false,
+            runbooks_tab_mouse_state: Default::default(),
+            new_runbook_mouse_state: Default::default(),
+            runbook_row_states: Default::default(),
+            edit_runbook_id: None,
+            edit_runbook_name_editor: ctx.add_view(|ctx| {
+                EditorView::single_line(single_line_opts.clone(), ctx)
+            }),
+            runbook_step_editors: Vec::new(),
+            runbook_form_open: false,
+            runbook_step_remove_states: Default::default(),
+            add_runbook_step_state: Default::default(),
+            running_runbook_id: None,
+            runbook_step_statuses: HashMap::new(),
+            runbook_step_run_states: Default::default(),
+            run_all_button_state: Default::default(),
+            reset_button_state: Default::default(),
+            runbook_back_button_state: Default::default(),
         }
     }
 
@@ -594,6 +648,7 @@ impl ActionsPanelView {
                     .with_child(self.render_tab_button(appearance, "Triggers", ActionsPanelTab::Triggers))
                     .with_child(self.render_tab_button(appearance, "Workspaces", ActionsPanelTab::Workspaces))
                     .with_child(self.render_tab_button(appearance, "Rules", ActionsPanelTab::NamingRules))
+                    .with_child(self.render_tab_button(appearance, "Runbooks", ActionsPanelTab::Runbooks))
             .with_main_axis_size(MainAxisSize::Min)
             .finish();
                 // Also render the palette search icon to the right.
@@ -710,6 +765,7 @@ impl ActionsPanelView {
             ActionsPanelTab::Triggers => self.triggers_tab_mouse_state.clone(),
             ActionsPanelTab::Workspaces => self.workspaces_tab_mouse_state.clone(),
             ActionsPanelTab::NamingRules => self.naming_rules_tab_mouse_state.clone(),
+            ActionsPanelTab::Runbooks => self.runbooks_tab_mouse_state.clone(),
         };
         Hoverable::new(mouse_state, move |_| {
             Container::new(text)
@@ -1417,6 +1473,500 @@ impl ActionsPanelView {
             .with_padding_right(10.)
             .with_padding_top(6.)
             .with_padding_bottom(6.)
+            .finish()
+    }
+
+    // ── Runbooks tab ──────────────────────────────────────────────────────────
+
+    fn render_runbooks_tab(
+        &self,
+        runbooks: &[crate::actions::model::Runbook],
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+
+        // If the runner view is open, show it instead of the list/form.
+        if let Some(rb_id) = self.running_runbook_id {
+            if let Some(runbook) = runbooks.iter().find(|r| r.id == rb_id) {
+                return self.render_runner_view(runbook, appearance);
+            }
+        }
+
+        let new_btn = icon_button(
+            appearance,
+            icons::Icon::Plus,
+            false,
+            self.new_runbook_mouse_state.clone(),
+        )
+        .build()
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(ActionsPanelAction::NewRunbook))
+        .finish();
+
+        let toolbar = Container::new(
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_main_axis_alignment(MainAxisAlignment::End)
+                .with_child(new_btn)
+                .finish(),
+        )
+        .with_padding_left(10.)
+        .with_padding_right(10.)
+        .with_padding_bottom(4.)
+        .finish();
+
+        let body: Box<dyn Element> = if self.runbook_form_open {
+            self.render_runbook_editor(appearance)
+        } else if runbooks.is_empty() {
+            let empty_state = {
+                let mut map = self.runbook_row_states.borrow_mut();
+                map.entry(Uuid::nil())
+                    .or_insert_with(RowMouseStates::default)
+                    .primary
+                    .clone()
+            };
+            Align::new(self.render_empty_state_with_label(
+                appearance,
+                icons::Icon::Play,
+                "Runbooks",
+                "Document and run step-by-step procedures",
+                "+ Create Runbook",
+                ActionsPanelAction::NewRunbook,
+                empty_state,
+            ))
+            .finish()
+        } else {
+            let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
+            for rb in runbooks {
+                col = col.with_child(self.render_runbook_row(rb, appearance));
+            }
+            Shrinkable::new(1.0, col.finish()).finish()
+        };
+
+        Flex::column()
+            .with_child(toolbar)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(Shrinkable::new(1.0, body).finish())
+            .finish()
+    }
+
+    fn render_runbook_row(
+        &self,
+        runbook: &crate::actions::model::Runbook,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+        let id = runbook.id;
+
+        let (run_state, edit_state) = {
+            let mut map = self.runbook_row_states.borrow_mut();
+            let states = map.entry(id).or_insert_with(RowMouseStates::default);
+            (states.primary.clone(), states.delete.clone())
+        };
+
+        let name = Text::new(runbook.name.clone(), font, 13.)
+            .with_style(Properties::default().weight(Weight::Medium))
+            .with_color(theme.main_text_color(theme.background()).into_solid())
+            .finish();
+        let step_count = format!(
+            "{} step{}",
+            runbook.steps.len(),
+            if runbook.steps.len() == 1 { "" } else { "s" }
+        );
+        let count_text = Text::new(step_count, font, 11.)
+            .with_color(theme.sub_text_color(theme.background()).into_solid())
+            .finish();
+        let label_col = Flex::column()
+            .with_child(name)
+            .with_child(count_text)
+            .with_spacing(2.)
+            .with_main_axis_size(MainAxisSize::Min)
+            .finish();
+
+        let run_btn = Hoverable::new(run_state, move |hover_state| {
+            let bg = if hover_state.is_hovered() {
+                warpui::elements::Fill::Solid(pathfinder_color::ColorU::new(255, 255, 255, 20))
+            } else {
+                warpui::elements::Fill::None
+            };
+            Container::new(
+                Text::new("▶ Run All", font, 11.)
+                    .with_color(
+                        if hover_state.is_hovered() {
+                            pathfinder_color::ColorU::new(100, 200, 100, 255)
+                        } else {
+                            pathfinder_color::ColorU::new(100, 200, 100, 200)
+                        }
+                    )
+                    .finish(),
+            )
+            .with_uniform_padding(4.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_background(bg)
+            .finish()
+        })
+        .on_click(move |ctx, _, _| ctx.dispatch_typed_action(ActionsPanelAction::OpenRunner(id)))
+        .with_cursor(Cursor::PointingHand)
+        .finish();
+
+        let edit_btn = Hoverable::new(edit_state, |_| {
+            Container::new(
+                Text::new("✎", font, 12.)
+                    .with_color(pathfinder_color::ColorU::new(180, 180, 180, 200))
+                    .finish(),
+            )
+            .with_uniform_padding(4.)
+            .finish()
+        })
+        .on_click(move |ctx, _, _| ctx.dispatch_typed_action(ActionsPanelAction::EditRunbook(id)))
+        .with_cursor(Cursor::PointingHand)
+        .finish();
+
+        let row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(Box::new(Expanded::new(1., label_col)))
+            .with_child(run_btn)
+            .with_child(edit_btn)
+            .with_spacing(6.)
+            .finish();
+
+        Container::new(row)
+            .with_padding_left(10.)
+            .with_padding_right(10.)
+            .with_padding_top(6.)
+            .with_padding_bottom(6.)
+            .finish()
+    }
+
+    fn render_runbook_editor(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+
+        // Name field
+        let name_label = Text::new("Runbook name", font, LABEL_SIZE)
+            .with_color(theme.sub_text_color(theme.background()).into_solid())
+            .finish();
+        let name_field = Container::new(
+            warpui::elements::ChildView::new(&self.edit_runbook_name_editor).finish(),
+        )
+        .with_uniform_padding(4.)
+        .with_border(
+            warpui::elements::Border::all(1.)
+                .with_border_color(theme.sub_text_color(theme.background()).into_solid()),
+        )
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+        .finish();
+        let name_section = Flex::column()
+            .with_child(name_label)
+            .with_child(name_field)
+            .with_spacing(4.)
+            .finish();
+
+        // Steps list
+        let steps_label = Text::new("Steps", font, LABEL_SIZE)
+            .with_color(theme.sub_text_color(theme.background()).into_solid())
+            .finish();
+
+        let mut steps_col = Flex::column().with_spacing(8.);
+        for (idx, (step_id, name_ed, cmd_ed)) in self.runbook_step_editors.iter().enumerate() {
+            let step_id = *step_id;
+            let step_num = Text::new(format!("{}.", idx + 1), font, 11.)
+                .with_color(theme.sub_text_color(theme.background()).into_solid())
+                .finish();
+
+            let name_input = Container::new(
+                warpui::elements::ChildView::new(name_ed).finish(),
+            )
+            .with_uniform_padding(4.)
+            .with_border(
+                warpui::elements::Border::all(1.)
+                    .with_border_color(theme.sub_text_color(theme.background()).into_solid()),
+            )
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .finish();
+
+            let cmd_input = Container::new(
+                warpui::elements::ChildView::new(cmd_ed).finish(),
+            )
+            .with_uniform_padding(4.)
+            .with_border(
+                warpui::elements::Border::all(1.)
+                    .with_border_color(theme.sub_text_color(theme.background()).into_solid()),
+            )
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .finish();
+
+            let del_state = {
+                let mut map = self.runbook_step_remove_states.borrow_mut();
+                map.entry(step_id).or_insert_with(MouseStateHandle::default).clone()
+            };
+            let del_btn = Hoverable::new(del_state, |_| {
+                Text::new("×", font, 14.)
+                    .with_color(pathfinder_color::ColorU::new(200, 80, 80, 200))
+                    .finish()
+            })
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(ActionsPanelAction::RemoveRunbookStep(step_id))
+            })
+            .with_cursor(Cursor::PointingHand)
+            .finish();
+
+            let fields = Flex::column()
+                .with_child(name_input)
+                .with_child(cmd_input)
+                .with_spacing(4.)
+                .finish();
+
+            let step_row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Start)
+                .with_child(step_num)
+                .with_child(Box::new(Expanded::new(1., fields)))
+                .with_child(del_btn)
+                .with_spacing(6.)
+                .finish();
+
+            steps_col = steps_col.with_child(step_row);
+        }
+
+        let add_step_btn = Hoverable::new(self.add_runbook_step_state.clone(), |_| {
+            Text::new("+ Add Step", font, 12.)
+                .with_color(theme.sub_text_color(theme.background()).into_solid())
+                .finish()
+        })
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(ActionsPanelAction::AddRunbookStep))
+        .with_cursor(Cursor::PointingHand)
+        .finish();
+
+        let steps_section = Flex::column()
+            .with_child(steps_label)
+            .with_child(steps_col.finish())
+            .with_child(add_step_btn)
+            .with_spacing(6.)
+            .finish();
+
+        // Save / Cancel / Delete buttons
+        let save_btn = appearance
+            .ui_builder()
+            .button(ButtonVariant::Accent, self.save_form_state.clone())
+            .with_text_label("Save Runbook".to_string())
+            .build()
+            .on_click(|ctx, _, _| ctx.dispatch_typed_action(ActionsPanelAction::SaveRunbook))
+            .finish();
+        let cancel_btn = appearance
+            .ui_builder()
+            .button(ButtonVariant::Secondary, self.cancel_form_state.clone())
+            .with_text_label("Cancel".to_string())
+            .build()
+            .on_click(|ctx, _, _| ctx.dispatch_typed_action(ActionsPanelAction::CancelForm))
+            .finish();
+
+        let mut btn_row = Flex::row()
+            .with_spacing(8.)
+            .with_main_axis_alignment(MainAxisAlignment::End)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(cancel_btn)
+            .with_child(save_btn);
+
+        if self.edit_runbook_id.is_some() {
+            let rb_id = self.edit_runbook_id.unwrap();
+            let del_btn = Hoverable::new(self.history_back_state.clone(), |_| {
+                Text::new("Delete", font, 12.)
+                    .with_color(pathfinder_color::ColorU::new(220, 80, 80, 255))
+                    .finish()
+            })
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(ActionsPanelAction::DeleteRunbook(rb_id))
+            })
+            .with_cursor(Cursor::PointingHand)
+            .finish();
+            btn_row = btn_row.with_child(del_btn);
+        }
+
+        Container::new(
+            Flex::column()
+                .with_child(name_section)
+                .with_child(steps_section)
+                .with_child(btn_row.finish())
+                .with_spacing(12.)
+                .finish(),
+        )
+        .with_uniform_padding(FORM_PADDING)
+        .finish()
+    }
+
+    fn render_runner_view(
+        &self,
+        runbook: &crate::actions::model::Runbook,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+
+        // Header row: back button + runbook name + Run All + Reset
+        let back_btn = Hoverable::new(self.runbook_back_button_state.clone(), |_| {
+            Text::new("← Back", font, 12.)
+                .with_color(theme.sub_text_color(theme.background()).into_solid())
+                .finish()
+        })
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(ActionsPanelAction::CloseRunner))
+        .with_cursor(Cursor::PointingHand)
+        .finish();
+
+        let title = Text::new(runbook.name.clone(), font, 13.)
+            .with_style(Properties::default().weight(Weight::Semibold))
+            .with_color(theme.main_text_color(theme.background()).into_solid())
+            .finish();
+
+        let any_running = self
+            .runbook_step_statuses
+            .values()
+            .any(|s| *s == StepStatus::Running);
+
+        let run_all_btn = {
+            let disabled = runbook.steps.is_empty() || any_running;
+            let color = if disabled {
+                pathfinder_color::ColorU::new(100, 180, 100, 80)
+            } else {
+                pathfinder_color::ColorU::new(100, 200, 100, 220)
+            };
+            let lbl = Text::new("▶ Run All", font, 11.)
+                .with_color(color)
+                .finish();
+            if disabled {
+                Container::new(lbl).with_uniform_padding(4.).finish()
+            } else {
+                Hoverable::new(self.run_all_button_state.clone(), move |_| {
+                    Container::new(
+                        Text::new("▶ Run All", font, 11.)
+                            .with_color(pathfinder_color::ColorU::new(100, 200, 100, 220))
+                            .finish(),
+                    )
+                    .with_uniform_padding(4.)
+                    .finish()
+                })
+                .on_click(|ctx, _, _| ctx.dispatch_typed_action(ActionsPanelAction::RunAllSteps))
+                .with_cursor(Cursor::PointingHand)
+                .finish()
+            }
+        };
+
+        let reset_btn = Hoverable::new(self.reset_button_state.clone(), |_| {
+            Text::new("Reset", font, 11.)
+                .with_color(theme.sub_text_color(theme.background()).into_solid())
+                .finish()
+        })
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(ActionsPanelAction::ResetSteps))
+        .with_cursor(Cursor::PointingHand)
+        .finish();
+
+        let header_row = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_child(back_btn)
+                .with_child(Box::new(Expanded::new(1., title)))
+                .with_child(run_all_btn)
+                .with_child(reset_btn)
+                .with_spacing(8.)
+                .finish(),
+        )
+        .with_padding_left(10.)
+        .with_padding_right(10.)
+        .with_padding_top(6.)
+        .with_padding_bottom(6.)
+        .with_border(
+            warpui::elements::Border::bottom(1.)
+                .with_border_color(theme.sub_text_color(theme.background()).into_solid()),
+        )
+        .finish();
+
+        // Step rows
+        let mut steps_col = Flex::column().with_main_axis_size(MainAxisSize::Max);
+        for step in &runbook.steps {
+            let step_id = step.id;
+            let status = self
+                .runbook_step_statuses
+                .get(&step_id)
+                .copied()
+                .unwrap_or(StepStatus::NotRun);
+
+            let status_icon = match status {
+                StepStatus::NotRun => "—",
+                StepStatus::Running => "⟳",
+                StepStatus::Done => "✓",
+            };
+            let status_color = match status {
+                StepStatus::NotRun => theme.sub_text_color(theme.background()).into_solid(),
+                StepStatus::Running => pathfinder_color::ColorU::new(230, 180, 50, 255),
+                StepStatus::Done => pathfinder_color::ColorU::new(80, 200, 100, 255),
+            };
+            let icon_text = Text::new(status_icon, font, 13.)
+                .with_color(status_color)
+                .finish();
+
+            let name_text = Text::new(step.name.clone(), font, 13.)
+                .with_color(theme.main_text_color(theme.background()).into_solid())
+                .finish();
+            let cmd_text = Text::new(step.command.clone(), font, 11.)
+                .with_color(theme.sub_text_color(theme.background()).into_solid())
+                .finish();
+            let label_col = Flex::column()
+                .with_child(name_text)
+                .with_child(cmd_text)
+                .with_spacing(2.)
+                .with_main_axis_size(MainAxisSize::Min)
+                .finish();
+
+            let run_state = {
+                let mut map = self.runbook_step_run_states.borrow_mut();
+                map.entry(step_id).or_insert_with(MouseStateHandle::default).clone()
+            };
+            let run_btn = if any_running {
+                Container::new(
+                    Text::new("▶", font, 11.)
+                        .with_color(pathfinder_color::ColorU::new(100, 200, 100, 60))
+                        .finish(),
+                )
+                .with_uniform_padding(4.)
+                .finish()
+            } else {
+                Hoverable::new(run_state, |_| {
+                    Text::new("▶", font, 11.)
+                        .with_color(pathfinder_color::ColorU::new(100, 200, 100, 200))
+                        .finish()
+                })
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ActionsPanelAction::RunStep(step_id))
+                })
+                .with_cursor(Cursor::PointingHand)
+                .finish()
+            };
+
+            let step_row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_child(icon_text)
+                .with_child(Box::new(Expanded::new(1., label_col)))
+                .with_child(run_btn)
+                .with_spacing(8.)
+                .finish();
+
+            steps_col = steps_col.with_child(
+                Container::new(step_row)
+                    .with_padding_left(10.)
+                    .with_padding_right(10.)
+                    .with_padding_top(6.)
+                    .with_padding_bottom(6.)
+                    .finish(),
+            );
+        }
+
+        Flex::column()
+            .with_child(header_row)
+            .with_child(Shrinkable::new(1.0, steps_col.finish()).finish())
+            .with_main_axis_size(MainAxisSize::Max)
             .finish()
     }
 
@@ -3053,6 +3603,19 @@ pub enum ActionsPanelAction {
     EditNamingRule(Uuid),
     DeleteNamingRule(Uuid),
     SaveNamingRule,
+    // ── Runbooks ──────────────────────────────────────────────────────────────
+    NewRunbook,
+    EditRunbook(Uuid),
+    DeleteRunbook(Uuid),
+    SaveRunbook,
+    AddRunbookStep,
+    RemoveRunbookStep(Uuid),
+    OpenRunner(Uuid),
+    CloseRunner,
+    RunStep(Uuid),
+    RunAllSteps,
+    ResetSteps,
+    SetStepStatus { step_id: Uuid, status: StepStatus },
 }
 
 // ── View impl ─────────────────────────────────────────────────────────────────
@@ -3087,6 +3650,10 @@ impl View for ActionsPanelView {
                 ActionsPanelTab::NamingRules => {
                     let rules = WarpConfig::as_ref(app).tab_naming_rules().to_vec();
                     self.render_naming_rules_tab(&rules, appearance)
+                }
+                ActionsPanelTab::Runbooks => {
+                    let runbooks = WarpConfig::as_ref(app).runbooks().to_vec();
+                    self.render_runbooks_tab(&runbooks, appearance)
                 }
             },
             PanelMode::EditAction(_) => self.render_action_editor(appearance),
@@ -3184,6 +3751,9 @@ impl warpui::TypedActionView for ActionsPanelView {
         match action {
             ActionsPanelAction::SetTab(tab) => {
                 self.naming_rule_form_open = false;
+                self.runbook_form_open = false;
+                self.running_runbook_id = None;
+                self.runbook_step_statuses.clear();
                 self.set_active_tab(*tab, ctx);
             }
             ActionsPanelAction::ClosePanel => {
@@ -3307,6 +3877,9 @@ impl warpui::TypedActionView for ActionsPanelView {
                 // Reset hotkey recording state.
                 self.hotkey_recording = false;
                 self.trigger_hotkey_recording = false;
+                // Close any open runbook form.
+                self.runbook_form_open = false;
+                self.edit_runbook_id = None;
                 ctx.notify();
             }
             ActionsPanelAction::EnterPaletteMode => {
@@ -3655,6 +4228,202 @@ impl warpui::TypedActionView for ActionsPanelView {
                 }
                 self.naming_rule_form_open = false;
                 self.edit_naming_rule_id = None;
+                ctx.notify();
+            }
+
+            // ── Runbooks ──────────────────────────────────────────────────────
+            ActionsPanelAction::NewRunbook => {
+                self.edit_runbook_id = None;
+                self.runbook_form_open = true;
+                self.runbook_step_editors.clear();
+                self.edit_runbook_name_editor
+                    .update(ctx, |e, ctx| e.set_buffer_text("", ctx));
+                ctx.notify();
+            }
+            ActionsPanelAction::EditRunbook(id) => {
+                use crate::user_config::WarpConfig;
+                let id = *id;
+                let config = WarpConfig::as_ref(ctx);
+                if let Some(rb) = config.runbooks().iter().find(|r| r.id == id).cloned() {
+                    drop(config);
+                    let name = rb.name.clone();
+                    self.edit_runbook_name_editor
+                        .update(ctx, |e, ctx| e.set_buffer_text_with_base_buffer(&name, ctx));
+                    self.runbook_step_editors.clear();
+                    for step in &rb.steps {
+                        let step_name = step.name.clone();
+                        let step_cmd = step.command.clone();
+                        let sid = step.id;
+                        let appearance = Appearance::as_ref(ctx);
+                        let font_size = appearance.ui_font_size();
+                        drop(appearance);
+                        let opts = SingleLineEditorOptions {
+                            text: TextOptions {
+                                font_size_override: Some(font_size),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        };
+                        let name_ed = ctx.add_view(|ctx| EditorView::single_line(opts.clone(), ctx));
+                        let cmd_ed = ctx.add_view(|ctx| EditorView::single_line(opts, ctx));
+                        name_ed.update(ctx, |e, ctx| e.set_buffer_text_with_base_buffer(&step_name, ctx));
+                        cmd_ed.update(ctx, |e, ctx| e.set_buffer_text_with_base_buffer(&step_cmd, ctx));
+                        self.runbook_step_editors.push((sid, name_ed, cmd_ed));
+                    }
+                    self.edit_runbook_id = Some(id);
+                    self.runbook_form_open = true;
+                    ctx.notify();
+                }
+            }
+            ActionsPanelAction::DeleteRunbook(id) => {
+                use crate::user_config::WarpConfig;
+                let id = *id;
+                let config = WarpConfig::as_ref(ctx);
+                let rb = config.runbooks().iter().find(|r| r.id == id).cloned();
+                drop(config);
+                if let Some(rb) = rb {
+                    let _ = crate::actions::storage::delete_runbook(&rb);
+                    WarpConfig::handle(ctx).update(ctx, |cfg, ctx| {
+                        cfg.remove_runbook(id, ctx);
+                    });
+                }
+                self.runbook_form_open = false;
+                self.edit_runbook_id = None;
+                ctx.notify();
+            }
+            ActionsPanelAction::AddRunbookStep => {
+                let appearance = Appearance::as_ref(ctx);
+                let font_size = appearance.ui_font_size();
+                drop(appearance);
+                let opts = SingleLineEditorOptions {
+                    text: TextOptions {
+                        font_size_override: Some(font_size),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let name_ed = ctx.add_view(|ctx| EditorView::single_line(opts.clone(), ctx));
+                let cmd_ed = ctx.add_view(|ctx| EditorView::single_line(opts, ctx));
+                self.runbook_step_editors.push((Uuid::new_v4(), name_ed, cmd_ed));
+                ctx.notify();
+            }
+            ActionsPanelAction::RemoveRunbookStep(step_id) => {
+                let step_id = *step_id;
+                self.runbook_step_editors.retain(|(id, _, _)| *id != step_id);
+                ctx.notify();
+            }
+            ActionsPanelAction::SaveRunbook => {
+                use crate::actions::model::{Runbook, RunbookStep};
+                use crate::user_config::WarpConfig;
+                let name = self
+                    .edit_runbook_name_editor
+                    .read(ctx, |e, ctx| e.buffer_text(ctx))
+                    .trim()
+                    .to_string();
+                if name.is_empty() {
+                    return;
+                }
+                let steps: Vec<RunbookStep> = self
+                    .runbook_step_editors
+                    .iter()
+                    .filter_map(|(sid, name_ed, cmd_ed)| {
+                        let step_name = name_ed
+                            .read(ctx, |e, ctx| e.buffer_text(ctx))
+                            .trim()
+                            .to_string();
+                        let step_cmd = cmd_ed
+                            .read(ctx, |e, ctx| e.buffer_text(ctx))
+                            .trim()
+                            .to_string();
+                        if step_name.is_empty() || step_cmd.is_empty() {
+                            return None;
+                        }
+                        Some(RunbookStep { id: *sid, name: step_name, command: step_cmd })
+                    })
+                    .collect();
+
+                let editing_id = self.edit_runbook_id;
+                WarpConfig::handle(ctx).update(ctx, |cfg, ctx| {
+                    if let Some(id) = editing_id {
+                        let existing = cfg.runbooks().iter().find(|r| r.id == id).cloned();
+                        if let Some(mut rb) = existing {
+                            rb.name = name.clone();
+                            rb.steps = steps.clone();
+                            let _ = crate::actions::storage::write_runbook(&rb);
+                            cfg.update_runbook(rb, ctx);
+                        }
+                    } else {
+                        let mut rb = Runbook {
+                            id: Uuid::new_v4(),
+                            name: name.clone(),
+                            steps: steps.clone(),
+                            source_path: None,
+                        };
+                        let _ = crate::actions::storage::write_runbook(&rb).map(|p| {
+                            rb.source_path = Some(p);
+                        });
+                        cfg.add_runbook(rb, ctx);
+                    }
+                });
+                self.runbook_form_open = false;
+                self.edit_runbook_id = None;
+                self.runbook_step_editors.clear();
+                ctx.notify();
+            }
+            ActionsPanelAction::OpenRunner(id) => {
+                self.running_runbook_id = Some(*id);
+                self.runbook_step_statuses.clear();
+                ctx.notify();
+            }
+            ActionsPanelAction::CloseRunner => {
+                self.running_runbook_id = None;
+                self.runbook_step_statuses.clear();
+                ctx.notify();
+            }
+            ActionsPanelAction::RunStep(step_id) => {
+                use crate::user_config::WarpConfig;
+                let step_id = *step_id;
+                let Some(rb_id) = self.running_runbook_id else { return; };
+                let config = WarpConfig::as_ref(ctx);
+                let cmd = config
+                    .runbooks()
+                    .iter()
+                    .find(|r| r.id == rb_id)
+                    .and_then(|r| r.steps.iter().find(|s| s.id == step_id))
+                    .map(|s| s.command.clone());
+                drop(config);
+                if let Some(cmd) = cmd {
+                    self.runbook_step_statuses.insert(step_id, StepStatus::Running);
+                    ctx.dispatch_typed_action(&WorkspaceAction::RunCommandInActiveTerminal(cmd));
+                    self.runbook_step_statuses.insert(step_id, StepStatus::Done);
+                }
+                ctx.notify();
+            }
+            ActionsPanelAction::RunAllSteps => {
+                use crate::user_config::WarpConfig;
+                let Some(rb_id) = self.running_runbook_id else { return; };
+                let config = WarpConfig::as_ref(ctx);
+                let steps: Vec<(Uuid, String)> = config
+                    .runbooks()
+                    .iter()
+                    .find(|r| r.id == rb_id)
+                    .map(|r| r.steps.iter().map(|s| (s.id, s.command.clone())).collect())
+                    .unwrap_or_default();
+                drop(config);
+                self.runbook_step_statuses.clear();
+                for (sid, cmd) in &steps {
+                    self.runbook_step_statuses.insert(*sid, StepStatus::Running);
+                    ctx.dispatch_typed_action(&WorkspaceAction::RunCommandInActiveTerminal(cmd.clone()));
+                    self.runbook_step_statuses.insert(*sid, StepStatus::Done);
+                }
+                ctx.notify();
+            }
+            ActionsPanelAction::ResetSteps => {
+                self.runbook_step_statuses.clear();
+                ctx.notify();
+            }
+            ActionsPanelAction::SetStepStatus { step_id, status } => {
+                self.runbook_step_statuses.insert(*step_id, *status);
                 ctx.notify();
             }
         }

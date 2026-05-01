@@ -277,6 +277,41 @@ impl TriggerHistory {
     }
 }
 
+// ── Runbooks ──────────────────────────────────────────────────────────────────
+
+/// A single executable step inside a [`Runbook`].
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct RunbookStep {
+    /// Stable identifier for this step.
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
+    /// Short, human-readable label shown in the runner view.
+    pub name: String,
+    /// The shell command sent to the active terminal when this step is run.
+    pub command: String,
+}
+
+/// An ordered, named list of shell-command steps that can be executed
+/// individually or sequentially from the Actions & Triggers panel.
+///
+/// Stored under `~/.warp/runbooks/<id>.toml`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Runbook {
+    /// Stable identifier for this runbook.
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
+    /// Human-readable name shown in the Runbooks tab.
+    pub name: String,
+    /// Ordered list of steps.
+    #[serde(default)]
+    pub steps: Vec<RunbookStep>,
+    /// Absolute path of the TOML file this runbook was loaded from.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
+}
+
+// ── Workspaces ────────────────────────────────────────────────────────────────
+
 /// A user-named snapshot of the current window layout (tabs, pane splits,
 /// shell working directories) that can be restored later.
 ///

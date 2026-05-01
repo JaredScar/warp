@@ -11,6 +11,7 @@ use repo_metadata::RepositoryUpdate;
 use warpui::{ModelContext, SingletonEntity};
 
 use crate::actions::model::{builtin_actions, Action, SavedWorkspace, Trigger};
+use crate::actions::storage::load_runbooks;
 use crate::features::FeatureFlag;
 use crate::launch_configs::launch_config::LaunchConfig;
 use crate::tab_configs::{TabConfig, TabConfigError};
@@ -26,8 +27,8 @@ use super::util::{
     parse_multi_workflow_dir_entry, parse_single_theme_dir_entry, parse_tab_config_dir_entry,
 };
 use super::{
-    actions_dir, launch_configs_dir, naming_rules_file, saved_workspaces_dir, tab_configs_dir,
-    themes_dir, triggers_dir, workflows_dir, TabNamingRule, WarpConfigUpdateEvent,
+    actions_dir, launch_configs_dir, naming_rules_file, runbooks_dir, saved_workspaces_dir,
+    tab_configs_dir, themes_dir, triggers_dir, workflows_dir, TabNamingRule, WarpConfigUpdateEvent,
     LAUNCH_CONFIG_COMMENT,
 };
 
@@ -65,9 +66,10 @@ impl super::WarpConfig {
                 let triggers = load_triggers(&triggers_dir());
                 let workspaces = load_saved_workspaces(&saved_workspaces_dir());
                 let naming_rules = load_naming_rules(&naming_rules_file());
-                (actions, triggers, workspaces, naming_rules)
+                let runbooks = load_runbooks(&runbooks_dir());
+                (actions, triggers, workspaces, naming_rules, runbooks)
             },
-            |me, (actions, triggers, workspaces, naming_rules), ctx| {
+            |me, (actions, triggers, workspaces, naming_rules, runbooks), ctx| {
                 // Prepend built-ins so they are always first and always present.
                 let mut all_actions = builtin_actions();
                 all_actions.extend(actions);
@@ -75,6 +77,7 @@ impl super::WarpConfig {
                 me.triggers = triggers;
                 me.saved_workspaces = workspaces;
                 me.tab_naming_rules = naming_rules;
+                me.runbooks = runbooks;
                 ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
             },
         );
@@ -179,6 +182,17 @@ impl super::WarpConfig {
                 |me, naming_rules, ctx| {
                     me.tab_naming_rules = naming_rules;
                     ctx.emit(WarpConfigUpdateEvent::TabNamingRules);
+                },
+            );
+        }
+
+        if repository_update_touches_prefix(update, &runbooks_dir()) {
+            let dir = runbooks_dir();
+            let _ = ctx.spawn(
+                async move { load_runbooks(&dir) },
+                |me, runbooks, ctx| {
+                    me.runbooks = runbooks;
+                    ctx.emit(WarpConfigUpdateEvent::Runbooks);
                 },
             );
         }

@@ -295,6 +295,8 @@ pub enum WorkspaceAction {
     ToggleActionsPanel,
     /// Run a single action by ID in the active terminal of the current tab.
     RunActionInActiveTerminal(Uuid),
+    /// Send a raw command string to the active terminal of the current tab.
+    RunCommandInActiveTerminal(String),
     /// Run a trigger by ID across its configured terminal targets (manual invocation).
     RunTrigger(Uuid),
     /// Run a trigger by ID triggered automatically by its cron schedule.
@@ -907,6 +909,7 @@ impl WorkspaceAction {
             | ToggleRightPanel
             | ToggleActionsPanel
             | RunActionInActiveTerminal(_)
+            | RunCommandInActiveTerminal(_)
             | RunTrigger(_)
             | RunTriggerScheduled(_)
             | StopTrigger
