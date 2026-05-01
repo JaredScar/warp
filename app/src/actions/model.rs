@@ -333,6 +333,22 @@ pub struct SavedWorkspace {
 /// A serialisable representation of one tab's pane layout for workspace
 /// save/restore.  Mirrors the fields of [`WindowSnapshot`] that are stable
 /// enough to round-trip through TOML.
+/// A persistent snapshot of a single tab group, saved as part of a workspace.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct WorkspaceGroupSnapshot {
+    /// Stable ID for this group within the workspace snapshot.
+    #[serde(default = "uuid::Uuid::new_v4")]
+    pub id: uuid::Uuid,
+    /// Display name of the group.
+    pub name: String,
+    /// Whether the group was collapsed when the workspace was saved.
+    #[serde(default)]
+    pub collapsed: bool,
+    /// RGBA color of the group accent (from `GROUP_COLOR_PALETTE`), stored as `[r, g, b, a]`.
+    #[serde(default)]
+    pub color: [u8; 4],
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct WorkspaceSnapshot {
     /// Ordered list of tab snapshots.
@@ -340,6 +356,9 @@ pub struct WorkspaceSnapshot {
     /// Index of the tab that was active at save time.
     #[serde(default)]
     pub active_tab_index: usize,
+    /// Tab groups defined at save time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<WorkspaceGroupSnapshot>,
 }
 
 /// Snapshot of a single tab sufficient for restore.
@@ -362,6 +381,9 @@ pub struct WorkspaceTabSnapshot {
     /// a regular terminal.  Restored via `add_ambient_agent_tab`.
     #[serde(default)]
     pub is_ambient_agent: bool,
+    /// The ID of the group this tab belonged to (references a `WorkspaceGroupSnapshot`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<uuid::Uuid>,
 }
 
 impl WorkspaceSnapshot {
@@ -409,6 +431,7 @@ impl WorkspaceSnapshot {
                     commands: vec![],
                     shell_launch_data: terminal.and_then(|t| t.shell_launch_data.clone()),
                     is_ambient_agent: ambient,
+                    group_id: None,
                 }
             })
             .collect();
@@ -416,6 +439,7 @@ impl WorkspaceSnapshot {
         WorkspaceSnapshot {
             tabs,
             active_tab_index: ws.active_tab_index,
+            groups: Vec::new(),
         }
     }
 }

@@ -21337,14 +21337,37 @@ impl TypedActionView for Workspace {
                 // so that any direct callers still compile.
             }
             SaveCurrentWorkspaceWithName(name) => {
-                use crate::actions::model::{SavedWorkspace, WorkspaceSnapshot};
+                use crate::actions::model::{
+                    SavedWorkspace, WorkspaceGroupSnapshot, WorkspaceSnapshot,
+                };
                 use crate::actions::storage;
                 use crate::user_config::WarpConfig;
                 let window_id = ctx.window_id();
                 let quake_mode =
                     quake_mode_window_id().map(|id| id == window_id).unwrap_or(false);
                 let window_snapshot = self.snapshot(window_id, quake_mode, ctx);
-                let ws_snapshot = WorkspaceSnapshot::from_window_snapshot(&window_snapshot);
+                let mut ws_snapshot =
+                    WorkspaceSnapshot::from_window_snapshot(&window_snapshot);
+
+                // Enrich each tab snapshot with its group_id from the live tab list.
+                for (idx, tab_snap) in ws_snapshot.tabs.iter_mut().enumerate() {
+                    if let Some(tab) = self.tabs.get(idx) {
+                        tab_snap.group_id = tab.group_id;
+                    }
+                }
+
+                // Capture all tab groups: name, color, and collapsed state.
+                ws_snapshot.groups = self
+                    .tab_groups
+                    .iter()
+                    .map(|g| WorkspaceGroupSnapshot {
+                        id: g.id,
+                        name: g.name.clone(),
+                        collapsed: g.collapsed,
+                        color: [g.color.r, g.color.g, g.color.b, g.color.a],
+                    })
+                    .collect();
+
                 let saved = SavedWorkspace {
                     id: uuid::Uuid::new_v4(),
                     name: name.clone(),
@@ -21397,47 +21420,88 @@ impl TypedActionView for Workspace {
                 drop(config);
                 if let Some(saved_ws) = workspaces.iter().find(|w| w.id == *workspace_id) {
                     log::info!(
-                        "Restoring workspace '{}' ({} tab(s))",
+                        "Restoring workspace '{}' ({} tab(s), {} group(s))",
                         saved_ws.name,
-                        saved_ws.snapshot.tabs.len()
+                        saved_ws.snapshot.tabs.len(),
+                        saved_ws.snapshot.groups.len(),
                     );
-                    for tab_snapshot in &saved_ws.snapshot.tabs {
+
+                    // The first index where newly-restored tabs will land.
+                    let base_tab_index = self.tabs.len();
+
+                    // Recreate groups, mapping snapshot IDs → new live IDs.
+                    let mut group_id_map: std::collections::HashMap<
+                        uuid::Uuid,
+                        uuid::Uuid,
+                    > = std::collections::HashMap::new();
+
+                    for group_snap in &saved_ws.snapshot.groups {
+                        let new_id = uuid::Uuid::new_v4();
+                        group_id_map.insert(group_snap.id, new_id);
+                        let color = pathfinder_color::ColorU {
+                            r: group_snap.color[0],
+                            g: group_snap.color[1],
+                            b: group_snap.color[2],
+                            a: group_snap.color[3],
+                        };
+                        self.tab_groups.push(crate::tab::TabGroup {
+                            id: new_id,
+                            name: group_snap.name.clone(),
+                            collapsed: group_snap.collapsed,
+                            color,
+                            header_mouse_state: Default::default(),
+                            rename_mouse_state: Default::default(),
+                        });
+                    }
+
+                    for (rel_idx, tab_snapshot) in
+                        saved_ws.snapshot.tabs.iter().enumerate()
+                    {
                         if tab_snapshot.is_ambient_agent {
                             self.add_ambient_agent_tab(ctx);
-                            continue;
+                        } else {
+                            let initial_directory = tab_snapshot
+                                .cwd
+                                .as_deref()
+                                .map(std::path::PathBuf::from)
+                                .filter(|p| p.is_dir());
+                            let custom_title = tab_snapshot.custom_title.clone();
+
+                            #[cfg(feature = "local_tty")]
+                            let shell: Option<AvailableShell> = tab_snapshot
+                                .shell_launch_data
+                                .as_ref()
+                                .and_then(|sld| {
+                                    use crate::terminal::available_shells::AvailableShells;
+                                    AvailableShells::handle(ctx).read(ctx, |model, _| {
+                                        model.get_from_shell_launch_data(sld)
+                                    })
+                                });
+                            #[cfg(not(feature = "local_tty"))]
+                            let shell: Option<AvailableShell> = None;
+
+                            self.add_tab_with_pane_layout(
+                                PanesLayout::SingleTerminal(Box::new(NewTerminalOptions {
+                                    initial_directory,
+                                    hide_homepage: true,
+                                    shell,
+                                    ..Default::default()
+                                })),
+                                std::sync::Arc::new(std::collections::HashMap::new()),
+                                custom_title,
+                                ctx,
+                            );
                         }
 
-                        let initial_directory = tab_snapshot
-                            .cwd
-                            .as_deref()
-                            .map(std::path::PathBuf::from)
-                            .filter(|p| p.is_dir());
-                        let custom_title = tab_snapshot.custom_title.clone();
-
-                        // Resolve the saved shell back to an AvailableShell so
-                        // the restored tab uses the same shell (bash, PowerShell, etc.)
-                        // as when the workspace was saved.
-                        #[cfg(feature = "local_tty")]
-                        let shell: Option<AvailableShell> =
-                            tab_snapshot.shell_launch_data.as_ref().and_then(|sld| {
-                                use crate::terminal::available_shells::AvailableShells;
-                                AvailableShells::handle(ctx)
-                                    .read(ctx, |model, _| model.get_from_shell_launch_data(sld))
-                            });
-                        #[cfg(not(feature = "local_tty"))]
-                        let shell: Option<AvailableShell> = None;
-
-                        self.add_tab_with_pane_layout(
-                            PanesLayout::SingleTerminal(Box::new(NewTerminalOptions {
-                                initial_directory,
-                                hide_homepage: true,
-                                shell,
-                                ..Default::default()
-                            })),
-                            std::sync::Arc::new(std::collections::HashMap::new()),
-                            custom_title,
-                            ctx,
-                        );
+                        // Assign the restored tab to its group if one was saved.
+                        if let Some(snap_group_id) = tab_snapshot.group_id {
+                            if let Some(&live_group_id) = group_id_map.get(&snap_group_id) {
+                                let tab_index = base_tab_index + rel_idx;
+                                if let Some(tab) = self.tabs.get_mut(tab_index) {
+                                    tab.group_id = Some(live_group_id);
+                                }
+                            }
+                        }
                     }
                 }
             }
