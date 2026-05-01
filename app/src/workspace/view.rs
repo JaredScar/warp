@@ -10405,6 +10405,14 @@ impl Workspace {
 
         let tab_data = self.tabs.remove(index);
 
+        // Auto-delete the group if this was its last tab.
+        if let Some(group_id) = tab_data.group_id {
+            let still_occupied = self.tabs.iter().any(|t| t.group_id == Some(group_id));
+            if !still_occupied {
+                self.tab_groups.retain(|g| g.id != group_id);
+            }
+        }
+
         if add_to_undo_stack {
             let handle = ctx.handle();
             UndoCloseStack::handle(ctx).update(ctx, |stack, ctx| {
@@ -20396,14 +20404,33 @@ impl TypedActionView for Workspace {
                 ctx.notify();
             }
             AddTabToGroup { tab_index, group_id } => {
+                // Remember the old group so we can clean it up if it becomes empty.
+                let old_group_id = self.tabs.get(*tab_index).and_then(|t| t.group_id);
                 if let Some(tab) = self.tabs.get_mut(*tab_index) {
                     tab.group_id = Some(*group_id);
+                }
+                // Auto-delete the old group if it now has no tabs.
+                if let Some(old_id) = old_group_id {
+                    if old_id != *group_id {
+                        let still_occupied = self.tabs.iter().any(|t| t.group_id == Some(old_id));
+                        if !still_occupied {
+                            self.tab_groups.retain(|g| g.id != old_id);
+                        }
+                    }
                 }
                 ctx.notify();
             }
             RemoveTabFromGroup(tab_index) => {
+                let old_group_id = self.tabs.get(*tab_index).and_then(|t| t.group_id);
                 if let Some(tab) = self.tabs.get_mut(*tab_index) {
                     tab.group_id = None;
+                }
+                // Auto-delete the group if it now has no tabs left.
+                if let Some(old_id) = old_group_id {
+                    let still_occupied = self.tabs.iter().any(|t| t.group_id == Some(old_id));
+                    if !still_occupied {
+                        self.tab_groups.retain(|g| g.id != old_id);
+                    }
                 }
                 ctx.notify();
             }

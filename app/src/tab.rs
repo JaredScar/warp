@@ -381,12 +381,14 @@ impl TabData {
                     .with_on_select_action(WorkspaceAction::RemoveTabFromGroup(index))
                     .into_item(),
             );
+        } else {
+            // Only offer "Add to New Group" when the tab is not already in a group.
+            menu_items.push(
+                MenuItemFields::new("Add to New Group")
+                    .with_on_select_action(WorkspaceAction::AddTabToNewGroup(index))
+                    .into_item(),
+            );
         }
-        menu_items.push(
-            MenuItemFields::new("Add to New Group")
-                .with_on_select_action(WorkspaceAction::AddTabToNewGroup(index))
-                .into_item(),
-        );
         // Add "Add to Group: <name>" entries for each existing group the tab is not already in.
         for group in tab_groups {
             if self.group_id == Some(group.id) {
