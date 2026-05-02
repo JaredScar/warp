@@ -54,15 +54,15 @@ jobs:
     name: Build Windows installer (${{ matrix.arch }})
     runs-on: windows-latest
     needs: prepare
+    # Skip the arm64 job unless the caller explicitly requested it.
+    if: >-
+      matrix.arch == 'x64' ||
+      (github.event_name == 'workflow_dispatch' && inputs.build_arm64 == true)
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        arch: ${{ fromJson(
-          (github.event_name == 'workflow_dispatch' && inputs.build_arm64 == true)
-          && '["x64","arm64"]'
-          || '["x64"]'
-        ) }}
+        arch: [x64, arm64]
 
     steps:
       - name: Checkout
