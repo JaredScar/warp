@@ -28,25 +28,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ─── Determine the version tag once, share it with build jobs ────────────────
+  # ─── Determine the version tag and arch list once, share with build jobs ──────
   prepare:
     name: Prepare release metadata
     runs-on: ubuntu-latest
     outputs:
       version_tag: ${{ steps.version.outputs.tag }}
+      # JSON array consumed by the build matrix via fromJson().
+      arch_matrix: ${{ steps.arch.outputs.matrix }}
     steps:
       - name: Resolve version tag
         id: version
         shell: bash
         run: |
           if [[ "${{ github.event_name }}" == "push" ]]; then
-            # Triggered by a tag push — use the tag name directly.
             echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           elif [[ -n "${{ inputs.version }}" ]]; then
             echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
           else
-            # Auto-generate a date-based tag when nothing was provided.
             echo "tag=v0.$(date -u +%Y.%m.%d)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve architecture list
+        id: arch
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.build_arm64 }}" == "true" ]]; then
+            echo 'matrix=["x64","arm64"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'matrix=["x64"]' >> "$GITHUB_OUTPUT"
           fi
 
   # ─── Windows build matrix ────────────────────────────────────────────────────
@@ -54,15 +64,11 @@ jobs:
     name: Build Windows installer (${{ matrix.arch }})
     runs-on: windows-latest
     needs: prepare
-    # Skip the arm64 job unless the caller explicitly requested it.
-    if: >-
-      matrix.arch == 'x64' ||
-      (github.event_name == 'workflow_dispatch' && inputs.build_arm64 == true)
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, arm64]
+        arch: ${{ fromJson(needs.prepare.outputs.arch_matrix) }}
 
     steps:
       - name: Checkout
