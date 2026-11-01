@@ -90,6 +90,22 @@ pub enum ActionsPanelTab {
     Workspaces,
     NamingRules,
     Runbooks,
+    Terminals,
+}
+
+/// One open terminal, shown on the sessions board.
+#[derive(Clone, Debug)]
+pub struct TerminalBoardRow {
+    pub tab_index: usize,
+    pub pane_index: usize,
+    pub terminal_id: Option<warpui::EntityId>,
+    pub title: String,
+    pub cwd: String,
+    pub branch: Option<String>,
+    pub running: bool,
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub is_current: bool,
 }
 
 // ── View struct ───────────────────────────────────────────────────────────────
@@ -100,7 +116,9 @@ pub enum StepStatus {
     #[default]
     NotRun,
     Running,
-    Done,
+    Passed,
+    /// `exit_code` is missing when the step was stopped before the shell reported one.
+    Failed { exit_code: Option<i32> },
 }
 
 pub struct ActionsPanelView {
@@ -248,6 +266,11 @@ pub struct ActionsPanelView {
     run_all_button_state: MouseStateHandle,
     reset_button_state: MouseStateHandle,
     runbook_back_button_state: MouseStateHandle,
+    runbook_stop_button_state: MouseStateHandle,
+    // ── terminals board ──
+    terminals_tab_mouse_state: MouseStateHandle,
+    terminal_rows: Vec<TerminalBoardRow>,
+    terminal_row_states: RefCell<HashMap<(usize, usize), MouseStateHandle>>,
 }
 
 impl ActionsPanelView {
@@ -449,7 +472,34 @@ impl ActionsPanelView {
             run_all_button_state: Default::default(),
             reset_button_state: Default::default(),
             runbook_back_button_state: Default::default(),
+            runbook_stop_button_state: Default::default(),
+            terminals_tab_mouse_state: Default::default(),
+            terminal_rows: Vec::new(),
+            terminal_row_states: Default::default(),
         }
+    }
+
+    pub fn set_runbook_step_status(
+        &mut self,
+        step_id: Uuid,
+        status: StepStatus,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.runbook_step_statuses.insert(step_id, status);
+        ctx.notify();
+    }
+
+    fn refresh_terminal_board(&mut self, ctx: &mut ViewContext<Self>) {
+        let window_id = ctx.window_id();
+        self.terminal_rows = ctx
+            .views_of_type::<crate::workspace::Workspace>(window_id)
+            .and_then(|workspaces| {
+                workspaces.into_iter().next().map(|workspace| {
+                    workspace.read(ctx, |workspace, app| workspace.terminal_board_rows(app))
+                })
+            })
+            .unwrap_or_default();
+        ctx.notify();
     }
 
     /// Seed the cron scheduler from the current trigger list.
@@ -459,6 +509,23 @@ impl ActionsPanelView {
         use crate::user_config::WarpConfig;
         let triggers = WarpConfig::as_ref(ctx).triggers().to_vec();
         self.cron_scheduler.reload_all(&triggers, ctx);
+        self.schedule_terminal_board_refresh(ctx);
+    }
+
+    fn schedule_terminal_board_refresh(&self, ctx: &mut ViewContext<Self>) {
+        let _ = ctx.spawn(
+            async move {
+                warpui::r#async::Timer::after(std::time::Duration::from_secs(1)).await;
+            },
+            |me, _, ctx| {
+                if me.active_tab == ActionsPanelTab::Terminals
+                    && matches!(me.panel_mode, PanelMode::List)
+                {
+                    me.refresh_terminal_board(ctx);
+                }
+                me.schedule_terminal_board_refresh(ctx);
+            },
+        );
     }
 
     pub fn set_active_tab(&mut self, tab: ActionsPanelTab, ctx: &mut ViewContext<Self>) {
@@ -669,6 +736,7 @@ impl ActionsPanelView {
                     .with_child(self.render_tab_button(appearance, "Workspaces", ActionsPanelTab::Workspaces))
                     .with_child(self.render_tab_button(appearance, "Rules", ActionsPanelTab::NamingRules))
                     .with_child(self.render_tab_button(appearance, "Runbooks", ActionsPanelTab::Runbooks))
+                    .with_child(self.render_tab_button(appearance, "Terminals", ActionsPanelTab::Terminals))
             .with_main_axis_size(MainAxisSize::Min)
             .finish();
                 // Also render the palette search icon to the right.
@@ -786,6 +854,7 @@ impl ActionsPanelView {
             ActionsPanelTab::Workspaces => self.workspaces_tab_mouse_state.clone(),
             ActionsPanelTab::NamingRules => self.naming_rules_tab_mouse_state.clone(),
             ActionsPanelTab::Runbooks => self.runbooks_tab_mouse_state.clone(),
+            ActionsPanelTab::Terminals => self.terminals_tab_mouse_state.clone(),
         };
         Hoverable::new(mouse_state, move |_| {
             Container::new(text)
@@ -2191,12 +2260,26 @@ impl ActionsPanelView {
         .with_cursor(Cursor::PointingHand)
         .finish();
 
+        let stop_btn = if any_running {
+            Hoverable::new(self.runbook_stop_button_state.clone(), |_| {
+                Text::new("Stop", font, 11.)
+                    .with_color(pathfinder_color::ColorU::new(220, 80, 80, 255))
+                    .finish()
+            })
+            .on_click(|ctx, _, _| ctx.dispatch_typed_action(&WorkspaceAction::StopTrigger))
+            .with_cursor(Cursor::PointingHand)
+            .finish()
+        } else {
+            Container::new(Text::new("", font, 11.).finish()).finish()
+        };
+
         let header_row = Container::new(
             Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_child(back_btn)
                 .with_child(Box::new(Expanded::new(1., title)))
+                .with_child(stop_btn)
                 .with_child(run_all_btn)
                 .with_child(reset_btn)
                 .with_spacing(8.)
@@ -2225,12 +2308,21 @@ impl ActionsPanelView {
             let status_icon = match status {
                 StepStatus::NotRun => "—",
                 StepStatus::Running => "⟳",
-                StepStatus::Done => "✓",
+                StepStatus::Passed => "✓",
+                StepStatus::Failed { .. } => "✗",
             };
             let status_color = match status {
                 StepStatus::NotRun => theme.sub_text_color(theme.background()).into_solid(),
                 StepStatus::Running => pathfinder_color::ColorU::new(230, 180, 50, 255),
-                StepStatus::Done => pathfinder_color::ColorU::new(80, 200, 100, 255),
+                StepStatus::Passed => pathfinder_color::ColorU::new(80, 200, 100, 255),
+                StepStatus::Failed { .. } => pathfinder_color::ColorU::new(220, 80, 80, 255),
+            };
+            let command_label = match status {
+                StepStatus::Failed { exit_code: Some(code) } => {
+                    format!("{}  ·  exit {code}", step.command)
+                }
+                StepStatus::Failed { exit_code: None } => format!("{}  ·  stopped", step.command),
+                _ => step.command.clone(),
             };
             let icon_text = Text::new(status_icon, font, 13.)
                 .with_color(status_color)
@@ -2239,7 +2331,7 @@ impl ActionsPanelView {
             let name_text = Text::new(step.name.clone(), font, 13.)
                 .with_color(theme.main_text_color(theme.background()).into_solid())
                 .finish();
-            let cmd_text = Text::new(step.command.clone(), font, 11.)
+            let cmd_text = Text::new(command_label, font, 11.)
                 .with_color(theme.sub_text_color(theme.background()).into_solid())
                 .finish();
             let label_col = Flex::column()
@@ -2298,6 +2390,112 @@ impl ActionsPanelView {
             .with_child(Shrinkable::new(1.0, steps_col.finish()).finish())
             .with_main_axis_size(MainAxisSize::Max)
             .finish()
+    }
+
+    fn render_terminals_tab(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+        if self.terminal_rows.is_empty() {
+            return Container::new(
+                Text::new("No terminals open", font, 13.)
+                    .with_color(theme.sub_text_color(theme.background()).into_solid())
+                    .finish(),
+            )
+            .with_uniform_padding(16.)
+            .finish();
+        }
+
+        let mut col = Flex::column().with_main_axis_size(MainAxisSize::Max);
+        for row in &self.terminal_rows {
+            col = col.with_child(self.render_terminal_row(row, appearance));
+        }
+        Shrinkable::new(1.0, col.finish()).finish()
+    }
+
+    fn render_terminal_row(
+        &self,
+        row: &TerminalBoardRow,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font = appearance.ui_font_family();
+        let main = theme.main_text_color(theme.background()).into_solid();
+        let sub = theme.sub_text_color(theme.background()).into_solid();
+        let status_color = if row.running {
+            pathfinder_color::ColorU::new(230, 180, 50, 255)
+        } else if matches!(row.exit_code, Some(code) if code != 0) {
+            pathfinder_color::ColorU::new(220, 80, 80, 255)
+        } else {
+            pathfinder_color::ColorU::new(80, 200, 100, 255)
+        };
+        let status_label = if row.command == "No shell" {
+            "No shell".to_string()
+        } else if row.running {
+            "Running".to_string()
+        } else if let Some(code) = row.exit_code {
+            format!("Idle · exit {code}")
+        } else {
+            "Idle".to_string()
+        };
+        let location = match &row.branch {
+            Some(branch) if !branch.is_empty() => format!("{}  ·  {}", row.cwd, branch),
+            _ => row.cwd.clone(),
+        };
+        let title = if row.is_current {
+            format!("● {}", row.title)
+        } else {
+            row.title.clone()
+        };
+        let command = row.command.clone();
+
+        let mouse_state = {
+            let mut map = self.terminal_row_states.borrow_mut();
+            map.entry((row.tab_index, row.pane_index))
+                .or_insert_with(MouseStateHandle::default)
+                .clone()
+        };
+        let tab_index = row.tab_index;
+        let terminal_id = row.terminal_id;
+        Hoverable::new(mouse_state, move |_| {
+            let body = Flex::column()
+                .with_child(
+                    Text::new(title.clone(), font, 13.)
+                        .with_style(Properties::default().weight(Weight::Medium))
+                        .with_color(main)
+                        .finish(),
+                )
+                .with_child(
+                    Text::new(location.clone(), font, 11.)
+                        .with_color(sub)
+                        .finish(),
+                )
+                .with_child(
+                    Text::new(status_label.clone(), font, 11.)
+                        .with_color(status_color)
+                        .finish(),
+                )
+                .with_child(
+                    Text::new(command.clone(), font, 11.)
+                        .with_color(sub)
+                        .finish(),
+                )
+                .with_spacing(2.)
+                .finish();
+            Container::new(body)
+                .with_padding_left(10.)
+                .with_padding_right(10.)
+                .with_padding_top(8.)
+                .with_padding_bottom(8.)
+                .finish()
+        })
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::FocusTerminal {
+                tab_index,
+                terminal_id,
+            });
+        })
+        .with_cursor(Cursor::PointingHand)
+        .finish()
     }
 
     fn render_action_row(&self, action: &Action, appearance: &Appearance) -> Box<dyn Element> {
@@ -3992,6 +4190,7 @@ impl View for ActionsPanelView {
                     let runbooks = WarpConfig::as_ref(app).runbooks().to_vec();
                     self.render_runbooks_tab(&runbooks, appearance)
                 }
+                ActionsPanelTab::Terminals => self.render_terminals_tab(appearance),
             },
             PanelMode::EditAction(_) => self.render_action_editor(appearance),
             PanelMode::EditTrigger(_) => self.render_trigger_editor(&actions, appearance),
@@ -4090,9 +4289,10 @@ impl warpui::TypedActionView for ActionsPanelView {
                 self.naming_rule_form_open = false;
                 self.color_rule_form_open = false;
                 self.runbook_form_open = false;
-                self.running_runbook_id = None;
-                self.runbook_step_statuses.clear();
                 self.set_active_tab(*tab, ctx);
+                if *tab == ActionsPanelTab::Terminals {
+                    self.refresh_terminal_board(ctx);
+                }
             }
             ActionsPanelAction::ClosePanel => {
                 ctx.dispatch_typed_action(&WorkspaceAction::ToggleActionsPanel);
@@ -4799,13 +4999,14 @@ impl warpui::TypedActionView for ActionsPanelView {
                     .map(|s| s.command.clone());
                 drop(config);
                 if let Some(cmd) = cmd {
-                    self.runbook_step_statuses.insert(step_id, StepStatus::Running);
-                    ctx.dispatch_typed_action(&WorkspaceAction::RunCommandInActiveTerminal(cmd));
-                    self.runbook_step_statuses.insert(step_id, StepStatus::Done);
+                    ctx.dispatch_typed_action(&WorkspaceAction::RunRunbookSteps(vec![(
+                        step_id, cmd,
+                    )]));
                 }
                 ctx.notify();
             }
             ActionsPanelAction::RunAllSteps => {
+                use crate::actions::runner::{plan_run_all, ListedStep, RunAllPlan};
                 use crate::user_config::WarpConfig;
                 let Some(rb_id) = self.running_runbook_id else { return; };
                 let config = WarpConfig::as_ref(ctx);
@@ -4816,19 +5017,28 @@ impl warpui::TypedActionView for ActionsPanelView {
                     .map(|r| r.steps.iter().map(|s| (s.id, s.command.clone())).collect())
                     .unwrap_or_default();
                 drop(config);
-                self.runbook_step_statuses.clear();
-                let commands: Vec<String> = steps.iter().map(|(_, cmd)| cmd.clone()).collect();
-                for (sid, _) in &steps {
-                    self.runbook_step_statuses.insert(*sid, StepStatus::Running);
+                let listed: Vec<ListedStep> = steps
+                    .iter()
+                    .map(|(id, _)| match self.runbook_step_statuses.get(id).copied() {
+                        Some(StepStatus::Running) => ListedStep::Running,
+                        Some(StepStatus::Passed) | Some(StepStatus::Failed { .. }) => {
+                            ListedStep::Settled
+                        }
+                        Some(StepStatus::NotRun) | None => ListedStep::NotRun,
+                    })
+                    .collect();
+                let to_run = match plan_run_all(&listed) {
+                    RunAllPlan::Wait => return,
+                    RunAllPlan::Restart => {
+                        self.runbook_step_statuses.clear();
+                        steps
+                    }
+                    RunAllPlan::From(index) => steps.into_iter().skip(index).collect(),
+                };
+                if to_run.is_empty() {
+                    return;
                 }
-                if !commands.is_empty() {
-                    ctx.dispatch_typed_action(&WorkspaceAction::RunCommandsInActiveTerminal(
-                        commands,
-                    ));
-                }
-                for (sid, _) in &steps {
-                    self.runbook_step_statuses.insert(*sid, StepStatus::Done);
-                }
+                ctx.dispatch_typed_action(&WorkspaceAction::RunRunbookSteps(to_run));
                 ctx.notify();
             }
             ActionsPanelAction::ResetSteps => {

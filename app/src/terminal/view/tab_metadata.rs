@@ -1,7 +1,37 @@
 use crate::context_chips::display_chip::GitLineChanges;
 use crate::context_chips::{git_line_changes_from_chips, ContextChipKind};
+use crate::terminal::model::terminal_model::TerminalModel;
 use crate::terminal::TerminalView;
 use warpui::AppContext;
+
+/// Snapshot of one terminal for the sessions board.
+pub struct TerminalLiveStatus {
+    pub running: bool,
+    pub command: Option<String>,
+    pub exit_code: Option<i32>,
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
+}
+
+fn latest_finished_user_command_from(model: &TerminalModel) -> Option<(String, i32)> {
+    model.block_list().blocks().iter().rev().find_map(|block| {
+        if block.is_done()
+            && !block.is_background()
+            && !block.is_static()
+            && !block.is_in_band_command_block()
+            && (block.bootstrap_stage().is_done() || block.is_restored())
+        {
+            let cmd = block.command_to_string();
+            if cmd.trim().is_empty() {
+                None
+            } else {
+                Some((cmd, block.exit_code().value()))
+            }
+        } else {
+            None
+        }
+    })
+}
 
 impl TerminalView {
     fn prompt_chip_value(&self, chip_kind: &ContextChipKind, ctx: &AppContext) -> Option<String> {
@@ -47,6 +77,54 @@ impl TerminalView {
                     None
                 }
             })
+    }
+
+    /// Exit code of the most recent finished user command, if one exists.
+    pub fn latest_user_exit_code(&self) -> Option<i32> {
+        self.latest_finished_user_command().map(|(_, exit_code)| exit_code)
+    }
+
+    /// Whether a command is executing, the command text to show, and the last
+    /// exit code when the shell is idle.
+    pub fn live_status(&self, ctx: &AppContext) -> TerminalLiveStatus {
+        let cwd = self.display_working_directory(ctx);
+        let branch = self.current_git_branch(ctx);
+        let model = self.model.lock();
+        let (running, running_command) = {
+            let active = model.block_list().active_block();
+            let running = active.is_executing();
+            let running_command = if running {
+                let cmd = active.command_to_string();
+                let cmd = cmd.trim();
+                if cmd.is_empty() {
+                    None
+                } else {
+                    Some(cmd.to_string())
+                }
+            } else {
+                None
+            };
+            (running, running_command)
+        };
+        let finished = latest_finished_user_command_from(&model);
+        let command = running_command.or_else(|| finished.as_ref().map(|(cmd, _)| cmd.clone()));
+        let exit_code = if running {
+            None
+        } else {
+            finished.map(|(_, exit_code)| exit_code)
+        };
+        TerminalLiveStatus {
+            running,
+            command,
+            exit_code,
+            cwd,
+            branch,
+        }
+    }
+
+    fn latest_finished_user_command(&self) -> Option<(String, i32)> {
+        let model = self.model.lock();
+        latest_finished_user_command_from(&model)
     }
 
     pub fn last_completed_command_text(&self) -> Option<String> {

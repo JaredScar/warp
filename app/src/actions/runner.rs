@@ -31,9 +31,51 @@ pub enum TriggerQueueItem {
         /// The shell command to execute.
         cmd: String,
         /// Max seconds to wait before advancing.  `None` means use the
-        /// global default (5 s).
+        /// global default (5 s). Ignored when `wait_until_exit` is set.
         timeout_secs: Option<u64>,
+        /// Runbook step this command belongs to, if any.
+        runbook_step_id: Option<uuid::Uuid>,
+        /// Wait for the command to exit instead of moving on at the timeout.
+        /// Runbook steps set this so a slow command is not marked finished early.
+        wait_until_exit: bool,
     },
+}
+
+/// How far a Run All should proceed, based on the steps' current outcomes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListedStep {
+    NotRun,
+    Running,
+    Settled,
+}
+
+/// What Run All should do with the current step outcomes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunAllPlan {
+    /// A step is still running, or there is nothing to run.
+    Wait,
+    /// Every step has already finished. Clear them and start over.
+    Restart,
+    /// Run from this index through the end. Earlier steps keep their results.
+    From(usize),
+}
+
+pub fn plan_run_all(steps: &[ListedStep]) -> RunAllPlan {
+    if steps.is_empty() || steps.iter().any(|step| *step == ListedStep::Running) {
+        return RunAllPlan::Wait;
+    }
+    if let Some(index) = steps
+        .iter()
+        .position(|step| *step == ListedStep::NotRun)
+    {
+        return RunAllPlan::From(index);
+    }
+    RunAllPlan::Restart
+}
+
+/// A missing exit code halts the run. Only `0` counts as passed.
+pub fn runbook_step_failed(exit_code: Option<i32>) -> bool {
+    exit_code != Some(0)
 }
 
 /// Split a command field into individually submitted lines.
@@ -88,6 +130,8 @@ impl TriggerRunner {
                     queue.push_back(TriggerQueueItem::SendCommand {
                         cmd: line,
                         timeout_secs: action.timeout_secs,
+                        runbook_step_id: None,
+                        wait_until_exit: false,
                     });
                 }
             }
@@ -95,6 +139,7 @@ impl TriggerRunner {
 
         workspace.trigger_queue = queue;
         workspace.trigger_running_name = Some(trigger.name.clone());
+        workspace.trigger_show_overlay = true;
         workspace.advance_trigger_queue(ctx);
     }
 
@@ -125,5 +170,44 @@ mod tests {
             split_command_lines("dotnet run"),
             vec!["dotnet run".to_string()]
         );
+    }
+
+    #[test]
+    fn run_all_starts_at_the_first_step_that_has_not_run() {
+        use super::{plan_run_all, ListedStep, RunAllPlan};
+        assert_eq!(
+            plan_run_all(&[
+                ListedStep::Settled,
+                ListedStep::NotRun,
+                ListedStep::NotRun,
+            ]),
+            RunAllPlan::From(1)
+        );
+    }
+
+    #[test]
+    fn run_all_restarts_when_every_step_has_finished() {
+        use super::{plan_run_all, ListedStep, RunAllPlan};
+        assert_eq!(
+            plan_run_all(&[ListedStep::Settled, ListedStep::Settled]),
+            RunAllPlan::Restart
+        );
+    }
+
+    #[test]
+    fn run_all_waits_while_a_step_is_running() {
+        use super::{plan_run_all, ListedStep, RunAllPlan};
+        assert_eq!(
+            plan_run_all(&[ListedStep::Settled, ListedStep::Running]),
+            RunAllPlan::Wait
+        );
+    }
+
+    #[test]
+    fn only_a_zero_exit_code_passes() {
+        use super::runbook_step_failed;
+        assert!(!runbook_step_failed(Some(0)));
+        assert!(runbook_step_failed(Some(1)));
+        assert!(runbook_step_failed(None));
     }
 }

@@ -81,7 +81,7 @@ RunCommandInActiveTerminal(cmd) => {
 
 Sequential "Run All" uses `TriggerQueueItem::SendCommand` items pushed onto `self.trigger_queue`, with `trigger_running_name` set to the runbook name (shows the running indicator). Each step uses a short default timeout. Step status in the panel is updated via a new `ActionsPanelAction::SetRunbookStepStatus { runbook_id, step_id, status }` dispatched from the panel when execution starts and from a workspace subscription when `PendingCommandCompleted` fires.
 
-**Simpler MVP approach for step status:** Because wiring exit codes requires deeper terminal event integration, the MVP marks a step ✓ as soon as `PendingCommandCompleted` fires (command left the input box), rather than checking the exit code. Sequential execution advances unconditionally. Exit-code-based pass/fail is deferred to a follow-up.
+Runbook steps use `WorkspaceAction::RunRunbookSteps`. Each step is one queue item with `wait_until_exit`, so a slow command stays ⟳ until the shell reports an exit. Exit code `0` marks the step ✓ and the next step starts. Any other code, or a missing code, marks the step ✗ and clears the rest of the queue. Stop marks the in-flight step ✗ without an exit code. The full-window trigger overlay stays off for runbooks; the runner view shows Stop.
 
 ### 6. Panel (`app/src/actions/panel.rs`)
 
@@ -155,6 +155,9 @@ Follow the exact same pattern as `NamingRules`: add `Runbooks =>` arms in the ta
 
 ## Follow-ups
 
-- Exit-code-based pass/fail gates (requires terminal exit-code event plumbing).
 - Step reordering via drag handles.
 - Runbook import/export.
+
+## Terminals board
+
+The Actions panel has a Terminals tab. It lists every terminal pane in the window: tab title, working directory, git branch, whether a command is running, the command text, and the last exit code when the shell is idle. The row for the focused pane is marked. Clicking a row activates that tab and focuses that pane. The list refreshes once a second while the tab is open.

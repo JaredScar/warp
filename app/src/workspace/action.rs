@@ -301,6 +301,13 @@ pub enum WorkspaceAction {
     RunCommandInActiveTerminal(String),
     /// Run each command in the active terminal, pressing Enter after every one.
     RunCommandsInActiveTerminal(Vec<String>),
+    /// Run runbook steps in order. Each step waits for its exit code.
+    RunRunbookSteps(Vec<(Uuid, String)>),
+    /// Bring a terminal pane to the front from the sessions board.
+    FocusTerminal {
+        tab_index: usize,
+        terminal_id: Option<warpui::EntityId>,
+    },
     /// Run a trigger by ID across its configured terminal targets (manual invocation).
     RunTrigger(Uuid),
     /// Run a trigger by ID triggered automatically by its cron schedule.
@@ -916,6 +923,8 @@ impl WorkspaceAction {
             | RunActionInActiveTerminal(_)
             | RunCommandInActiveTerminal(_)
             | RunCommandsInActiveTerminal(_)
+            | RunRunbookSteps(_)
+            | FocusTerminal { .. }
             | RunTrigger(_)
             | RunTriggerScheduled(_)
             | StopTrigger

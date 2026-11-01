@@ -49,7 +49,7 @@ Runbook Mode lets users create named, step-by-step runbooks — ordered lists of
 21. Clicking an individual **▶ Run** button runs only that step; it does not affect other steps' statuses.
 22. After any run (individual or sequential), the step's status updates to ✓ or ✗ based on exit code.
 23. A **Reset** button in the runner view header resets all step statuses back to — (not run) without running anything.
-24. Status indicators are purely in-memory and not persisted to disk — reopening the panel or switching tabs resets all step statuses.
+24. Status indicators are purely in-memory and not persisted to disk. Switching to another tab in the panel keeps them, so a run can be checked again from the runner. Closing the runner with Back does not clear them; Reset does.
 
 ### Deleting a runbook
 
@@ -67,6 +67,16 @@ Runbook Mode lets users create named, step-by-step runbooks — ordered lists of
 
 31. If the active terminal has no running shell when **▶ Run** or **▶ Run All** is clicked, the command is dispatched the same way as a normal action — no special error is shown in the panel.
 32. If the user switches away from the Runbooks tab while a run is in progress, execution continues in the background; step statuses update when the user returns to the tab.
-33. If the user closes and reopens the Actions panel while a run is in progress, the in-progress state is lost (statuses reset to —). MVP does not persist run state.
+33. Hiding the Actions panel does not reset an in-progress run. Statuses live with the panel view and are not written to disk.
 34. Runbook names are not required to be unique; two runbooks may share the same name.
 35. A runbook with zero steps can be saved but the **▶ Run All** button is disabled (nothing to run).
+36. While a step is ⟳, the runner shows **Stop**. Stop leaves that step as ✗ and does not start later steps.
+37. **▶ Run All** starts at the first step that has not run. If every step is already ✓ or ✗, Run All clears those results and starts from the first step.
+38. A non-zero exit code is ✗ and later steps in that Run All do not start. Exit code 0 is ✓.
+
+### Terminals
+
+39. The panel has a **Terminals** tab that lists every terminal pane in the window on one screen.
+40. Each row shows the tab title, working directory, git branch when one is known, whether a command is running, the command text, and the last exit code when the shell is idle.
+41. The focused pane is marked. Clicking a row switches to that tab and focuses that pane.
+42. The list refreshes about once a second while the tab is visible. A tab with no shell shows "No shell".

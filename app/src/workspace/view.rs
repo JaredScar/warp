@@ -1070,6 +1070,13 @@ pub struct Workspace {
     trigger_subscribed_terminal_id: Option<warpui::EntityId>,
     /// Bumped every time a command wait is armed so older timers no-op.
     trigger_wait_generation: u64,
+    /// When set, the full-window overlay is shown for this run. Runbooks
+    /// keep the queue without covering the terminal.
+    pub(crate) trigger_show_overlay: bool,
+    /// The in-flight command should not advance on the fallback timer.
+    trigger_wait_until_exit: bool,
+    /// Runbook step whose command is currently in the terminal.
+    trigger_active_runbook_step: Option<uuid::Uuid>,
     /// Named, collapsible tab groups.  Indexed by `TabData::group_id`.
     tab_groups: Vec<crate::tab::TabGroup>,
     /// The id of the tab group currently being renamed inline in the sidebar, if any.
@@ -1440,7 +1447,19 @@ impl Workspace {
                 return;
             }
             if me.trigger_queue_waiting {
+                let unsent = me.trigger_active_terminal.as_ref().is_some_and(|terminal| {
+                    terminal.read(ctx, |term, app| term.has_unsent_pending_command(app))
+                });
+                // This completion belongs to a command that was already
+                // running. The queued command is still sitting in the input.
+                if unsent {
+                    return;
+                }
+                let halt = me.finish_active_runbook_step(ctx);
                 me.trigger_queue_waiting = false;
+                if halt {
+                    me.trigger_queue.clear();
+                }
                 me.advance_trigger_queue(ctx);
             }
         });
@@ -1497,6 +1516,9 @@ impl Workspace {
         });
         if unsent {
             self.arm_trigger_timeout(terminal_id, generation, 1, full_timeout_secs, true, ctx);
+            return;
+        }
+        if self.trigger_wait_until_exit {
             return;
         }
         if polling {
@@ -1567,15 +1589,148 @@ impl Workspace {
         self.trigger_queue = commands
             .into_iter()
             .map(|(cmd, timeout_secs)| {
-                crate::actions::runner::TriggerQueueItem::SendCommand { cmd, timeout_secs }
+                crate::actions::runner::TriggerQueueItem::SendCommand {
+                    cmd,
+                    timeout_secs,
+                    runbook_step_id: None,
+                    wait_until_exit: false,
+                }
             })
             .collect();
         self.trigger_running_name = Some(name);
+        self.trigger_show_overlay = true;
         self.trigger_running_id = None;
         self.trigger_run_start = None;
         self.trigger_stale_completions = 0;
         self.trigger_wait_generation = self.trigger_wait_generation.wrapping_add(1);
         self.advance_trigger_queue(ctx);
+    }
+
+    fn start_runbook_steps(
+        &mut self,
+        steps: Vec<(uuid::Uuid, String)>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.trigger_running_name.is_some() || steps.is_empty() {
+            return;
+        }
+        let Some(terminal) = self
+            .active_tab_pane_group()
+            .read(ctx, |pg, app| pg.active_session_view(app))
+        else {
+            return;
+        };
+        self.subscribe_trigger_terminal(&terminal, ctx);
+        self.trigger_active_terminal = Some(terminal.clone());
+        self.trigger_active_terminal_id = Some(terminal.id());
+        self.trigger_queue = steps
+            .into_iter()
+            .map(|(step_id, cmd)| {
+                crate::actions::runner::TriggerQueueItem::SendCommand {
+                    cmd,
+                    timeout_secs: None,
+                    runbook_step_id: Some(step_id),
+                    wait_until_exit: true,
+                }
+            })
+            .collect();
+        self.trigger_running_name = Some("Runbook".to_string());
+        self.trigger_show_overlay = false;
+        self.trigger_running_id = None;
+        self.trigger_run_start = None;
+        self.trigger_stale_completions = 0;
+        self.trigger_wait_until_exit = true;
+        self.trigger_wait_generation = self.trigger_wait_generation.wrapping_add(1);
+        self.advance_trigger_queue(ctx);
+    }
+
+    /// Record the exit code of the runbook step that just finished.
+    /// Returns true when the rest of the run should stop.
+    fn finish_active_runbook_step(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        use crate::actions::panel::StepStatus;
+        use crate::actions::runner::runbook_step_failed;
+
+        let Some(step_id) = self.trigger_active_runbook_step.take() else {
+            return false;
+        };
+        let exit_code = self.trigger_active_terminal.as_ref().and_then(|terminal| {
+            terminal.read(ctx, |term, _| term.latest_user_exit_code())
+        });
+        let failed = runbook_step_failed(exit_code);
+        let status = if failed {
+            StepStatus::Failed { exit_code }
+        } else {
+            StepStatus::Passed
+        };
+        self.actions_panel_view.update(ctx, |panel, ctx| {
+            panel.set_runbook_step_status(step_id, status, ctx);
+        });
+        failed
+    }
+
+    /// One row per terminal pane, across every tab.
+    pub fn terminal_board_rows(&self, ctx: &AppContext) -> Vec<crate::actions::panel::TerminalBoardRow> {
+        let mut rows = Vec::new();
+        for (tab_index, tab) in self.tabs.iter().enumerate() {
+            let group = &tab.pane_group;
+            let tab_title = group.read(ctx, |pg, app| {
+                let title = pg.display_title(app);
+                if title.trim().is_empty() {
+                    format!("Tab {}", tab_index + 1)
+                } else {
+                    title
+                }
+            });
+            let terminals = group.read(ctx, |pg, app| pg.terminal_views(app));
+            let active_id = group.read(ctx, |pg, app| {
+                pg.active_session_view(app).map(|view| view.id())
+            });
+            if terminals.is_empty() {
+                rows.push(crate::actions::panel::TerminalBoardRow {
+                    tab_index,
+                    pane_index: 0,
+                    terminal_id: None,
+                    title: tab_title,
+                    cwd: "—".to_string(),
+                    branch: None,
+                    running: false,
+                    command: "No shell".to_string(),
+                    exit_code: None,
+                    is_current: tab_index == self.active_tab_index,
+                });
+                continue;
+            }
+            let pane_count = terminals.len();
+            for (pane_index, terminal) in terminals.iter().enumerate() {
+                let terminal_id = terminal.id();
+                let live = terminal.read(ctx, |view, app| view.live_status(app));
+                let title = if pane_count > 1 {
+                    format!("{tab_title} · {}", pane_index + 1)
+                } else {
+                    tab_title.clone()
+                };
+                rows.push(crate::actions::panel::TerminalBoardRow {
+                    tab_index,
+                    pane_index,
+                    terminal_id: Some(terminal_id),
+                    title,
+                    cwd: live.cwd.unwrap_or_else(|| "—".to_string()),
+                    branch: live.branch,
+                    running: live.running,
+                    command: live.command.unwrap_or_else(|| {
+                        if live.running {
+                            "Running".to_string()
+                        } else {
+                            "Idle".to_string()
+                        }
+                    }),
+                    exit_code: live.exit_code,
+                    is_current: tab_index == self.active_tab_index
+                        && Some(terminal_id) == active_id,
+                });
+            }
+        }
+        rows
     }
 
     /// Append a [`TriggerRunRecord`] to the trigger's on-disk history file.
@@ -1628,6 +1783,9 @@ impl Workspace {
                 self.trigger_active_terminal_id = None;
                 self.trigger_queue_waiting = false;
                 self.trigger_running_name = None;
+                self.trigger_show_overlay = false;
+                self.trigger_wait_until_exit = false;
+                self.trigger_active_runbook_step = None;
                 self.trigger_stale_completions = 0;
                 // Write a success history record when the run finishes normally.
                 self.record_trigger_run(
@@ -1660,13 +1818,29 @@ impl Workspace {
                         // Fall through the loop to consume the first command.
                     }
                 }
-                TriggerQueueItem::SendCommand { cmd, timeout_secs } => {
+                TriggerQueueItem::SendCommand {
+                    cmd,
+                    timeout_secs,
+                    runbook_step_id,
+                    wait_until_exit,
+                } => {
                     if let Some(terminal) = self.trigger_active_terminal.clone() {
                         let terminal_id = terminal.id();
                         self.trigger_wait_generation =
                             self.trigger_wait_generation.wrapping_add(1);
                         let generation = self.trigger_wait_generation;
                         self.trigger_queue_waiting = true;
+                        self.trigger_wait_until_exit = wait_until_exit;
+                        self.trigger_active_runbook_step = runbook_step_id;
+                        if let Some(step_id) = runbook_step_id {
+                            self.actions_panel_view.update(ctx, |panel, ctx| {
+                                panel.set_runbook_step_status(
+                                    step_id,
+                                    crate::actions::panel::StepStatus::Running,
+                                    ctx,
+                                );
+                            });
+                        }
                         let unsent = terminal.update(ctx, |t, ctx| {
                             t.execute_command_or_set_pending(&cmd, ctx);
                             t.has_unsent_pending_command(ctx)
@@ -1684,7 +1858,7 @@ impl Workspace {
                                 true,
                                 ctx,
                             );
-                        } else {
+                        } else if !wait_until_exit {
                             self.arm_trigger_timeout(
                                 terminal_id,
                                 generation,
@@ -3559,6 +3733,9 @@ impl Workspace {
             trigger_stale_completions: 0,
             trigger_subscribed_terminal_id: None,
             trigger_wait_generation: 0,
+            trigger_show_overlay: false,
+            trigger_wait_until_exit: false,
+            trigger_active_runbook_step: None,
             tab_groups: Vec::new(),
             renaming_tab_group_id: None,
             tab_group_rename_editor: Self::tab_group_rename_editor(ctx),
@@ -21593,6 +21770,21 @@ impl TypedActionView for Workspace {
                     .collect();
                 self.run_command_lines("Commands".to_string(), lines, ctx);
             }
+            RunRunbookSteps(steps) => {
+                self.start_runbook_steps(steps.clone(), ctx);
+            }
+            FocusTerminal {
+                tab_index,
+                terminal_id,
+            } => {
+                self.activate_tab(*tab_index, ctx);
+                if let Some(terminal_id) = *terminal_id {
+                    let group = self.active_tab_pane_group().clone();
+                    group.update(ctx, |group, ctx| {
+                        group.focus_terminal_view(terminal_id, ctx);
+                    });
+                }
+            }
             RunCommandInActiveTerminal(cmd) => {
                 let cmd = cmd.clone();
                 if let Some(terminal_handle) = self
@@ -21647,11 +21839,22 @@ impl TypedActionView for Workspace {
                 }
             }
             StopTrigger => {
+                if let Some(step_id) = self.trigger_active_runbook_step.take() {
+                    self.actions_panel_view.update(ctx, |panel, ctx| {
+                        panel.set_runbook_step_status(
+                            step_id,
+                            crate::actions::panel::StepStatus::Failed { exit_code: None },
+                            ctx,
+                        );
+                    });
+                }
                 self.trigger_queue.clear();
                 self.trigger_active_terminal = None;
                 self.trigger_active_terminal_id = None;
                 self.trigger_queue_waiting = false;
                 self.trigger_stale_completions = 0;
+                self.trigger_wait_until_exit = false;
+                self.trigger_show_overlay = false;
                 self.trigger_wait_generation = self.trigger_wait_generation.wrapping_add(1);
                 self.trigger_running_name = None;
                 self.record_trigger_run(
@@ -23749,7 +23952,7 @@ impl View for Workspace {
         );
 
         // Trigger-running overlay: blocks all interaction and shows a stop button.
-        if self.trigger_running_name.is_some() {
+        if self.trigger_running_name.is_some() && self.trigger_show_overlay {
             stack.add_child(self.render_trigger_running_overlay(appearance));
         }
 
