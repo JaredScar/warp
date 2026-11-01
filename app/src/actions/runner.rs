@@ -6,8 +6,8 @@ use crate::workspace::Workspace;
 use crate::WorkspaceAction;
 
 use super::model::{
-    is_builtin_action, Action, Trigger,
-    BUILTIN_CLOSE_ALL_TERMINALS_ID, BUILTIN_KILL_ALL_PROCESSES_ID,
+    is_builtin_action, Action, Trigger, BUILTIN_CLOSE_ALL_TERMINALS_ID,
+    BUILTIN_KILL_ALL_PROCESSES_ID,
 };
 
 /// A single step in the sequential trigger execution queue.
@@ -34,6 +34,20 @@ pub enum TriggerQueueItem {
         /// global default (5 s).
         timeout_secs: Option<u64>,
     },
+}
+
+/// Split a command field into individually submitted lines.
+///
+/// Each line is executed with its own Enter. A newline inside one PTY write
+/// is pasted as text when bracketed paste is enabled, so `dotnet restore`
+/// and `dotnet run` would otherwise stay on the same line.
+pub fn split_command_lines(command: &str) -> Vec<String> {
+    command
+        .split('\n')
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 pub struct TriggerRunner;
@@ -70,9 +84,9 @@ impl TriggerRunner {
                 tab_name: action.tab_name.clone(),
             });
             for cmd in &action.commands {
-                if !cmd.trim().is_empty() {
+                for line in split_command_lines(cmd) {
                     queue.push_back(TriggerQueueItem::SendCommand {
-                        cmd: cmd.clone(),
+                        cmd: line,
                         timeout_secs: action.timeout_secs,
                     });
                 }
@@ -90,5 +104,26 @@ impl TriggerRunner {
         } else if *action_id == BUILTIN_KILL_ALL_PROCESSES_ID {
             ctx.dispatch_typed_action(&WorkspaceAction::KillAllTerminalProcesses);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_command_lines;
+
+    #[test]
+    fn each_line_is_its_own_command() {
+        assert_eq!(
+            split_command_lines("dotnet restore\ndotnet run\r\n"),
+            vec!["dotnet restore".to_string(), "dotnet run".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_single_command_stays_intact() {
+        assert_eq!(
+            split_command_lines("dotnet run"),
+            vec!["dotnet run".to_string()]
+        );
     }
 }

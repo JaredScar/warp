@@ -4817,9 +4817,16 @@ impl warpui::TypedActionView for ActionsPanelView {
                     .unwrap_or_default();
                 drop(config);
                 self.runbook_step_statuses.clear();
-                for (sid, cmd) in &steps {
+                let commands: Vec<String> = steps.iter().map(|(_, cmd)| cmd.clone()).collect();
+                for (sid, _) in &steps {
                     self.runbook_step_statuses.insert(*sid, StepStatus::Running);
-                    ctx.dispatch_typed_action(&WorkspaceAction::RunCommandInActiveTerminal(cmd.clone()));
+                }
+                if !commands.is_empty() {
+                    ctx.dispatch_typed_action(&WorkspaceAction::RunCommandsInActiveTerminal(
+                        commands,
+                    ));
+                }
+                for (sid, _) in &steps {
                     self.runbook_step_statuses.insert(*sid, StepStatus::Done);
                 }
                 ctx.notify();

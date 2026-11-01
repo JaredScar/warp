@@ -299,6 +299,8 @@ pub enum WorkspaceAction {
     RunActionInActiveTerminal(Uuid),
     /// Send a raw command string to the active terminal of the current tab.
     RunCommandInActiveTerminal(String),
+    /// Run each command in the active terminal, pressing Enter after every one.
+    RunCommandsInActiveTerminal(Vec<String>),
     /// Run a trigger by ID across its configured terminal targets (manual invocation).
     RunTrigger(Uuid),
     /// Run a trigger by ID triggered automatically by its cron schedule.
@@ -913,6 +915,7 @@ impl WorkspaceAction {
             | TogglePinTab(_)
             | RunActionInActiveTerminal(_)
             | RunCommandInActiveTerminal(_)
+            | RunCommandsInActiveTerminal(_)
             | RunTrigger(_)
             | RunTriggerScheduled(_)
             | StopTrigger

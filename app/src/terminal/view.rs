@@ -14488,6 +14488,12 @@ impl TerminalView {
         self.awaiting_pending_command_completion || self.input.as_ref(ctx).has_pending_command()
     }
 
+    /// True when a command is sitting in the input buffer and has not been
+    /// written to the shell yet.
+    pub fn has_unsent_pending_command(&self, ctx: &AppContext) -> bool {
+        self.input.as_ref(ctx).has_pending_command()
+    }
+
     /// Marks this terminal to enter agent view once pending setup commands
     /// finish. Called from `pane_tree_from_template_recursive` when the tab
     /// config has both commands and `PaneMode::Agent`.

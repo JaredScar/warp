@@ -5957,7 +5957,13 @@ impl Input {
             return;
         }
 
-        self.try_execute_command(&command, ctx);
+        // Leave the command pending when it was not written. A later
+        // bootstrap or block-completed event retries it. Clearing the flag
+        // here dropped the command and let the next one append onto the
+        // same input line.
+        if !self.try_execute_command(&command, ctx) {
+            return;
+        }
         self.has_pending_command = false;
 
         self.editor.update(ctx, |editor, ctx| {
@@ -11587,7 +11593,10 @@ impl Input {
 
     pub fn set_pending_command(&mut self, exec: &str, ctx: &mut ViewContext<Self>) {
         self.has_pending_command = true;
-        self.system_insert(exec, ctx);
+        // Replace, rather than insert. The input buffer still holds the
+        // previous command until its block completes, so inserting here
+        // glues the next command onto that line with no Enter between them.
+        self.replace_buffer_content(exec, ctx);
     }
 
     fn should_enter_accept_completion_suggestion(&self, app: &AppContext) -> bool {
@@ -13229,6 +13238,19 @@ impl Input {
             let latest_block_id = self.model.lock().block_list().active_block_id().clone();
             let input_contents_before_prompt_chip_command =
                 self.input_contents_before_prompt_chip_command.take();
+            // The next command in a sequence is placed in the buffer while the
+            // previous one is still running. Reinitializing below would drop
+            // it, and the follow-up Enter would never be sent.
+            let pending_command = if self.has_pending_command {
+                let text = self.editor.as_ref(ctx).buffer_text(ctx);
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            } else {
+                None
+            };
 
             if should_clear_buffer {
                 // We want to reinitialize the buffer whenever a command is completed so that
@@ -13241,7 +13263,11 @@ impl Input {
 
                     // If we have a pending input restore (from a prompt chip command like cd),
                     // restore the input contents instead of leaving the buffer empty.
-                    if let Some(restore_text) = input_contents_before_prompt_chip_command {
+                    // A parked follow-up command wins, so it is still there when the
+                    // shell is ready to accept it.
+                    if let Some(restore_text) =
+                        pending_command.or(input_contents_before_prompt_chip_command)
+                    {
                         self.editor.update(ctx, |editor, ctx| {
                             editor.set_buffer_text(&restore_text, ctx);
                         });

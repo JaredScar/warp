@@ -1063,6 +1063,13 @@ pub struct Workspace {
     /// `PendingCommandCompleted`.  Used to guard both the subscription
     /// callback and the 5-second fallback timer against double-advance.
     trigger_queue_waiting: bool,
+    /// Completions to ignore because a timeout already moved the queue past
+    /// the command that produced them.
+    trigger_stale_completions: u8,
+    /// Terminal that already has a completion subscription for this queue.
+    trigger_subscribed_terminal_id: Option<warpui::EntityId>,
+    /// Bumped every time a command wait is armed so older timers no-op.
+    trigger_wait_generation: u64,
     /// Named, collapsible tab groups.  Indexed by `TabData::group_id`.
     tab_groups: Vec<crate::tab::TabGroup>,
     /// The id of the tab group currently being renamed inline in the sidebar, if any.
@@ -1408,16 +1415,167 @@ impl Workspace {
 
     // ── Trigger sequential execution ──────────────────────────────────────
 
-    /// Fallback timer callback: if the queue is still waiting after
-    /// `TRIGGER_COMMAND_TIMEOUT_SECS`, assume the command started a
-    /// long-running process and advance to the next queue item anyway.
-    fn trigger_queue_timeout(&mut self, terminal_id: warpui::EntityId, ctx: &mut ViewContext<Self>) {
-        if self.trigger_queue_waiting
-            && self.trigger_active_terminal_id == Some(terminal_id)
-        {
-            self.trigger_queue_waiting = false;
-            self.advance_trigger_queue(ctx);
+    /// Subscribe once per terminal so a command completion advances the queue.
+    fn subscribe_trigger_terminal(
+        &mut self,
+        terminal: &ViewHandle<TerminalView>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let terminal_id = terminal.id();
+        if self.trigger_subscribed_terminal_id == Some(terminal_id) {
+            return;
         }
+        self.trigger_subscribed_terminal_id = Some(terminal_id);
+        ctx.subscribe_to_view(terminal, move |me, _, event, ctx| {
+            if !matches!(event, terminal::Event::PendingCommandCompleted) {
+                return;
+            }
+            if me.trigger_active_terminal_id != Some(terminal_id) {
+                return;
+            }
+            // A timeout already queued the next command. This completion
+            // belongs to the command we moved past.
+            if me.trigger_stale_completions > 0 {
+                me.trigger_stale_completions -= 1;
+                return;
+            }
+            if me.trigger_queue_waiting {
+                me.trigger_queue_waiting = false;
+                me.advance_trigger_queue(ctx);
+            }
+        });
+    }
+
+    fn arm_trigger_timeout(
+        &mut self,
+        terminal_id: warpui::EntityId,
+        generation: u64,
+        delay_secs: u64,
+        full_timeout_secs: u64,
+        polling: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let _ = ctx.spawn(
+            async move {
+                warpui::r#async::Timer::after(std::time::Duration::from_secs(delay_secs.max(1)))
+                    .await;
+            },
+            move |me: &mut Self, _: (), ctx| {
+                me.on_trigger_timeout(
+                    terminal_id,
+                    generation,
+                    full_timeout_secs,
+                    polling,
+                    ctx,
+                );
+            },
+        );
+    }
+
+    /// Fallback timer for the command currently being waited on.
+    ///
+    /// While the command is still sitting in the input buffer, keep polling
+    /// instead of queueing the next one on top of it. Once it has been
+    /// written, wait out the full timeout and then treat it as long-running.
+    fn on_trigger_timeout(
+        &mut self,
+        terminal_id: warpui::EntityId,
+        generation: u64,
+        full_timeout_secs: u64,
+        polling: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.trigger_wait_generation != generation
+            || !self.trigger_queue_waiting
+            || self.trigger_active_terminal_id != Some(terminal_id)
+        {
+            return;
+        }
+
+        let unsent = self.trigger_active_terminal.as_ref().is_some_and(|terminal| {
+            terminal.read(ctx, |term, app| term.has_unsent_pending_command(app))
+        });
+        if unsent {
+            self.arm_trigger_timeout(terminal_id, generation, 1, full_timeout_secs, true, ctx);
+            return;
+        }
+        if polling {
+            self.arm_trigger_timeout(
+                terminal_id,
+                generation,
+                full_timeout_secs,
+                full_timeout_secs,
+                false,
+                ctx,
+            );
+            return;
+        }
+
+        self.trigger_stale_completions = self.trigger_stale_completions.saturating_add(1);
+        self.trigger_queue_waiting = false;
+        self.advance_trigger_queue(ctx);
+    }
+
+    /// Run `commands` one at a time in the active terminal. Each line is
+    /// submitted with its own Enter, after the previous line finishes or
+    /// times out.
+    fn run_command_lines(
+        &mut self,
+        name: String,
+        commands: Vec<(String, Option<u64>)>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if commands.is_empty() {
+            return;
+        }
+        // A single line is already submitted with Enter by the PTY writer.
+        // Only a sequence needs the queue, so each following line waits for
+        // that Enter to take effect before the next line is written.
+        if commands.len() == 1 {
+            let cmd = commands[0].0.clone();
+            if let Some(terminal_handle) = self
+                .active_tab_pane_group()
+                .read(ctx, |pg, app| pg.active_session_view(app))
+            {
+                terminal_handle.update(ctx, |terminal, term_ctx| {
+                    terminal.execute_command_or_set_pending(&cmd, term_ctx);
+                });
+            }
+            return;
+        }
+        self.start_command_sequence(name, commands, ctx);
+    }
+
+    fn start_command_sequence(
+        &mut self,
+        name: String,
+        commands: Vec<(String, Option<u64>)>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.trigger_running_name.is_some() || commands.is_empty() {
+            return;
+        }
+        let Some(terminal) = self
+            .active_tab_pane_group()
+            .read(ctx, |pg, app| pg.active_session_view(app))
+        else {
+            return;
+        };
+        self.subscribe_trigger_terminal(&terminal, ctx);
+        self.trigger_active_terminal = Some(terminal.clone());
+        self.trigger_active_terminal_id = Some(terminal.id());
+        self.trigger_queue = commands
+            .into_iter()
+            .map(|(cmd, timeout_secs)| {
+                crate::actions::runner::TriggerQueueItem::SendCommand { cmd, timeout_secs }
+            })
+            .collect();
+        self.trigger_running_name = Some(name);
+        self.trigger_running_id = None;
+        self.trigger_run_start = None;
+        self.trigger_stale_completions = 0;
+        self.trigger_wait_generation = self.trigger_wait_generation.wrapping_add(1);
+        self.advance_trigger_queue(ctx);
     }
 
     /// Append a [`TriggerRunRecord`] to the trigger's on-disk history file.
@@ -1455,10 +1613,9 @@ impl Workspace {
     /// - Called initially to kick off execution.
     /// - Called by the `PendingCommandCompleted` subscription when the active
     ///   terminal finishes a block.
-    /// - Called by `trigger_queue_timeout` when a command takes longer than
+    /// - Called by `on_trigger_timeout` when a command takes longer than
     ///   `TRIGGER_COMMAND_TIMEOUT_SECS` (long-running processes).
     pub(crate) fn advance_trigger_queue(&mut self, ctx: &mut ViewContext<Self>) {
-        use std::time::Duration;
         use crate::actions::runner::TriggerQueueItem;
 
         /// Seconds to wait for a command to complete before assuming it started
@@ -1471,6 +1628,7 @@ impl Workspace {
                 self.trigger_active_terminal_id = None;
                 self.trigger_queue_waiting = false;
                 self.trigger_running_name = None;
+                self.trigger_stale_completions = 0;
                 // Write a success history record when the run finishes normally.
                 self.record_trigger_run(
                     crate::actions::model::TriggerRunStatus::Success,
@@ -1496,49 +1654,46 @@ impl Workspace {
                             g.terminal_views(ctx).into_iter().next()
                         });
                     if let Some(terminal) = terminal_handle {
-                        let terminal_id = terminal.id();
+                        self.subscribe_trigger_terminal(&terminal, ctx);
                         self.trigger_active_terminal = Some(terminal.clone());
-                        self.trigger_active_terminal_id = Some(terminal_id);
-
-                        // Subscribe so each command waits for the previous
-                        // block to complete.  We check both the waiting flag
-                        // and the terminal identity to guard against events
-                        // from previous terminals that may still fire.
-                        ctx.subscribe_to_view(&terminal, move |me, _, event, ctx| {
-                            if matches!(event, terminal::Event::PendingCommandCompleted)
-                                && me.trigger_queue_waiting
-                                && me.trigger_active_terminal_id == Some(terminal_id)
-                            {
-                                me.trigger_queue_waiting = false;
-                                me.advance_trigger_queue(ctx);
-                            }
-                        });
+                        self.trigger_active_terminal_id = Some(terminal.id());
                         // Fall through the loop to consume the first command.
                     }
                 }
                 TriggerQueueItem::SendCommand { cmd, timeout_secs } => {
                     if let Some(terminal) = self.trigger_active_terminal.clone() {
                         let terminal_id = terminal.id();
+                        self.trigger_wait_generation =
+                            self.trigger_wait_generation.wrapping_add(1);
+                        let generation = self.trigger_wait_generation;
                         self.trigger_queue_waiting = true;
-                        terminal.update(ctx, |t, ctx| {
+                        let unsent = terminal.update(ctx, |t, ctx| {
                             t.execute_command_or_set_pending(&cmd, ctx);
+                            t.has_unsent_pending_command(ctx)
                         });
-                        // Spawn a fallback timer.  If PendingCommandCompleted
-                        // fires first, trigger_queue_waiting will be false and
-                        // the timer callback will be a no-op.
-                        let effective_timeout =
+                        let full_timeout =
                             timeout_secs.unwrap_or(TRIGGER_COMMAND_TIMEOUT_SECS);
-                        let _ = ctx.spawn(
-                            async move {
-                                warpui::r#async::Timer::after(Duration::from_secs(
-                                    effective_timeout,
-                                ))
-                                .await;
-                            },
-                            move |me: &mut Self, _: (), ctx| {
-                                me.trigger_queue_timeout(terminal_id, ctx);
-                            },
-                        );
+                        if unsent {
+                            // The shell is not ready. Poll until the command
+                            // is actually written, then start the full wait.
+                            self.arm_trigger_timeout(
+                                terminal_id,
+                                generation,
+                                1,
+                                full_timeout,
+                                true,
+                                ctx,
+                            );
+                        } else {
+                            self.arm_trigger_timeout(
+                                terminal_id,
+                                generation,
+                                full_timeout,
+                                full_timeout,
+                                false,
+                                ctx,
+                            );
+                        }
                     }
                     // Stop here; the subscription (or fallback timer) will
                     // call us again when the time is right.
@@ -3401,6 +3556,9 @@ impl Workspace {
             trigger_active_terminal: None,
             trigger_active_terminal_id: None,
             trigger_queue_waiting: false,
+            trigger_stale_completions: 0,
+            trigger_subscribed_terminal_id: None,
+            trigger_wait_generation: 0,
             tab_groups: Vec::new(),
             renaming_tab_group_id: None,
             tab_group_rename_editor: Self::tab_group_rename_editor(ctx),
@@ -21405,27 +21563,35 @@ impl TypedActionView for Workspace {
                 });
             }
             RunActionInActiveTerminal(action_id) => {
+                use crate::actions::runner::split_command_lines;
                 use crate::user_config::WarpConfig;
+                if self.trigger_running_name.is_some() {
+                    return;
+                }
                 let config = WarpConfig::as_ref(ctx);
                 let actions = config.actions().to_vec();
                 drop(config);
                 if let Some(action) = actions.iter().find(|a| a.id == *action_id) {
-                    if !action.commands.is_empty() {
-                        if let Some(terminal_handle) = self
-                            .active_tab_pane_group()
-                            .read(ctx, |pg, app| pg.active_session_view(app))
-                        {
-                            // Join commands with '\n'. The PTY layer converts '\n' to
-                            // '\r' (Enter) when bracketed-paste is off, and shells handle
-                            // each newline-separated line as a distinct command when
-                            // bracketed-paste is on.
-                            let combined = action.commands.join("\n");
-                            terminal_handle.update(ctx, |terminal, term_ctx| {
-                                terminal.execute_command_or_set_pending(&combined, term_ctx);
-                            });
-                        }
-                    }
+                    let commands: Vec<(String, Option<u64>)> = action
+                        .commands
+                        .iter()
+                        .flat_map(|cmd| split_command_lines(cmd))
+                        .map(|line| (line, action.timeout_secs))
+                        .collect();
+                    self.run_command_lines(action.name.clone(), commands, ctx);
                 }
+            }
+            RunCommandsInActiveTerminal(commands) => {
+                use crate::actions::runner::split_command_lines;
+                if self.trigger_running_name.is_some() {
+                    return;
+                }
+                let lines: Vec<(String, Option<u64>)> = commands
+                    .iter()
+                    .flat_map(|cmd| split_command_lines(cmd))
+                    .map(|line| (line, None))
+                    .collect();
+                self.run_command_lines("Commands".to_string(), lines, ctx);
             }
             RunCommandInActiveTerminal(cmd) => {
                 let cmd = cmd.clone();
@@ -21454,6 +21620,8 @@ impl TypedActionView for Workspace {
                     self.trigger_running_id = Some(*trigger_id);
                     self.trigger_run_start =
                         Some((chrono::Utc::now(), TriggerRunSource::Manual));
+                    self.trigger_stale_completions = 0;
+                    self.trigger_wait_generation = self.trigger_wait_generation.wrapping_add(1);
                     TriggerRunner::build_queue(trigger, &actions, self, ctx);
                 }
             }
@@ -21473,6 +21641,8 @@ impl TypedActionView for Workspace {
                     self.trigger_running_id = Some(*trigger_id);
                     self.trigger_run_start =
                         Some((chrono::Utc::now(), TriggerRunSource::Scheduled));
+                    self.trigger_stale_completions = 0;
+                    self.trigger_wait_generation = self.trigger_wait_generation.wrapping_add(1);
                     TriggerRunner::build_queue(trigger, &actions, self, ctx);
                 }
             }
@@ -21481,6 +21651,8 @@ impl TypedActionView for Workspace {
                 self.trigger_active_terminal = None;
                 self.trigger_active_terminal_id = None;
                 self.trigger_queue_waiting = false;
+                self.trigger_stale_completions = 0;
+                self.trigger_wait_generation = self.trigger_wait_generation.wrapping_add(1);
                 self.trigger_running_name = None;
                 self.record_trigger_run(
                     crate::actions::model::TriggerRunStatus::Stopped,
