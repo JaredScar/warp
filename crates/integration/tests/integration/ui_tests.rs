@@ -8,9 +8,11 @@ use super::integration_tests;
 
 integration_tests! {
     test_add_many_sessions,
+    test_child_pill_after_reopening_closed_parent_tab,
     test_ctrl_tab_session_switching,
     test_hover_over_menu,
     test_shell_reinitializing,
+    test_cloud_agent_shell_respawn,
     test_exit_multiple_tabs,
     test_execute_multiple_cursor_command,
     test_home_key_should_not_appear_in_input,
@@ -124,6 +126,10 @@ integration_tests! {
     test_with_launch_config_with_active_tab_index,
     test_with_launch_config_with_active_pane,
     test_with_launch_config_with_no_active_pane,
+    test_launch_config_restores_tab_groups,
+    test_launch_config_restores_tab_groups_into_active_window,
+    test_launch_config_restores_pinned_tab_group_into_pinned_prefix,
+    test_launch_config_restore_keeps_existing_group_contiguous,
     test_find_query_not_evaluated_on_terminal_mode_change,
     test_custom_open_completions_menu_binding,
     test_ssh_with_shell_override,
@@ -140,6 +146,9 @@ integration_tests! {
     test_open_input_context_menu,
     test_copy_all_from_input_context_menu,
     test_cut_paste_from_input_context_menu,
+    test_inline_model_selector_restores_prompt_on_dismissal,
+    test_inline_model_selector_restores_prompt_on_model_selection,
+    test_inline_model_selector_restores_prompt_on_chip_toggle_close,
     test_paste_and_type_characters_before_bootstrap,
     #[ignore = "Flaking on CI - KC looking into 3/31/26"]
     test_code_review_scroll_anchor_preserved_when_inserting_above,
@@ -153,6 +162,7 @@ integration_tests! {
     test_code_review_scroll_preserved_header_range,
     #[ignore = "Flaking on CI - KC looking into 3/31/26"]
     test_code_review_scroll_preserved_footer_range,
+    test_code_review_double_click_fully_expands_hidden_section,
     test_pane_group_state_single_pane,
     test_pane_group_state_multi_pane,
     test_pane_group_state_close_pane,
@@ -208,11 +218,27 @@ integration_tests! {
     test_secret_case_sensitivity,
     test_secrets_are_always_redacted_in_ai_inputs,
 
+    // OSC 8 hyperlink tests (GH6393)
+    test_osc8_open_close_renders_visible_text,
+    test_osc8_copy_block_yields_visible_text_only,
+    test_osc8_open_link_action_opens_url,
+    test_osc8_file_scheme_opens_url,
+    test_osc8_no_regression_on_url_autodetect,
+
+    test_cycle_active_tab_color_with_keybinding,
     test_active_session_follows_focus,
+    test_tab_context_menu_copies_metadata,
+    test_vertical_tab_context_menu_copies_metadata,
+    test_vertical_pane_context_menu_copies_metadata,
 
     test_focus_panes_on_hover,
 
     test_close_tab_with_long_running_process,
+    test_reorder_tabs_with_drag,
+    test_detach_tab_to_new_window_with_drag,
+    test_attach_tab_to_other_window_and_continue_drag,
+    test_single_tab_handoff_continues_drag,
+    test_multi_tab_drag_back_to_source_and_out_again,
 
     test_restore_single_closed_pane,
     test_restore_multiple_closed_panes,
@@ -224,7 +250,7 @@ integration_tests! {
     test_close_notebook_tab,
     test_open_in_warp_banner,
     test_close_notebook_window,
-    test_backspace_inside_rendered_mermaid_block_is_atomic,
+    test_backspace_inside_raw_mermaid_block_edits_text_without_removing_block,
 
     test_open_workflow_in_pane,
     test_create_personal_workflow_pane_from_command_palette,
@@ -247,6 +273,8 @@ integration_tests! {
     test_latest_buffer_operations,
 
     test_pass_control_sequences_to_long_running_block,
+    test_execution_profiles_load_from_settings_file,
+    test_execution_profile_model_persists_and_hot_reloads_settings_file,
     test_settings_file_migration_from_native_store,
     test_settings_file_hot_reload_applies_new_values,
 
@@ -255,6 +283,19 @@ integration_tests! {
     test_settings_error_banner_on_reload_with_invalid_toml,
     test_settings_error_banner_on_reload_with_invalid_value,
 
+    // Settings sidebar navigation and search.
+    test_settings_mouse_navigation_through_umbrella,
+    test_settings_keyboard_navigation_down_into_collapsed_umbrella,
+    test_settings_keyboard_navigation_up_into_collapsed_umbrella,
+    test_settings_keyboard_navigation_after_manual_collapse,
+    test_settings_search_filters_top_level_pages,
+    test_settings_search_filters_subpages,
+    test_settings_search_subpage_still_renders_content,
+    test_settings_search_clear_restores_umbrella_state,
+    test_settings_search_preserved_on_sidebar_click,
+    test_settings_agent_mcp_servers_renders_standalone_page,
+
+    test_copy_selection_within_ai_block,
     #[ignore = "Affected by agent_view feature flag UI changes"]
     test_selection_first_to_last_through_ai_simple,
     #[ignore = "Affected by agent_view feature flag UI changes"]
@@ -294,9 +335,10 @@ integration_tests! {
     #[ignore = "Affected by agent_view feature flag UI changes"]
     test_selection_last_to_ai_lines,
     test_restored_ai_block_renders_mermaid_and_local_images,
+    test_cancelled_run_agents_card_renders_cancelled_state,
 
     // Middle-click-paste is only implemented for Linux right now.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     test_middle_click_paste,
     test_agent_mode_pane_minimum_size,
 
@@ -312,11 +354,21 @@ integration_tests! {
     test_file_tree_non_openable_files,
     test_file_tree_nested_file_opening,
 
+    // Copy current path command-palette action
+    test_copy_current_path_copies_terminal_pwd,
+    test_copy_current_path_copies_code_editor_file_path,
+
     // Go to Line tests
     test_goto_line_dialog_open_close,
     test_goto_line_jumps_to_line,
     test_goto_line_with_column,
     test_goto_line_clamps_out_of_range,
+    test_code_editor_line_numbers_default_to_absolute,
+    test_code_editor_relative_line_numbers_follow_cursor,
+
+    // AI document tests
+    test_copy_ai_document_as_markdown_from_overflow_menu,
+    test_restored_ai_document_populates_code_block_after_first_layout,
 
     // Keyboard protocol tests
     test_keyboard_protocol_disabled_shift_enter,
@@ -332,4 +384,9 @@ integration_tests! {
     // Video recording test — requires real display, run manually
     #[ignore = "Manual test: requires real display for frame capture"]
     test_video_recording,
+
+    // Rich Input Ctrl+Enter submit toggle (issue #11588)
+    test_rich_input_toggle_on_enter_inserts_newline_and_ctrl_enter_submits,
+    // Regression: Enter must accept inline menus (not insert newline) when toggle=true
+    test_rich_input_enter_accepts_menu_item_when_toggle_is_true,
 }

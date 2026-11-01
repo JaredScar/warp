@@ -1,6 +1,7 @@
-use crate::{
-    error::UserFacingError, request_context::RequestContext, schema, user::DiscoverableTeamData,
-};
+use crate::error::UserFacingError;
+use crate::request_context::RequestContext;
+use crate::schema;
+use crate::user::{DiscoverableTeamData, DiscoverableWorkspaceData};
 
 /*
 query GetDiscoverableTeams($requestContext: RequestContext!) {
@@ -12,6 +13,17 @@ query GetDiscoverableTeams($requestContext: RequestContext!) {
           numMembers
           teamAcceptingInvites
           teamUid
+        }
+        discoverableWorkspaces {
+          workspaceUid
+          name
+          memberCount
+          openTeams {
+            name
+            numMembers
+            teamAcceptingInvites
+            teamUid
+          }
         }
       }
     }
@@ -37,6 +49,7 @@ pub struct UserOutput {
 #[derive(cynic::QueryFragment, Debug)]
 pub struct User {
     pub discoverable_teams: Vec<DiscoverableTeamData>,
+    pub discoverable_workspaces: Vec<DiscoverableWorkspaceData>,
 }
 
 #[derive(cynic::QueryFragment, Debug)]

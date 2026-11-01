@@ -1,36 +1,40 @@
-use itertools::Itertools;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use ai::skills::{ParsedSkill, SkillProvider, SkillScope};
+use itertools::Itertools;
+use ui_components::lightbox::{LightboxImage, LightboxImageSource};
+use warp_util::local_or_remote_path::LocalOrRemotePath;
 #[cfg(feature = "local_fs")]
 use warpui::assets::asset_cache::AssetSource;
-use warpui::App;
+use warpui::elements::{Empty, MouseStateHandle};
+use warpui::{App, Element};
 
-#[cfg(feature = "local_fs")]
-use super::{blocklist_image_asset_source, ResolvedBlocklistImageSources};
 use super::{
-    collect_visual_markdown_lightbox_collection, compute_visual_section_width,
-    inline_image_source_label, lightbox_trigger_for_section, query_prefix_highlight_len,
-    render_scrollable_collapsible_content, text_sections_with_indices, CollapsibleElementState,
-    CollapsibleExpansionState, VisualMarkdownLightboxCollection,
+    CollapsibleElementState, CollapsibleExpansionState, LOAD_OUTPUT_MESSAGE,
+    LOAD_OUTPUT_MESSAGE_FOR_CREATING_DIFF, LOAD_OUTPUT_MESSAGE_FOR_GENERATING_PLAN,
+    VisualMarkdownLightboxCollection, collect_visual_markdown_lightbox_collection,
+    compute_visual_section_width, image_tooltip_handles_for_group, inline_image_source_label,
+    is_supported_blocklist_image_source, lightbox_trigger_for_section, query_prefix_highlight_len,
+    render_scrollable_collapsible_content, status_message_naming_model, text_sections_with_indices,
+    warping_footer_height,
 };
-use crate::{
-    ai::agent::{
-        AIAgentInput, AIAgentTextSection, AgentOutputImage, AgentOutputImageLayout,
-        AgentOutputMermaidDiagram, MessageId, UserQueryMode,
-    },
-    features::FeatureFlag,
-    search::slash_command_menu::static_commands::commands,
+#[cfg(feature = "local_fs")]
+use super::{ResolvedBlocklistImageSources, blocklist_image_asset_source};
+use crate::ai::agent::{
+    AIAgentInput, AIAgentTextSection, AgentOutputImage, AgentOutputImageLayout,
+    AgentOutputMermaidDiagram, MessageId, UserQueryMode,
 };
-use ui_components::lightbox::{LightboxImage, LightboxImageSource};
-use warpui::{elements::Empty, Element};
+use crate::features::FeatureFlag;
+use crate::search::slash_command_menu::static_commands::commands;
 
 #[test]
 fn query_prefix_highlight_len_highlights_invoke_skill_inputs() {
     let input = AIAgentInput::InvokeSkill {
         context: Arc::new([]),
         skill: ParsedSkill {
-            path: PathBuf::from("/tmp/.agents/skills/review-pr/SKILL.md"),
+            path: LocalOrRemotePath::Local(PathBuf::from("/tmp/.agents/skills/review-pr/SKILL.md")),
             name: "review-pr".to_string(),
             description: "Review a pull request.".to_string(),
             content: String::new(),
@@ -57,6 +61,7 @@ fn query_prefix_highlight_len_does_not_guess_from_plain_user_query_text() {
         user_query_mode: UserQueryMode::Normal,
         running_command: None,
         intended_agent: None,
+        base: None,
     };
 
     assert_eq!(
@@ -75,6 +80,7 @@ fn query_prefix_highlight_len_keeps_existing_plan_highlighting() {
         user_query_mode: UserQueryMode::Plan,
         running_command: None,
         intended_agent: None,
+        base: None,
     };
 
     assert_eq!(
@@ -127,6 +133,17 @@ fn text_sections_with_indices_preserve_image_section_alignment_after_empty_text_
 }
 
 #[test]
+fn image_tooltip_handles_for_group_uses_available_handles_only() {
+    let handles = [MouseStateHandle::default(), MouseStateHandle::default()];
+
+    assert_eq!(image_tooltip_handles_for_group(&handles, 0, 1).len(), 1);
+    assert_eq!(image_tooltip_handles_for_group(&handles, 1, 4).len(), 1);
+    assert_eq!(image_tooltip_handles_for_group(&handles, 2, 1).len(), 0);
+    assert_eq!(image_tooltip_handles_for_group(&handles, 3, 1).len(), 0);
+    assert_eq!(image_tooltip_handles_for_group(&[], 1, 1).len(), 0);
+}
+
+#[test]
 fn render_scrollable_collapsible_content_returns_none_when_collapsed() {
     let state = CollapsibleElementState {
         expansion_state: CollapsibleExpansionState::Collapsed,
@@ -146,6 +163,26 @@ fn render_scrollable_collapsible_content_returns_none_when_collapsed() {
         content.is_none(),
         "Expected no rendered content when collapsible state is collapsed",
     );
+}
+
+#[test]
+fn warping_footer_height_reserves_a_line_for_the_secondary_element() {
+    // Regression: the warping indicator's footer is a fixed-height, clipped
+    // container. When an agent tip (or fallback-model explanation) is present it
+    // renders on a second line, so the footer must be taller than the
+    // single-line case — otherwise the clip (added to keep action chips from
+    // overflowing narrow panes) hides the tip entirely.
+    let font_size = 13.;
+    let without_tip = warping_footer_height(font_size, false);
+    let with_tip = warping_footer_height(font_size, true);
+
+    assert!(
+        with_tip > without_tip,
+        "footer with a secondary element ({with_tip}) should be taller than without ({without_tip})",
+    );
+    // The extra room must cover the secondary line: its font size
+    // (monospace_font_size - 3) plus the 1px top margin on the tip container.
+    assert_eq!(with_tip - without_tip, (font_size - 3.) + 1.);
 }
 
 #[test]
@@ -253,10 +290,12 @@ fn collect_visual_markdown_lightbox_collection_includes_mermaid_sections_in_sour
 
             assert_eq!(collection.section_indices, vec![11, 13]);
             assert_eq!(collection.images.len(), 2);
-            assert!(collection
-                .images
-                .iter()
-                .all(|image| image.description.is_none()));
+            assert!(
+                collection
+                    .images
+                    .iter()
+                    .all(|image| image.description.is_none())
+            );
         });
     });
 }
@@ -278,6 +317,7 @@ fn blocklist_image_asset_source_uses_cached_resolution_when_available() {
         "diagram.png".to_string(),
         Some(AssetSource::LocalFile {
             path: cached_path.clone(),
+            content_version: None,
         }),
     )]);
 
@@ -288,7 +328,72 @@ fn blocklist_image_asset_source_uses_cached_resolution_when_available() {
     );
 
     match resolved {
-        Some(AssetSource::LocalFile { path }) => assert_eq!(path, cached_path),
+        Some(AssetSource::LocalFile { path, .. }) => assert_eq!(path, cached_path),
         other => panic!("expected cached local file asset source, got {other:?}"),
     }
+}
+
+/// `is_supported_blocklist_image_source` should accept the same image extensions
+/// that `warp_util::file_type::is_binary_file` recognises (plus `svg`, which is
+/// text/XML and not in `is_binary_file`). Until #9395 / this fix landed the
+/// blocklist list was only `jpg | jpeg | png | gif | webp | svg`, so inline
+/// references to local `.bmp` / `.tiff` / `.tif` / `.ico` images failed the
+/// support check and silently rendered as plain text.
+#[test]
+fn is_supported_blocklist_image_source_covers_common_local_formats() {
+    for source in [
+        "diagram.jpg",
+        "diagram.jpeg",
+        "diagram.png",
+        "diagram.gif",
+        "diagram.bmp",
+        "diagram.tiff",
+        "diagram.tif",
+        "diagram.webp",
+        "diagram.ico",
+        "diagram.svg",
+    ] {
+        assert!(
+            is_supported_blocklist_image_source(source),
+            "{source} should be a supported local image source"
+        );
+    }
+    // Case-insensitive on the extension.
+    assert!(is_supported_blocklist_image_source("PHOTO.PNG"));
+    assert!(is_supported_blocklist_image_source("scan.TIFF"));
+    // HTTP / HTTPS sources are intentionally rejected regardless of extension.
+    assert!(!is_supported_blocklist_image_source(
+        "http://example.com/x.png"
+    ));
+    assert!(!is_supported_blocklist_image_source(
+        "https://example.com/x.png"
+    ));
+    // Non-image extensions stay rejected.
+    assert!(!is_supported_blocklist_image_source("doc.pdf"));
+    assert!(!is_supported_blocklist_image_source("notes.md"));
+}
+
+#[test]
+fn names_the_model_before_a_status_message_ellipsis() {
+    assert_eq!(
+        status_message_naming_model(LOAD_OUTPUT_MESSAGE_FOR_GENERATING_PLAN, "Claude Sonnet 4.5"),
+        "Generating plan with Claude Sonnet 4.5..."
+    );
+    assert_eq!(
+        status_message_naming_model(LOAD_OUTPUT_MESSAGE, "Claude Sonnet 4.5"),
+        "Warping with Claude Sonnet 4.5..."
+    );
+    assert_eq!(
+        status_message_naming_model(LOAD_OUTPUT_MESSAGE_FOR_CREATING_DIFF, "GPT-5.2"),
+        "Creating diff with GPT-5.2..."
+    );
+}
+
+/// A message without the row's usual trailing ellipsis still reads correctly.
+#[test]
+fn names_the_model_after_a_status_message_without_an_ellipsis() {
+    assert_eq!(
+        status_message_naming_model("Generating plan", "Claude Sonnet 4.5"),
+        "Generating plan with Claude Sonnet 4.5"
+    );
 }

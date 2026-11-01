@@ -3,8 +3,6 @@
 //! This modal is displayed when users click "New agent" to choose between
 //! cloud and local agent modes.
 
-use crate::appearance::Appearance;
-use crate::ui_components::icons::Icon;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
 use warp_core::ui::color::blend::Blend;
@@ -19,6 +17,9 @@ use warpui::keymap::{FixedBinding, Keystroke};
 use warpui::platform::Cursor;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext};
+
+use crate::appearance::Appearance;
+use crate::ui_components::icons::Icon;
 
 // Modal dimensions based on Figma design.
 const MODAL_WIDTH: f32 = 440.;
@@ -332,7 +333,7 @@ impl AgentTypeSelector {
 
         let cloud_agent_option = self.render_option(
             0,
-            Icon::OzCloud,
+            Icon::CloudFilled,
             "Cloud agent",
             "Runs autonomously in a cloud environment you choose. Best for parallel or long-running work.",
             true,
@@ -343,7 +344,7 @@ impl AgentTypeSelector {
 
         let local_agent_option = self.render_option(
             1,
-            Icon::Oz,
+            Icon::Agent,
             "Local agent",
             "Runs on your machine and requires supervision. Best for quick, interactive tasks.",
             false,

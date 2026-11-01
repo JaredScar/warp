@@ -7,10 +7,6 @@
 //!   `Workspace::render_settings_error_banner`) when the settings file has an
 //!   error *and* the user has dismissed the workspace banner.
 //! * Otherwise, a plain bordered "Open settings file" button.
-use crate::appearance::Appearance;
-use crate::settings::SettingsFileError;
-use crate::ui_components::icons::Icon;
-use crate::WorkspaceAction;
 use pathfinder_color::ColorU;
 use warp_core::ui::color::coloru_with_opacity;
 use warp_core::ui::theme::Fill;
@@ -23,6 +19,11 @@ use warpui::elements::{
 use warpui::fonts::{FamilyId, Properties, Weight};
 use warpui::platform::Cursor;
 
+use crate::WorkspaceAction;
+use crate::appearance::Appearance;
+use crate::settings::SettingsFileError;
+use crate::ui_components::icons::Icon;
+
 /// Horizontal + vertical padding applied to the footer inside the sidebar.
 const FOOTER_PADDING: f32 = 12.;
 /// Font size used for the button label and the alert copy; matches the
@@ -34,10 +35,10 @@ const OPEN_BUTTON_HEIGHT: f32 = 32.;
 const ALERT_ACTION_BUTTON_HEIGHT: f32 = 24.;
 /// Size of the leading icons (search-sm, code-02, alert-circle, oz).
 const FOOTER_ICON_SIZE: f32 = 16.;
-/// Size of the Oz brand mark inside the "Fix with Oz" button. Matches the
+/// Size of the Warp Agent brand mark inside the "Fix with Warp Agent" button. Matches the
 /// Figma spec and the workspace banner's secondary-button icon sizing.
 const ALERT_OZ_ICON_SIZE: f32 = 14.;
-/// Horizontal padding inside the "Open file" / "Fix with Oz" action buttons.
+/// Horizontal padding inside the "Open file" / "Fix with Warp Agent" action buttons.
 /// Matches the workspace banner's secondary button pad.
 const ALERT_BUTTON_HORIZONTAL_PADDING: f32 = 8.;
 /// Spacing between the two action buttons when they fit on one row.
@@ -249,8 +250,8 @@ pub fn render_settings_error_alert(
             ui_font_family,
             text_color,
             mouse_states.alert_fix_with_oz_button.clone(),
-            "Fix with Oz",
-            Some(Icon::Oz),
+            "Fix with Warp Agent",
+            Some(Icon::Agent),
             /*bordered=*/ false,
             WorkspaceAction::FixSettingsWithOz { error_description },
         );

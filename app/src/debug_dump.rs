@@ -36,15 +36,15 @@ pub(crate) fn run() -> anyhow::Result<()> {
             ));
 
             // Log some additional windowing system information on Linux.
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             {
                 use winit::raw_window_handle::HasDisplayHandle as _;
 
-                if let Ok(display_handle) = event_loop.display_handle() {
-                    if let Ok(system) = windowing::System::try_from(display_handle.as_raw()) {
-                        println!("Windowing system: {system:?}");
-                        windowing_system = Some(system);
-                    }
+                if let Ok(display_handle) = event_loop.display_handle()
+                    && let Ok(system) = windowing::System::try_from(display_handle.as_raw())
+                {
+                    println!("Windowing system: {system:?}");
+                    windowing_system = Some(system);
                 }
 
                 if let Some(name) = windowing::winit::get_os_window_manager_name() {
@@ -54,15 +54,16 @@ pub(crate) fn run() -> anyhow::Result<()> {
         }
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd", windows))]
     {
         use std::ops::Deref as _;
 
-        use crate::settings::{
-            init_private_user_preferences, PreferLowPowerGPU, PreferredGraphicsBackend,
-        };
         use settings::Setting as _;
         use warpui::rendering::GPUPowerPreference;
+
+        use crate::settings::{
+            PreferLowPowerGPU, PreferredGraphicsBackend, init_private_user_preferences,
+        };
 
         let user_preferences = init_private_user_preferences();
 
@@ -90,7 +91,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
         ));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         let lspci_info = collect_output_or_suggest_install("lspci");
         println!("##################################################");

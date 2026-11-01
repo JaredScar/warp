@@ -1,16 +1,16 @@
 //! Module that builds a static context to attach to each of our events that are sent to Rudderstack.
 //! This is needed so we know the backing operating system and version of each telemetry event.
 
-use super::rudder_message::Message as RudderMessage;
-use crate::server::OperatingSystemInfo;
-
-use serde::Serialize;
-use serde_json::{json, Value};
-
 use std::sync::OnceLock;
 
+use serde::Serialize;
+use serde_json::{Value, json};
+use warp_errors::report_error;
 #[cfg(target_family = "wasm")]
 use warpui::platform::wasm;
+
+use super::rudder_message::Message as RudderMessage;
+use crate::server::OperatingSystemInfo;
 
 static TELEMETRY_CONTEXT: OnceLock<TelemetryContext> = OnceLock::new();
 
@@ -46,7 +46,10 @@ impl TelemetryContext {
         match serde_json::to_value(context) {
             Ok(value) => Self(value),
             Err(e) => {
-                log::error!("Failed to serialize telemetry context info to JSON value: {e:?}");
+                report_error!(
+                    anyhow::Error::new(e)
+                        .context("Failed to serialize telemetry context info to JSON value")
+                );
                 Self(json!({}))
             }
         }

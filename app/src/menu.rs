@@ -2,40 +2,42 @@ use std::cell::OnceCell;
 use std::sync::Arc;
 use std::{fmt, vec};
 
-use crate::safe_triangle::SafeTriangle;
-use crate::themes::theme::Fill;
-use crate::util::time_format::format_approx_duration_from_now_sentence_case;
-use crate::{appearance::Appearance, ui_components::icons};
 use chrono::{DateTime, Local};
 use pathfinder_color::ColorU;
 use pathfinder_geometry::rect::RectF;
-use pathfinder_geometry::vector::{vec2f, Vector2F};
+use pathfinder_geometry::vector::{Vector2F, vec2f};
 use warp_core::ui::color::blend::Blend;
+use warpui::accessibility::{AccessibilityContent, ActionAccessibilityContent, WarpA11yRole};
+use warpui::assets::asset_cache::AssetSource;
 use warpui::elements::{
-    ChildAnchor, ClippedScrollStateHandle, ClippedScrollable, DropShadow, OffsetPositioning,
-    ParentAnchor, ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds,
-    ScrollTarget, ScrollToPositionMode, ScrollbarWidth, Stack,
+    Align, Border, CacheOption, ChildAnchor, ClippedScrollStateHandle, ClippedScrollable,
+    ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Dismiss, DispatchEventResult,
+    DropShadow, Element, EventHandler, Expanded, Flex, Hoverable, Icon, Image, MainAxisAlignment,
+    MainAxisSize, MouseInBehavior, MouseStateHandle, OffsetPositioning, ParentAnchor,
+    ParentElement, ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds,
+    Radius, Rect, SavePosition, ScrollTarget, ScrollToPositionMode, ScrollbarWidth, Shrinkable,
+    Stack, Text,
 };
-use warpui::WindowId;
+use warpui::fonts::{FamilyId, Properties};
+use warpui::keymap::FixedBinding;
+use warpui::platform::Cursor;
+use warpui::text_layout::ClipConfig;
+use warpui::ui_components::components::UiComponent;
 use warpui::{
-    accessibility::{AccessibilityContent, ActionAccessibilityContent, WarpA11yRole},
-    elements::{
-        Align, Border, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Dismiss,
-        DispatchEventResult, Element, EventHandler, Flex, Hoverable, Icon, MainAxisAlignment,
-        MainAxisSize, MouseInBehavior, MouseStateHandle, ParentElement, Radius, Rect, SavePosition,
-        Shrinkable, Text,
-    },
-    fonts::{FamilyId, Properties},
-    keymap::FixedBinding,
-    platform::Cursor,
-    ui_components::components::UiComponent,
-    Action, AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext,
+    Action, AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext, WindowId,
 };
+
+use crate::appearance::Appearance;
+use crate::safe_triangle::SafeTriangle;
+use crate::themes::theme::Fill;
+use crate::ui_components::buttons::icon_button_with_color;
+use crate::ui_components::icons;
+use crate::util::time_format::format_approx_duration_from_now_sentence_case;
 
 pub const CHEVRON_RIGHT_ALIGN_SVG_PATH: &str = "bundled/svg/chevron-right-align.svg";
 
 const SUBMENU_OVERLAP: f32 = 8.;
-const MENU_VERTICAL_PADDING: f32 = 9.;
+pub(crate) const MENU_VERTICAL_PADDING: f32 = 9.;
 pub const MENU_ITEM_VERTICAL_PADDING: f32 = 5.;
 pub const MENU_ITEM_HORIZONTAL_PADDING: f32 = 14.;
 pub const SEPARATOR_VERTICAL_MARGIN: f32 = 4.;
@@ -123,6 +125,9 @@ pub struct Menu<A: Action + Clone = ()> {
     /// Optional overrides for the depth-0 menu content padding.
     content_top_padding_override: Option<f32>,
     content_bottom_padding_override: Option<f32>,
+    /// Optional saved-position id whose last rendered width should override
+    /// the configured submenu width while this menu is rendered.
+    width_match_position_id: Option<String>,
     /// If false, selecting a menu item updates selection and emits menu events
     /// without dispatching the item's typed action directly from the menu.
     dispatch_item_actions: bool,
@@ -261,18 +266,20 @@ impl MenuItemLabel {
         menu_width: f32,
         is_selected: bool,
         is_hovered: bool,
+        clip_config: Option<ClipConfig>,
         appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
         match self {
-            Self::Text(label) => Shrinkable::new(
-                4.,
-                Text::new_inline(label.clone(), font_family, font_size)
+            Self::Text(label) => {
+                let mut text = Text::new_inline(label.clone(), font_family, font_size)
                     .with_color(primary_color.into())
-                    .autosize_text(MINIMUM_MENU_ITEM_FONT_SIZE)
-                    .finish(),
-            )
-            .finish(),
+                    .autosize_text(MINIMUM_MENU_ITEM_FONT_SIZE);
+                if let Some(config) = clip_config {
+                    text = text.with_clip(config).soft_wrap(false);
+                }
+                Shrinkable::new(4., text.finish()).finish()
+            }
             Self::MultilineText { label, max_lines } => {
                 let max_height_for_n_lines =
                     *max_lines as f32 * font_size * appearance.line_height_ratio();
@@ -385,6 +392,47 @@ struct RightSideLabel {
     text: String,
     font_properties: Properties,
 }
+#[derive(Clone)]
+struct RightSideIconConfig<A> {
+    icon: icons::Icon,
+    override_color: Option<Fill>,
+    /// Optional action dispatched when the right-side icon is clicked. When
+    /// set, the right-side icon becomes its own hit target: clicking it
+    /// dispatches this action without firing the row's own `on_select_action`,
+    /// and prevents the row click from propagating.
+    action: Option<A>,
+    /// Optional accessibility label for the right-side icon hit target.
+    a11y_label: Option<String>,
+    /// When true, the right-side icon is rendered as disabled with no hover or
+    /// click action.
+    disabled: bool,
+    /// Tracks hover state independently from the row.
+    mouse_state: MouseStateHandle,
+}
+
+impl<A> RightSideIconConfig<A> {
+    fn new(icon: icons::Icon) -> Self {
+        Self {
+            icon,
+            override_color: None,
+            action: None,
+            a11y_label: None,
+            disabled: false,
+            mouse_state: MouseStateHandle::default(),
+        }
+    }
+
+    fn without_action<B>(self) -> RightSideIconConfig<B> {
+        RightSideIconConfig {
+            icon: self.icon,
+            override_color: self.override_color,
+            action: None,
+            a11y_label: self.a11y_label,
+            disabled: self.disabled,
+            mouse_state: self.mouse_state,
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct MenuItemFields<A: Action + Clone> {
@@ -396,6 +444,9 @@ pub struct MenuItemFields<A: Action + Clone> {
     disabled: bool,
     mouse_state: MouseStateHandle,
     icon: Option<icons::Icon>,
+    /// Path to a full-color image asset (e.g. `bundled/svg/file_type/rust.svg`).
+    /// When set, the icon is rendered via [`Image::new`] preserving original colors.
+    image_icon: Option<&'static str>,
     override_icon_color: Option<Fill>,
     override_text_color: Option<ColorU>,
     override_font_family: Option<FamilyId>,
@@ -408,7 +459,8 @@ pub struct MenuItemFields<A: Action + Clone> {
     tooltip: Option<String>,
     tooltip_position: MenuTooltipPosition,
     right_side_label: Option<RightSideLabel>,
-    /// Optional override for the background color rendered when this item is
+    right_side_icon: Option<RightSideIconConfig<A>>,
+    /// Optional override for the background color
     /// hovered or selected. When `None`, the default hover/selected background
     /// from the theme is used (accent or dark overlay, depending on
     /// `highlight_on_hover`).
@@ -416,6 +468,11 @@ pub struct MenuItemFields<A: Action + Clone> {
     /// Optional override for the leading icon size in logical pixels. When
     /// `None`, the icon is sized to `appearance.ui_font_size()`.
     icon_size_override: Option<f32>,
+    /// Optional clip config controlling how the label text is clipped when it
+    /// would overflow the available width. Only applied to plain
+    /// [`MenuItemLabel::Text`] labels — multiline/stacked/labeled/icon/custom
+    /// variants ignore this field.
+    clip_config: Option<ClipConfig>,
 }
 
 impl<A: Action + Clone> std::fmt::Debug for MenuItemFields<A> {
@@ -439,6 +496,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             disabled: false,
             mouse_state: Default::default(),
             icon: None,
+            image_icon: None,
             override_icon_color: None,
             override_font_family: None,
             override_font_size: None,
@@ -452,8 +510,10 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip: None,
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
+            right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
+            clip_config: None,
         }
     }
 
@@ -466,6 +526,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             disabled: false,
             mouse_state: Default::default(),
             icon: None,
+            image_icon: None,
             override_icon_color: None,
             override_font_family: None,
             override_font_size: None,
@@ -479,8 +540,10 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip: None,
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
+            right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
+            clip_config: None,
         }
     }
 
@@ -496,6 +559,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             disabled: false,
             mouse_state: Default::default(),
             icon: None,
+            image_icon: None,
             override_icon_color: None,
             override_font_family: None,
             override_font_size: None,
@@ -509,12 +573,14 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip: None,
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
+            right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
+            clip_config: None,
         }
     }
 
-    /// Creates a new menu item with vertically stacked primary and secondary text.
+    /// Creates a new menu item with vertically stacked
     /// This is useful for items that need both a title and description/subtitle,
     /// such as slash commands with their descriptions.
     pub fn new_with_stacked_label<T: Into<String>>(title: T, subtitle: T) -> Self {
@@ -529,6 +595,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             disabled: false,
             mouse_state: Default::default(),
             icon: None,
+            image_icon: None,
             override_icon_color: None,
             override_font_family: None,
             override_font_size: None,
@@ -542,8 +609,10 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip: None,
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
+            right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
+            clip_config: None,
         }
     }
 
@@ -560,6 +629,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             disabled: false,
             mouse_state: Default::default(),
             icon: None,
+            image_icon: None,
             override_icon_color: None,
             override_font_family: None,
             override_font_size: None,
@@ -573,8 +643,10 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip: None,
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
+            right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
+            clip_config: None,
         }
     }
 
@@ -590,6 +662,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             disabled: false,
             mouse_state: Default::default(),
             icon: None,
+            image_icon: None,
             override_icon_color: None,
             override_font_family: None,
             override_font_size: None,
@@ -603,8 +676,10 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip: None,
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
+            right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
+            clip_config: None,
         }
     }
 
@@ -617,6 +692,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             disabled: false,
             mouse_state: Default::default(),
             icon: None,
+            image_icon: None,
             override_icon_color: None,
             override_font_family: None,
             override_font_size: None,
@@ -630,8 +706,10 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip: None,
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
+            right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
+            clip_config: None,
         }
     }
 
@@ -660,6 +738,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             disabled: self.disabled,
             mouse_state: self.mouse_state,
             icon: self.icon,
+            image_icon: self.image_icon,
             override_icon_color: self.override_icon_color,
             override_font_family: self.override_font_family,
             override_font_size: self.override_font_size,
@@ -673,8 +752,16 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip: self.tooltip,
             tooltip_position: self.tooltip_position,
             right_side_label: self.right_side_label,
+            // The right-side icon action is `Option<A>`; we can't safely map
+            // it to `Option<B>` here, so drop it. Callers that need the
+            // right-side action must set it via `with_right_side_icon_action`
+            // after conversion.
+            right_side_icon: self
+                .right_side_icon
+                .map(RightSideIconConfig::without_action),
             override_hover_background_color: self.override_hover_background_color,
             icon_size_override: self.icon_size_override,
+            clip_config: self.clip_config,
         }
     }
 
@@ -754,6 +841,14 @@ impl<A: Action + Clone> MenuItemFields<A> {
         self
     }
 
+    /// Set a full-color image asset as the icon for this menu item.
+    /// The image is rendered via [`Image::new`], preserving its original colors
+    /// (e.g. for language logos from `bundled/svg/file_type/`).
+    pub fn with_image_icon(mut self, path: &'static str) -> Self {
+        self.image_icon = Some(path);
+        self
+    }
+
     pub fn with_indent(mut self) -> Self {
         self.indent = true;
         self
@@ -772,6 +867,14 @@ impl<A: Action + Clone> MenuItemFields<A> {
         self
     }
 
+    /// Set a [`ClipConfig`] that controls how the label text is clipped when
+    /// it would overflow the available width. Only applied to plain
+    /// [`MenuItemLabel::Text`] labels.
+    pub fn with_clip_config(mut self, config: ClipConfig) -> Self {
+        self.clip_config = Some(config);
+        self
+    }
+
     pub(crate) fn with_tooltip_position(mut self, position: MenuTooltipPosition) -> Self {
         self.tooltip_position = position;
         self
@@ -787,6 +890,36 @@ impl<A: Action + Clone> MenuItemFields<A> {
             text: label.into(),
             font_properties,
         });
+        self
+    }
+
+    pub fn with_right_side_icon(mut self, icon: icons::Icon) -> Self {
+        self.right_side_icon = Some(RightSideIconConfig::new(icon));
+        self
+    }
+
+    /// Sets a separate action that fires when the right-side icon is
+    /// clicked. The action is independent from the row's
+    /// `on_select_action`: clicking the icon dispatches this action and
+    /// the row click is suppressed.
+    pub fn with_right_side_icon_action(mut self, action: A) -> Self {
+        if let Some(config) = &mut self.right_side_icon {
+            config.action = Some(action);
+        }
+        self
+    }
+
+    pub fn with_right_side_icon_a11y_label(mut self, label: impl Into<String>) -> Self {
+        if let Some(config) = &mut self.right_side_icon {
+            config.a11y_label = Some(label.into());
+        }
+        self
+    }
+
+    pub fn with_right_side_icon_disabled(mut self, disabled: bool) -> Self {
+        if let Some(config) = &mut self.right_side_icon {
+            config.disabled = disabled;
+        }
         self
     }
 
@@ -825,6 +958,25 @@ impl<A: Action + Clone> MenuItemFields<A> {
     }
 
     fn render_icon(&self, appearance: &Appearance, color: Fill) -> Option<Box<dyn Element>> {
+        let icon_size = appearance.ui_font_size();
+        if let Some(path) = self.image_icon {
+            return Some(
+                Shrinkable::new(
+                    1.,
+                    Container::new(
+                        ConstrainedBox::new(
+                            Image::new(AssetSource::Bundled { path }, CacheOption::BySize).finish(),
+                        )
+                        .with_width(icon_size)
+                        .with_height(icon_size)
+                        .finish(),
+                    )
+                    .with_margin_right(icon_size / 2.)
+                    .finish(),
+                )
+                .finish(),
+            );
+        }
         if let Some(icon) = self.icon {
             let icon_size = self
                 .icon_size_override
@@ -901,6 +1053,63 @@ impl<A: Action + Clone> MenuItemFields<A> {
         } else {
             None
         }
+    }
+
+    fn render_right_side_icon(
+        &self,
+        appearance: &Appearance,
+        color: Fill,
+        dispatch_item_actions: bool,
+    ) -> Option<Box<dyn Element>> {
+        let config = self.right_side_icon.as_ref()?;
+        let icon_size = self
+            .icon_size_override
+            .unwrap_or_else(|| appearance.ui_font_size());
+        let icon_color = config.override_color.unwrap_or(color);
+        if let Some(action) = &config.action {
+            let mut button = icon_button_with_color(
+                appearance,
+                config.icon,
+                false,
+                config.mouse_state.clone(),
+                icon_color,
+            );
+            if config.disabled {
+                button = button.disabled();
+            }
+            let mut hoverable = button.build();
+            if !config.disabled {
+                let action = action.clone();
+                hoverable = hoverable.on_click(move |ctx, _, _| {
+                    if dispatch_item_actions {
+                        ctx.dispatch_typed_action(action.clone());
+                    }
+                });
+                // Swallow mouse-down too so the row's click handler
+                // doesn't latch onto the press that targets the icon.
+                hoverable = hoverable.on_mouse_down(|_, _, _| {});
+            }
+            let button_element = if config.disabled {
+                EventHandler::new(hoverable.finish())
+                    .on_left_mouse_down(|_, _, _| DispatchEventResult::StopPropagation)
+                    .on_left_mouse_up(|_, _, _| DispatchEventResult::StopPropagation)
+                    .finish()
+            } else {
+                hoverable.finish()
+            };
+            let element = Container::new(button_element)
+                .with_margin_left(icon_size / 2.)
+                .finish();
+            return Some(Shrinkable::new(1., Align::new(element).right().finish()).finish());
+        }
+        let icon_element = ConstrainedBox::new(config.icon.to_warpui_icon(icon_color).finish())
+            .with_width(icon_size)
+            .with_height(icon_size)
+            .finish();
+        let container = Container::new(icon_element)
+            .with_margin_left(icon_size / 2.)
+            .finish();
+        Some(Shrinkable::new(1., Align::new(container).right().finish()).finish())
     }
 
     fn render_right_aligned_chevron(
@@ -1046,6 +1255,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
                 menu_width,
                 is_selected,
                 state.is_hovered(),
+                self.clip_config,
                 appearance,
                 app,
             );
@@ -1070,27 +1280,44 @@ impl<A: Action + Clone> MenuItemFields<A> {
                 }
                 label_row.add_child(Shrinkable::new(1., content_column.finish()).finish());
             } else {
-                label_row.add_child(label_element);
+                // Keep a clipped label from pushing its right-side label out of bounds.
+                if self.clip_config.is_some() && self.right_side_label.is_some() {
+                    label_row.add_child(Expanded::new(1., label_element).finish());
+                } else {
+                    label_row.add_child(label_element);
+                }
 
                 if self.has_submenu {
                     label_row
                         .add_child(self.render_right_aligned_chevron(appearance, primary_color));
-                } else if let Some(right_label) =
-                    self.render_right_side_label(appearance, secondary_color.into())
+                } else {
+                    match self.render_right_side_label(appearance, secondary_color.into()) {
+                        Some(right_label) => {
+                            label_row.add_child(right_label);
+                        }
+                        _ => match self.render_key_shortcut(appearance, secondary_color.into()) {
+                            Some(key_shortcut) => {
+                                label_row.add_child(key_shortcut);
+                            }
+                            _ => {
+                                if let Some(timestamp) = &self.timestamp {
+                                    label_row.add_child(self.render_right_aligned_time_estimation(
+                                        timestamp,
+                                        font_family,
+                                        font_size,
+                                        text_background_color,
+                                        appearance,
+                                    ));
+                                }
+                            }
+                        },
+                    }
+                }
+
+                if let Some(right_icon) =
+                    self.render_right_side_icon(appearance, primary_color, dispatch_item_actions)
                 {
-                    label_row.add_child(right_label);
-                } else if let Some(key_shortcut) =
-                    self.render_key_shortcut(appearance, secondary_color.into())
-                {
-                    label_row.add_child(key_shortcut);
-                } else if let Some(timestamp) = &self.timestamp {
-                    label_row.add_child(self.render_right_aligned_time_estimation(
-                        timestamp,
-                        font_family,
-                        font_size,
-                        text_background_color,
-                        appearance,
-                    ));
+                    label_row.add_child(right_icon);
                 }
             }
 
@@ -1126,35 +1353,35 @@ impl<A: Action + Clone> MenuItemFields<A> {
             };
 
             // Render tooltip if present and hovered
-            if let Some(tooltip_text) = &self.tooltip {
-                if state.is_hovered() {
-                    let tooltip_element = appearance
-                        .ui_builder()
-                        .tool_tip(tooltip_text.clone())
-                        .build()
-                        .finish();
-                    let positioning = match self.tooltip_position {
-                        MenuTooltipPosition::Right => OffsetPositioning::offset_from_parent(
-                            vec2f(4., 0.),
-                            ParentOffsetBounds::WindowByPosition,
-                            ParentAnchor::MiddleRight,
-                            ChildAnchor::MiddleLeft,
-                        ),
-                        MenuTooltipPosition::Above => OffsetPositioning::offset_from_parent(
-                            vec2f(0., -4.),
-                            ParentOffsetBounds::WindowByPosition,
-                            ParentAnchor::TopMiddle,
-                            ChildAnchor::BottomMiddle,
-                        ),
-                    };
-                    let mut stack = Stack::new();
-                    stack.add_child(container_element);
-                    // Use add_positioned_child instead of add_positioned_overlay_child
-                    // to prevent the tooltip from intercepting mouse events and causing
-                    // hover state flickering on the parent menu item.
-                    stack.add_positioned_child(tooltip_element, positioning);
-                    return stack.finish();
-                }
+            if let Some(tooltip_text) = &self.tooltip
+                && state.is_hovered()
+            {
+                let tooltip_element = appearance
+                    .ui_builder()
+                    .tool_tip(tooltip_text.clone())
+                    .build()
+                    .finish();
+                let positioning = match self.tooltip_position {
+                    MenuTooltipPosition::Right => OffsetPositioning::offset_from_parent(
+                        vec2f(4., 0.),
+                        ParentOffsetBounds::WindowByPosition,
+                        ParentAnchor::MiddleRight,
+                        ChildAnchor::MiddleLeft,
+                    ),
+                    MenuTooltipPosition::Above => OffsetPositioning::offset_from_parent(
+                        vec2f(0., -4.),
+                        ParentOffsetBounds::WindowByPosition,
+                        ParentAnchor::TopMiddle,
+                        ChildAnchor::BottomMiddle,
+                    ),
+                };
+                let mut stack = Stack::new();
+                stack.add_child(container_element);
+                // Use add_positioned_child instead of add_positioned_overlay_child
+                // to prevent the tooltip from intercepting mouse events and causing
+                // hover state flickering on the parent menu item.
+                stack.add_positioned_child(tooltip_element, positioning);
+                return stack.finish();
             }
 
             container_element
@@ -1188,6 +1415,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
                 });
             }
         });
+        ret = ret.with_defer_events_to_children();
 
         let on_select_action = self.on_select_action.clone();
 
@@ -1725,13 +1953,12 @@ impl<A: Action + Clone> SubMenu<A> {
         if matches!(
             selection_source,
             MenuSelectionSource::KeyboardOrProgrammatic
-        ) {
-            if let MenuVariant::Scrollable(scroll_state) = &self.menu_variant {
-                scroll_state.scroll_to_position(ScrollTarget {
-                    position_id: Self::save_position_id(self.depth),
-                    mode: ScrollToPositionMode::FullyIntoView,
-                });
-            }
+        ) && let MenuVariant::Scrollable(scroll_state) = &self.menu_variant
+        {
+            scroll_state.scroll_to_position(ScrollTarget {
+                position_id: Self::save_position_id(self.depth),
+                mode: ScrollToPositionMode::FullyIntoView,
+            });
         }
         ctx.emit(Event::ItemSelected);
         ctx.notify();
@@ -1908,42 +2135,44 @@ impl<A: Action + Clone> SubMenu<A> {
         let depth = self.depth;
         match &self.menu_variant {
             MenuVariant::Fixed => {
-                let mut menus = vec![Flex::column()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                    .with_children(self.items.iter().enumerate().map(
-                        |(index, item)| -> Box<dyn Element> {
-                            let is_selected = selected_row == Some(index);
-                            // When the safe zone is active, suppress hover highlighting on
-                            // non-anchor rows so intermediate items don't flash as the
-                            // mouse moves toward the sidecar.
-                            let safe_zone_suppresses_hover =
-                                safe_zone_anchor_row.is_some_and(|anchor| anchor != index);
-                            let submenu_being_shown_for_item =
-                                submenu_being_shown_for_item_index == Some(index);
-                            let item = item.render(
-                                menu_background_color,
-                                depth,
-                                index,
-                                selected_item,
-                                dispatch_item_actions,
-                                is_selected,
-                                ignore_hover_when_covered,
-                                safe_zone_suppresses_hover,
-                                submenu_being_shown_for_item,
-                                appearance,
-                                submenu_width,
-                                app,
-                            );
-                            let item = if is_selected {
-                                let save_position = Self::save_position_id(depth);
-                                SavePosition::new(item, &save_position).finish()
-                            } else {
-                                item
-                            };
-                            Container::new(item).finish()
-                        },
-                    ))
-                    .finish()];
+                let mut menus = vec![
+                    Flex::column()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                        .with_children(self.items.iter().enumerate().map(
+                            |(index, item)| -> Box<dyn Element> {
+                                let is_selected = selected_row == Some(index);
+                                // When the safe zone is active, suppress hover highlighting on
+                                // non-anchor rows so intermediate items don't flash as the
+                                // mouse moves toward the sidecar.
+                                let safe_zone_suppresses_hover =
+                                    safe_zone_anchor_row.is_some_and(|anchor| anchor != index);
+                                let submenu_being_shown_for_item =
+                                    submenu_being_shown_for_item_index == Some(index);
+                                let item = item.render(
+                                    menu_background_color,
+                                    depth,
+                                    index,
+                                    selected_item,
+                                    dispatch_item_actions,
+                                    is_selected,
+                                    ignore_hover_when_covered,
+                                    safe_zone_suppresses_hover,
+                                    submenu_being_shown_for_item,
+                                    appearance,
+                                    submenu_width,
+                                    app,
+                                );
+                                let item = if is_selected {
+                                    let save_position = Self::save_position_id(depth);
+                                    SavePosition::new(item, &save_position).finish()
+                                } else {
+                                    item
+                                };
+                                Container::new(item).finish()
+                            },
+                        ))
+                        .finish(),
+                ];
                 let Some(selected_row) = self.selected_item() else {
                     return menus;
                 };
@@ -1999,20 +2228,22 @@ impl<A: Action + Clone> SubMenu<A> {
                         Container::new(item).finish()
                     }));
 
-                vec![ConstrainedBox::new(
-                    ClippedScrollable::vertical(
-                        scroll_state.clone(),
-                        column_of_items.finish(),
-                        ScrollbarWidth::Auto,
-                        appearance.theme().nonactive_ui_detail().into(),
-                        appearance.theme().active_ui_detail().into(),
-                        warpui::elements::Fill::None,
+                vec![
+                    ConstrainedBox::new(
+                        ClippedScrollable::vertical(
+                            scroll_state.clone(),
+                            column_of_items.finish(),
+                            ScrollbarWidth::Auto,
+                            appearance.theme().nonactive_ui_detail().into(),
+                            appearance.theme().active_ui_detail().into(),
+                            warpui::elements::Fill::None,
+                        )
+                        .with_overlayed_scrollbar()
+                        .finish(),
                     )
-                    .with_overlayed_scrollbar()
+                    .with_max_height(height)
                     .finish(),
-                )
-                .with_max_height(height)
-                .finish()]
+                ]
             }
         }
     }
@@ -2036,6 +2267,7 @@ impl<A: Action + Clone> Menu<A> {
             pinned_header_builder: None,
             content_top_padding_override: None,
             content_bottom_padding_override: None,
+            width_match_position_id: None,
             dispatch_item_actions: true,
         }
     }
@@ -2117,6 +2349,9 @@ impl<A: Action + Clone> Menu<A> {
 
     pub fn set_width(&mut self, width: f32) {
         self.submenu_width = width;
+    }
+    pub fn set_width_match_position_id(&mut self, position_id: Option<String>) {
+        self.width_match_position_id = position_id;
     }
 
     pub fn set_border(&mut self, border: Option<Border>) {
@@ -2253,6 +2488,11 @@ impl<A: Action + Clone> Menu<A> {
 
     pub fn select_next(&mut self, ctx: &mut ViewContext<Self>) {
         self.select(SelectAction::Next, ctx);
+    }
+
+    /// Select the first selectable item in the menu. No-op if no item is selectable.
+    pub fn select_first(&mut self, ctx: &mut ViewContext<Self>) {
+        self.menu.select_first_selectable(ctx);
     }
 
     #[cfg(test)]
@@ -2445,13 +2685,13 @@ impl<A: Action + Clone> TypedActionView for Menu<A> {
     }
 
     fn handle_action(&mut self, action: &MenuAction, ctx: &mut ViewContext<Self>) {
-        if let MenuAction::HoverSubmenuLeafNode { position, .. } = action {
-            if let Some(st) = &mut self.safe_triangle {
-                if st.should_suppress_hover(*position) {
-                    return;
-                }
-                st.update_position(*position);
+        if let MenuAction::HoverSubmenuLeafNode { position, .. } = action
+            && let Some(st) = &mut self.safe_triangle
+        {
+            if st.should_suppress_hover(*position) {
+                return;
             }
+            st.update_position(*position);
         }
 
         self.menu
@@ -2664,13 +2904,24 @@ impl<A: Action + Clone> View for Menu<A> {
             .as_ref()
             .filter(|st| st.is_suppressing())
             .and(self.menu.hovered_row_index);
+        let window_id = self.window_id(app);
+        let submenu_width = self
+            .width_match_position_id
+            .as_deref()
+            .and_then(|position_id| {
+                window_id.and_then(|window_id| {
+                    app.element_position_by_id_at_last_frame(window_id, position_id)
+                })
+            })
+            .map(|bounds| bounds.width())
+            .unwrap_or(self.submenu_width);
 
         self.menu.render(
             self.border,
-            self.submenu_width,
+            submenu_width,
             self.with_drop_shadow,
             self.origin,
-            self.window_id(app),
+            window_id,
             self.prevent_interaction_with_other_elements,
             self.dispatch_item_actions,
             self.ignore_hover_when_covered,
@@ -2730,5 +2981,5 @@ impl<A: Action + Clone> MenuItem<A> {
 }
 
 #[cfg(test)]
-#[path = "menu_test.rs"]
+#[path = "menu_tests.rs"]
 mod tests;

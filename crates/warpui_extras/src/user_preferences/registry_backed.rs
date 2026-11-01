@@ -1,10 +1,12 @@
 use std::io;
 
+use warp_errors::report_error;
+use windows_registry::{CURRENT_USER, Key};
+use windows_result::HRESULT;
+
 /// Store user preferences in the Windows Registry.
 /// Modeled after https://github.com/neovide/neovide/blob/main/src/windows_utils.rs .
 use super::UserPreferences;
-use windows_registry::{Key, CURRENT_USER};
-use windows_result::HRESULT;
 
 pub struct RegistryBackedPreferences {
     app_key_path: String,
@@ -24,7 +26,10 @@ impl RegistryBackedPreferences {
     /// Gets Warp's registry key, creating it if it does not already exist.
     fn get_warp_registry(&self) -> Result<Key, super::Error> {
         CURRENT_USER.create(self.app_key_path.clone()).map_err(|e| {
-            log::error!("unable to access Warp app key in Windows Registry: {e:#}");
+            report_error!(
+                anyhow::Error::new(e.clone())
+                    .context("unable to access Warp app key in Windows Registry")
+            );
             super::Error::IoError(io::Error::from(e))
         })
     }

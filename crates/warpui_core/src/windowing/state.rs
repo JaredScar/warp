@@ -1,18 +1,15 @@
-use pathfinder_geometry::rect::RectF;
-use std::{
-    collections::VecDeque,
-    fmt::{Display, Formatter},
-};
+use std::collections::VecDeque;
+use std::fmt::{Display, Formatter};
 
-use crate::{
-    geometry,
-    platform::{self, FullscreenState, TerminationMode, WindowFocusBehavior},
-    scene::{CornerRadius, Radius},
-    windowing, DisplayId, DisplayIdx, Entity, ModelContext, OptionalPlatformWindow,
-    SingletonEntity, WindowId,
-};
+use pathfinder_geometry::rect::RectF;
 
 use super::WindowCallbacks;
+use crate::platform::{self, FullscreenState, TerminationMode, WindowFocusBehavior};
+use crate::scene::{CornerRadius, Radius};
+use crate::{
+    DisplayId, DisplayIdx, Entity, ModelContext, OptionalPlatformWindow, SingletonEntity, WindowId,
+    geometry, windowing,
+};
 
 /// Description of the current stage in the lifecycle of the app.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -94,6 +91,14 @@ impl WindowManager {
         self.platform.set_window_bounds(window_id, bound)
     }
 
+    /// Sets the per-window opacity, where `1.0` is fully opaque and `0.0` is fully
+    /// transparent. Cheap alternative to `hide_window` for cases where the window
+    /// only needs to disappear visually (e.g. tab drag preview) without changing
+    /// focus, key state, or z-order.
+    pub fn set_window_alpha(&self, window_id: WindowId, alpha: f32) {
+        self.platform.set_window_alpha(window_id, alpha)
+    }
+
     pub fn cancel_synthetic_drag(&self, window_id: WindowId) {
         self.platform.cancel_synthetic_drag(window_id)
     }
@@ -122,11 +127,6 @@ impl WindowManager {
             .set_all_windows_background_blur_radius(blur_radius_pixels)
     }
 
-    pub fn set_all_windows_background_blur_texture(&self, use_blur_texture: bool) {
-        self.platform
-            .set_all_windows_background_blur_texture(use_blur_texture)
-    }
-
     pub fn set_window_title(&self, window_id: WindowId, title: &str) {
         self.platform.set_window_title(window_id, title)
     }
@@ -146,6 +146,14 @@ impl WindowManager {
 
     pub fn active_window(&self) -> Option<WindowId> {
         self.platform.active_window_id()
+    }
+
+    /// Test-only helper: returns the window most recently passed to
+    /// `show_window_and_focus_app`. Only the `test` platform tracks this; other platforms
+    /// report focus via `active_window` instead.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn last_window_shown_and_focused_for_test(&self) -> Option<WindowId> {
+        self.platform.last_window_shown_and_focused_for_test()
     }
 
     // Get the rect of the current active screen. We need the bound instead of just
@@ -191,6 +199,21 @@ impl WindowManager {
             8.
         };
         CornerRadius::with_all(Radius::Pixels(radius))
+    }
+
+    /// Like [`Self::window_corner_radius`], but square when the given window is fullscreen: a
+    /// fullscreen window occupies the entire screen, and rounding its corners leaves transparent
+    /// notches at the screen corners that square content behind can poke through.
+    pub fn window_corner_radius_for_window(&self, window_id: WindowId) -> CornerRadius {
+        let is_fullscreen = self
+            .platform_window(window_id)
+            .map(|window| window.fullscreen_state() == FullscreenState::Fullscreen)
+            .unwrap_or(false);
+        if is_fullscreen {
+            CornerRadius::with_all(Radius::Pixels(0.))
+        } else {
+            self.window_corner_radius()
+        }
     }
 
     pub(crate) fn open_window(

@@ -1,19 +1,19 @@
-use super::new_session_option::{Direction, NewSessionConfig};
-use super::new_session_option::{NewSessionOption, NewSessionOptionId};
-use super::search_item::SearchItem;
-use crate::search::data_source::DataSourceSearchError;
-use crate::search::{
-    binding_source::BindingSource,
-    command_palette::mixer::CommandPaletteItemAction,
-    data_source::{Query, QueryResult},
-    mixer::{DataSourceRunErrorWrapper, SyncDataSource},
-};
-use crate::terminal::available_shells::AvailableShells;
-use fuzzy_match::{match_indices_case_insensitive, FuzzyMatchResult};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use fuzzy_match::{FuzzyMatchResult, match_indices_case_insensitive};
 use warp_core::features::FeatureFlag;
 use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
+
+use super::new_session_option::{
+    Direction, NewSessionConfig, NewSessionOption, NewSessionOptionId,
+};
+use super::search_item::SearchItem;
+use crate::search::binding_source::BindingSource;
+use crate::search::command_palette::mixer::CommandPaletteItemAction;
+use crate::search::data_source::{DataSourceSearchError, Query, QueryResult};
+use crate::search::mixer::{DataSourceRunErrorWrapper, SyncDataSource};
+use crate::terminal::available_shells::AvailableShells;
 
 /// Controls which kinds of new sessions the data source should surface.
 #[derive(Copy, Clone, Debug)]
@@ -47,7 +47,7 @@ impl AllowedSessionKinds {
 /// Gathers this data by:
 /// - Listening for any binding source changes
 /// - Comparing the options in binding sources (open new tab, open new window, etc.)
-///   to the list of available shells, and creates an interesction of those items.
+///   to the list of available shells, and creates an intersection of those items.
 pub struct NewSessionDataSource {
     searcher: Box<dyn NewSessionSearcher>,
     allowed: AllowedSessionKinds,
@@ -189,9 +189,7 @@ impl SyncDataSource for NewSessionDataSource {
     ) -> Result<Vec<QueryResult<Self::Action>>, DataSourceRunErrorWrapper> {
         let search_term = query.text.as_str();
         self.searcher.search(search_term).map_err(|err| {
-            let search_error = DataSourceSearchError {
-                message: err.to_string(),
-            };
+            let search_error = DataSourceSearchError::new(err.to_string());
             Box::new(search_error) as DataSourceRunErrorWrapper
         })
     }
@@ -301,9 +299,15 @@ impl NewSessionSearcher for FuzzyNewSessionSearcher {
 
 #[cfg(not(target_family = "wasm"))]
 mod full_text_searcher {
-    use crate::define_search_schema;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use fuzzy_match::FuzzyMatchResult;
+    use warp_search_core::define_search_schema;
+    use warpui::r#async::executor::Background;
+
     use crate::search::command_palette::new_session::data_source::{
-        NewSessionSearcher, SearcherAction, SEARCHER_BASE_STRINGS,
+        NewSessionSearcher, SEARCHER_BASE_STRINGS, SearcherAction,
     };
     use crate::search::command_palette::new_session::search_item::SearchItem;
     use crate::search::command_palette::new_session::{NewSessionOption, NewSessionOptionId};
@@ -311,10 +315,6 @@ mod full_text_searcher {
     use crate::search::searcher::{
         AsyncSearcher, DEFAULT_MEMORY_BUDGET, MIN_MEMORY_BUDGET, SCORE_CONVERSION_FACTOR,
     };
-    use fuzzy_match::FuzzyMatchResult;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use warpui::r#async::executor::Background;
 
     define_search_schema!(
         schema_name: NEW_SESSION_SEARCH_SCHEMA,
@@ -373,7 +373,9 @@ mod full_text_searcher {
 
         fn build_index(&mut self) {
             if self.rebuild_search_index().is_err() {
-                log::error!("Failed to create search index writer for new session options");
+                warp_errors::report_error!(
+                    "Failed to create search index writer for new session options"
+                );
                 self.clear_search_index();
             }
         }
@@ -409,7 +411,9 @@ mod full_text_searcher {
                 .build_index_async(max_match_documents)
                 .is_err()
             {
-                log::error!("Failed to build search index for base text of new session search");
+                warp_errors::report_error!(
+                    "Failed to build search index for base text of new session search"
+                );
                 if max_match_searcher.clear_search_index_async().is_err() {
                     max_match_searcher = BASE_TEXT_SEARCH_SCHEMA
                         .create_async_searcher(MIN_MEMORY_BUDGET, background_executor.clone())
@@ -425,7 +429,6 @@ mod full_text_searcher {
         }
 
         fn rebuild_search_index(&mut self) -> Result<(), anyhow::Error> {
-            self.clear_search_index();
             let documents = self.shell_id_to_options.iter().map(|(id, option)| {
                 let binding_description = option.description().to_lowercase();
 
@@ -434,7 +437,7 @@ mod full_text_searcher {
                     id: id.0.clone(),
                 }
             });
-            self.searcher.build_index_async(documents)
+            self.searcher.rebuild_index_async(documents)
         }
 
         fn clear_search_index(&mut self) {

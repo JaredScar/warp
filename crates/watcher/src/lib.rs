@@ -1,27 +1,24 @@
-use std::{
-    collections::{HashMap, HashSet},
-    future::Future,
-    path::{Path, PathBuf},
-    sync::mpsc::{self, channel},
-    thread,
-    time::Duration,
-};
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, channel};
+use std::thread;
+use std::time::Duration;
 
 pub mod home_watcher;
-pub use home_watcher::{HomeDirectoryWatcher, HomeDirectoryWatcherEvent};
-
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::channel::oneshot;
-use notify_debouncer_full::{
-    new_debouncer_opt,
-    notify::{
-        self,
-        event::{ModifyKind, RenameMode},
-        EventKind, RecommendedWatcher, RecursiveMode, WatchFilter,
-    },
-    DebounceEventHandler, DebounceEventResult, DebouncedEvent, Debouncer, NoCache,
+pub use home_watcher::{HomeDirectoryWatcher, HomeDirectoryWatcherEvent};
+use notify_debouncer_full::notify::event::{ModifyKind, RenameMode};
+use notify_debouncer_full::notify::{
+    self, EventKind, RecommendedWatcher, RecursiveMode, WatchFilter,
 };
-use warpui::{Entity, ModelContext};
+use notify_debouncer_full::{
+    DebounceEventHandler, DebounceEventResult, DebouncedEvent, Debouncer, NoCache,
+    new_debouncer_opt,
+};
+use warp_errors::report_error;
+use warpui_core::{Entity, ModelContext};
 
 #[derive(Debug)]
 enum BackgroundFileWatcherCommand {
@@ -47,20 +44,19 @@ impl BackgroundFileWatcher {
         debounce_duration: Duration,
         handler: WatcherEventHandler,
         rx: mpsc::Receiver<BackgroundFileWatcherCommand>,
-    ) -> Self {
+    ) -> Result<Self> {
         let debounced_watcher = new_debouncer_opt(
             debounce_duration,
             None,
             handler,
             NoCache,
             notify::Config::default(),
-        )
-        .expect("Should be able to create watcher");
+        )?;
 
-        Self {
+        Ok(Self {
             notifier: debounced_watcher,
             rx,
-        }
+        })
     }
 
     /// Listen to streamed in commands to modify the internal notifier state.
@@ -134,6 +130,20 @@ impl BulkFilesystemWatcherEvent {
     }
 }
 
+/// Validates a path before it reaches the platform watcher.
+///
+/// An empty path is not a location, and the platform backends handle it badly enough to be fatal:
+/// on macOS `notify` cannot build a CoreFoundation URL for it and then releases a null `CFError`,
+/// which traps and takes the whole process down. Rejecting it here keeps a caller's bad path from
+/// being a crash. See Sentry issue
+/// [WARP-CLIENT-DEV-XT3](https://warpdotdev.sentry.io/issues/WARP-CLIENT-DEV-XT3).
+fn ensure_watchable_path(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("the filesystem watcher cannot watch an empty path");
+    }
+    Ok(path.to_path_buf())
+}
+
 /// Model for watching for all file / folder changes under target directories.
 /// The updates are debounced with a configurable duration.
 pub struct BulkFilesystemWatcher {
@@ -150,15 +160,27 @@ impl BulkFilesystemWatcher {
         if let Err(e) = thread::Builder::new()
             .name("Bulk Filesystem Watcher".into())
             .spawn(move || {
-                let watcher = BackgroundFileWatcher::new(
+                match BackgroundFileWatcher::new(
                     debounce_duration,
                     WatcherEventHandler { tx },
                     bg_rx,
-                );
-                watcher.run();
+                ) {
+                    Ok(watcher) => watcher.run(),
+                    Err(e) => {
+                        // The thread exits, which drops `bg_rx` and the
+                        // event-channel sender. Subsequent `register_path` /
+                        // `unregister_path` calls will get `SendError` and
+                        // log a warning — the app continues without file
+                        // watching.
+                        report_error!(e.context(
+                            "Failed to create filesystem watcher, file watching will be disabled"
+                        ));
+                    }
+                }
             })
+            .context("Failed to spawn thread for background file watcher")
         {
-            log::error!("Failed to spawn thread for background file watcher {e:?}");
+            report_error!(e);
         }
         ctx.spawn_stream_local(rx, Self::handle_watcher_event, |_, _| {});
 
@@ -172,15 +194,16 @@ impl BulkFilesystemWatcher {
 
     /// Stop watching a path. The returned future resolves once the path is fully unregistered.
     /// Awaiting the future is *not* required for the path to be unregistered.
-    pub fn unregister_path(&mut self, path: &Path) -> impl Future<Output = Result<()>> {
+    pub fn unregister_path(&mut self, path: &Path) -> impl Future<Output = Result<()>> + use<> {
         let (tx, rx) = oneshot::channel();
-        let send_result = self.tx.send(BackgroundFileWatcherCommand::RemovePath {
-            path: path.to_path_buf(),
-            response: tx,
+        let send_result = ensure_watchable_path(path).and_then(|path| {
+            self.tx
+                .send(BackgroundFileWatcherCommand::RemovePath { path, response: tx })
+                .map_err(anyhow::Error::new)
         });
 
-        if send_result.is_err() {
-            log::warn!("Filesystem watcher thread has exited");
+        if let Err(error) = &send_result {
+            log::warn!("Failed to unregister watched path: {error:#}");
         }
 
         async move {
@@ -197,17 +220,21 @@ impl BulkFilesystemWatcher {
         path: &Path,
         watch_filter: WatchFilter,
         recursive_mode: RecursiveMode,
-    ) -> impl Future<Output = Result<()>> {
+    ) -> impl Future<Output = Result<()>> + use<> {
         let (tx, rx) = oneshot::channel();
-        let send_result = self.tx.send(BackgroundFileWatcherCommand::AddPath {
-            path: path.to_path_buf(),
-            filter: watch_filter,
-            response: tx,
-            recursive_mode,
+        let send_result = ensure_watchable_path(path).and_then(|path| {
+            self.tx
+                .send(BackgroundFileWatcherCommand::AddPath {
+                    path,
+                    filter: watch_filter,
+                    response: tx,
+                    recursive_mode,
+                })
+                .map_err(anyhow::Error::new)
         });
 
-        if send_result.is_err() {
-            log::warn!("Filesystem watcher thread has exited");
+        if let Err(error) = &send_result {
+            log::warn!("Failed to register watched path: {error:#}");
         }
 
         async move {
@@ -240,10 +267,9 @@ impl DebounceEventHandler for WatcherEventHandler {
             Ok(debounce_events) => {
                 if let Ok(config_event) =
                     deduplicate_and_merge_raw_notifier_events(&debounce_events)
+                    && let Err(e) = self.tx.try_send(config_event)
                 {
-                    if let Err(e) = self.tx.try_send(config_event) {
-                        log::warn!("Failed to send WatcherEvent: {e:?}");
-                    }
+                    log::warn!("Failed to send WatcherEvent: {e:?}");
                 }
             }
             Err(e) => {
@@ -376,3 +402,7 @@ fn deduplicate_and_merge_raw_notifier_events(
 
     Ok(update)
 }
+
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;

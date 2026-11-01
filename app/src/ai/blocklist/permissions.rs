@@ -1,35 +1,32 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-};
-
-use crate::{
-    ai::{
-        agent::conversation::AIConversationId,
-        execution_profiles::{
-            profiles::{AIExecutionProfilesModel, ClientProfileId},
-            AIExecutionProfile, ActionPermission, AskUserQuestionPermission, WriteToPtyPermission,
-        },
-    },
-    report_if_error,
-    settings::{AISettings, AgentModeCodingPermissionsType, AgentModeCommandExecutionPredicate},
-    workspaces::{user_workspaces::UserWorkspaces, workspace::AiAutonomySettings},
-};
-use warp_core::execution_mode::AppExecutionMode;
-
-use crate::ai::mcp::mcp_provider_from_file_path;
-#[cfg(not(target_family = "wasm"))]
-use crate::ai::mcp::TemplatableMCPServerManager;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use warp_completer::parsers::simple::decompose_command;
+use warp_completer::parsers::simple::{command_without_leading_env_vars, decompose_command};
+use warp_core::execution_mode::AppExecutionMode;
+use warp_core::features::FeatureFlag;
+use warp_core::settings::Setting;
 use warp_core::user_preferences::GetUserPreferences;
-use warp_core::{features::FeatureFlag, settings::Setting};
+use warp_errors::{report_error, report_if_error};
 use warp_util::path::EscapeChar;
 use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity};
 
 use super::BlocklistAIHistoryModel;
+use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
+use crate::ai::execution_profiles::{
+    AIExecutionProfile, ActionPermission, AskUserQuestionPermission, ComputerUsePermission,
+    ExecutionProfileId, WriteToPtyPermission,
+};
+#[cfg(not(target_family = "wasm"))]
+use crate::ai::mcp::TemplatableMCPServerManager;
+use crate::ai::mcp::mcp_provider_from_file_path;
+use crate::settings::{
+    AISettings, AgentModeCodingPermissionsType, AgentModeCommandExecutionPredicate,
+};
+use crate::workspaces::user_workspaces::{TeamScope, UserWorkspaces};
+use crate::workspaces::workspace::AiAutonomySettings;
 
 /// Whether or not a command can be auto-executed, along with a detailed reason.
 #[derive(Copy, Clone, Debug, Deserialize, Serialize)]
@@ -128,8 +125,8 @@ pub enum FileWritePermissionDeniedReason {
     AlwaysAskEnabled,
     Inconclusive,
     AgentDecided,
-    /// The path is a system-protected file (e.g. an MCP config) that must never
-    /// be auto-written regardless of user autonomy settings.
+    /// The path is a system-protected file (e.g. an MCP config) that requires explicit approval
+    /// in local sessions regardless of autonomy settings.
     ProtectedPath,
 }
 
@@ -156,7 +153,10 @@ impl BlocklistAIPermissions {
                 .private_user_preferences()
                 .remove_value("AgentModeAutoReadFiles")
             {
-                log::error!("Failed to remove old AgentModeAutoReadFiles user pref: {e}");
+                report_error!(
+                    anyhow::Error::new(e)
+                        .context("Failed to remove old AgentModeAutoReadFiles user pref")
+                );
             }
             if can_read_files {
                 report_if_error!(AISettings::handle(ctx).update(ctx, |settings, ctx| {
@@ -175,8 +175,9 @@ impl BlocklistAIPermissions {
     /// Returns the active permissions profile, accounting for any enterprise overrides.
     pub fn permissions_profile_for_id(
         &self,
+        profile_id: &ExecutionProfileId,
+        scope: &impl TeamScope,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
     ) -> AIExecutionProfile {
         let profiles_model = AIExecutionProfilesModel::as_ref(ctx);
         let profile = profiles_model
@@ -186,18 +187,21 @@ impl BlocklistAIPermissions {
 
         AIExecutionProfile {
             // Some fields may have an enterprise override.
-            apply_code_diffs: self.get_apply_code_diffs_setting_for_profile(ctx, profile_id),
-            read_files: self.get_read_files_setting_for_profile(ctx, profile_id),
-            execute_commands: self.get_execute_commands_setting_for_profile(ctx, profile_id),
+            apply_code_diffs: self.get_apply_code_diffs_setting_for_profile(profile_id, scope, ctx),
+            read_files: self.get_read_files_setting_for_profile(profile_id, scope, ctx),
+            execute_commands: self.get_execute_commands_setting_for_profile(profile_id, scope, ctx),
             mcp_permissions: self.get_mcp_permissions_setting_for_profile(ctx, profile_id),
-            write_to_pty: self.get_write_to_pty_setting_for_profile(ctx, profile_id),
-            command_allowlist: self.get_execute_commands_allowlist_for_profile(ctx, profile_id),
-            command_denylist: self.get_execute_commands_denylist_for_profile(ctx, profile_id),
-            directory_allowlist: self.get_read_files_allowlist_for_profile(ctx, profile_id),
+            write_to_pty: self.get_write_to_pty_setting_for_profile(profile_id, scope, ctx),
+            command_allowlist: self
+                .get_execute_commands_allowlist_for_profile(profile_id, scope, ctx),
+            command_denylist: self
+                .get_execute_commands_denylist_for_profile(profile_id, scope, ctx),
+            directory_allowlist: self.get_read_files_allowlist_for_profile(profile_id, scope, ctx),
             mcp_allowlist: self.get_mcp_allowlist_for_profile(ctx, profile_id),
             mcp_denylist: self.get_mcp_denylist_for_profile(ctx, profile_id),
-            computer_use: self.get_computer_use_setting_for_profile(ctx, profile_id),
+            computer_use: self.get_computer_use_setting_for_profile(profile_id, scope, ctx),
             ask_user_question: self.get_ask_user_question_setting_for_profile(ctx, profile_id),
+            run_agents: self.get_run_agents_setting_for_profile(ctx, profile_id),
 
             // Some fields are read directly from the profile.
             name: profile_data.name.clone(),
@@ -214,35 +218,37 @@ impl BlocklistAIPermissions {
 
     pub fn active_permissions_profile(
         &self,
-        ctx: &AppContext,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
+        ctx: &AppContext,
     ) -> AIExecutionProfile {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
-        self.permissions_profile_for_id(ctx, *active_profile.id())
+        self.permissions_profile_for_id(active_profile.id(), scope, ctx)
     }
 
     /// Returns the applicable workspace autonomy settings based on execution mode.
     /// In sandboxed mode, returns settings derived from the sandboxed agent config.
     /// In unsandboxed mode, returns the standard AI autonomy settings.
-    fn workspace_autonomy_settings(ctx: &AppContext) -> AiAutonomySettings {
+    fn team_autonomy_settings(scope: &impl TeamScope, ctx: &AppContext) -> AiAutonomySettings {
         if AppExecutionMode::as_ref(ctx).is_sandboxed() {
-            let sandboxed = UserWorkspaces::as_ref(ctx).sandboxed_agent_settings();
             AiAutonomySettings {
-                execute_commands_denylist: sandboxed.and_then(|s| s.execute_commands_denylist),
+                execute_commands_denylist: UserWorkspaces::as_ref(ctx)
+                    .sandboxed_agent_execute_commands_denylist_for_scope(scope),
                 ..Default::default()
             }
         } else {
-            UserWorkspaces::as_ref(ctx).ai_autonomy_settings()
+            UserWorkspaces::as_ref(ctx).ai_autonomy_settings(scope)
         }
     }
 
     pub fn get_apply_code_diffs_setting_for_profile(
         &self,
+        profile_id: &ExecutionProfileId,
+        scope: &impl TeamScope,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
     ) -> ActionPermission {
-        let autonomy_settings = Self::workspace_autonomy_settings(ctx);
+        let autonomy_settings = Self::team_autonomy_settings(scope, ctx);
         let apply_code_diffs_workspace_setting = autonomy_settings.apply_code_diffs_setting;
 
         apply_code_diffs_workspace_setting.unwrap_or_else(|| {
@@ -259,21 +265,23 @@ impl BlocklistAIPermissions {
     /// based on the workspace setting and the active profile.
     pub fn get_apply_code_diffs_setting(
         &self,
-        ctx: &AppContext,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
+        ctx: &AppContext,
     ) -> ActionPermission {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
 
-        self.get_apply_code_diffs_setting_for_profile(ctx, *active_profile.id())
+        self.get_apply_code_diffs_setting_for_profile(active_profile.id(), scope, ctx)
     }
 
     pub fn get_read_files_setting_for_profile(
         &self,
+        profile_id: &ExecutionProfileId,
+        scope: &impl TeamScope,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
     ) -> ActionPermission {
-        let autonomy_settings = Self::workspace_autonomy_settings(ctx);
+        let autonomy_settings = Self::team_autonomy_settings(scope, ctx);
         let read_files_workspace_setting = autonomy_settings.read_files_setting;
 
         read_files_workspace_setting.unwrap_or_else(|| {
@@ -290,20 +298,22 @@ impl BlocklistAIPermissions {
     /// based on the workspace setting and the active profile.
     pub fn get_read_files_setting(
         &self,
-        ctx: &AppContext,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
+        ctx: &AppContext,
     ) -> ActionPermission {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
-        self.get_read_files_setting_for_profile(ctx, *active_profile.id())
+        self.get_read_files_setting_for_profile(active_profile.id(), scope, ctx)
     }
 
     pub fn get_read_files_allowlist_for_profile(
         &self,
+        profile_id: &ExecutionProfileId,
+        scope: &impl TeamScope,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
     ) -> Vec<PathBuf> {
-        let autonomy_settings = Self::workspace_autonomy_settings(ctx);
+        let autonomy_settings = Self::team_autonomy_settings(scope, ctx);
         let read_files_workspace_allowlist = autonomy_settings.read_files_allowlist;
 
         read_files_workspace_allowlist.unwrap_or_else(|| {
@@ -322,20 +332,22 @@ impl BlocklistAIPermissions {
     /// should affect how this gets used, if at all.
     pub fn get_read_files_allowlist(
         &self,
-        ctx: &AppContext,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
+        ctx: &AppContext,
     ) -> Vec<PathBuf> {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
-        self.get_read_files_allowlist_for_profile(ctx, *active_profile.id())
+        self.get_read_files_allowlist_for_profile(active_profile.id(), scope, ctx)
     }
 
     pub fn get_execute_commands_setting_for_profile(
         &self,
+        profile_id: &ExecutionProfileId,
+        scope: &impl TeamScope,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
     ) -> ActionPermission {
-        let autonomy_settings = Self::workspace_autonomy_settings(ctx);
+        let autonomy_settings = Self::team_autonomy_settings(scope, ctx);
         let execute_commands_workspace_setting = autonomy_settings.execute_commands_setting;
 
         execute_commands_workspace_setting.unwrap_or_else(|| {
@@ -352,20 +364,22 @@ impl BlocklistAIPermissions {
     /// based on the workspace setting and the active profile.
     pub fn get_execute_commands_setting(
         &self,
-        ctx: &AppContext,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
+        ctx: &AppContext,
     ) -> ActionPermission {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
-        self.get_execute_commands_setting_for_profile(ctx, *active_profile.id())
+        self.get_execute_commands_setting_for_profile(active_profile.id(), scope, ctx)
     }
 
     pub fn get_execute_commands_allowlist_for_profile(
         &self,
+        profile_id: &ExecutionProfileId,
+        scope: &impl TeamScope,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
     ) -> Vec<AgentModeCommandExecutionPredicate> {
-        let autonomy_settings = Self::workspace_autonomy_settings(ctx);
+        let autonomy_settings = Self::team_autonomy_settings(scope, ctx);
         let execute_commands_workspace_allowlist = autonomy_settings.execute_commands_allowlist;
 
         execute_commands_workspace_allowlist.unwrap_or_else(|| {
@@ -384,32 +398,52 @@ impl BlocklistAIPermissions {
     /// should affect how this gets used, if at all.
     pub fn get_execute_commands_allowlist(
         &self,
-        ctx: &AppContext,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
+        ctx: &AppContext,
     ) -> Vec<AgentModeCommandExecutionPredicate> {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
-        self.get_execute_commands_allowlist_for_profile(ctx, *active_profile.id())
+        self.get_execute_commands_allowlist_for_profile(active_profile.id(), scope, ctx)
     }
 
     pub fn get_execute_commands_denylist_for_profile(
         &self,
+        profile_id: &ExecutionProfileId,
+        scope: &impl TeamScope,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
     ) -> Vec<AgentModeCommandExecutionPredicate> {
-        let autonomy_settings = Self::workspace_autonomy_settings(ctx);
+        let autonomy_settings = Self::team_autonomy_settings(scope, ctx);
+        let profiles_model = AIExecutionProfilesModel::as_ref(ctx);
+        let user_denylist = profiles_model
+            .get_profile_by_id(profile_id, ctx)
+            .unwrap_or_else(|| profiles_model.default_profile(ctx))
+            .data()
+            .command_denylist
+            .clone();
 
+        match autonomy_settings.execute_commands_denylist {
+            Some(org_denylist) => {
+                let mut merged = org_denylist;
+                for item in user_denylist {
+                    if !merged.contains(&item) {
+                        merged.push(item);
+                    }
+                }
+                merged
+            }
+            None => user_denylist,
+        }
+    }
+
+    pub fn get_org_execute_commands_denylist(
+        scope: &impl TeamScope,
+        ctx: &AppContext,
+    ) -> Vec<AgentModeCommandExecutionPredicate> {
+        let autonomy_settings = Self::team_autonomy_settings(scope, ctx);
         autonomy_settings
             .execute_commands_denylist
-            .unwrap_or_else(|| {
-                let profiles_model = AIExecutionProfilesModel::as_ref(ctx);
-                profiles_model
-                    .get_profile_by_id(profile_id, ctx)
-                    .unwrap_or_else(|| profiles_model.default_profile(ctx))
-                    .data()
-                    .command_denylist
-                    .clone()
-            })
+            .unwrap_or_default()
     }
 
     /// Returns a denylist of command regexes that AM should not auto-execute.
@@ -417,20 +451,22 @@ impl BlocklistAIPermissions {
     /// should affect how this gets used, if at all.
     pub fn get_execute_commands_denylist(
         &self,
-        ctx: &AppContext,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
+        ctx: &AppContext,
     ) -> Vec<AgentModeCommandExecutionPredicate> {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
-        self.get_execute_commands_denylist_for_profile(ctx, *active_profile.id())
+        self.get_execute_commands_denylist_for_profile(active_profile.id(), scope, ctx)
     }
 
     pub fn get_write_to_pty_setting_for_profile(
         &self,
+        profile_id: &ExecutionProfileId,
+        scope: &impl TeamScope,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
     ) -> WriteToPtyPermission {
-        let autonomy_settings = Self::workspace_autonomy_settings(ctx);
+        let autonomy_settings = Self::team_autonomy_settings(scope, ctx);
         let write_to_pty_workspace_setting = autonomy_settings.write_to_pty_setting;
 
         write_to_pty_workspace_setting.unwrap_or_else(|| {
@@ -445,18 +481,20 @@ impl BlocklistAIPermissions {
 
     pub fn get_write_to_pty_setting(
         &self,
-        ctx: &AppContext,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
+        ctx: &AppContext,
     ) -> WriteToPtyPermission {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
-        self.get_write_to_pty_setting_for_profile(ctx, *active_profile.id())
+        self.get_write_to_pty_setting_for_profile(active_profile.id(), scope, ctx)
     }
 
     pub fn can_write_to_pty(
         &self,
         conversation_id: &AIConversationId,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
         ctx: &AppContext,
     ) -> WriteToPtyPermission {
         if BlocklistAIHistoryModel::as_ref(ctx)
@@ -465,13 +503,13 @@ impl BlocklistAIPermissions {
         {
             return WriteToPtyPermission::AlwaysAllow;
         }
-        self.get_write_to_pty_setting(ctx, terminal_view_id)
+        self.get_write_to_pty_setting(terminal_view_id, scope, ctx)
     }
 
     pub fn get_mcp_permissions_setting_for_profile(
         &self,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
+        profile_id: &ExecutionProfileId,
     ) -> ActionPermission {
         // TODO: allow a workspace override on MCP permissions.
 
@@ -490,13 +528,13 @@ impl BlocklistAIPermissions {
     ) -> ActionPermission {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
-        self.get_mcp_permissions_setting_for_profile(ctx, *active_profile.id())
+        self.get_mcp_permissions_setting_for_profile(ctx, active_profile.id())
     }
 
     pub fn get_mcp_allowlist_for_profile(
         &self,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
+        profile_id: &ExecutionProfileId,
     ) -> Vec<uuid::Uuid> {
         // TODO: allow a workspace override on MCP allowlist.
 
@@ -516,13 +554,13 @@ impl BlocklistAIPermissions {
     ) -> Vec<uuid::Uuid> {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
-        self.get_mcp_allowlist_for_profile(ctx, *active_profile.id())
+        self.get_mcp_allowlist_for_profile(ctx, active_profile.id())
     }
 
     pub fn get_mcp_denylist_for_profile(
         &self,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
+        profile_id: &ExecutionProfileId,
     ) -> Vec<uuid::Uuid> {
         // TODO: allow a workspace override on MCP denylist.
 
@@ -542,13 +580,13 @@ impl BlocklistAIPermissions {
     ) -> Vec<uuid::Uuid> {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
-        self.get_mcp_denylist_for_profile(ctx, *active_profile.id())
+        self.get_mcp_denylist_for_profile(ctx, active_profile.id())
     }
 
     pub fn get_web_search_enabled_for_profile(
         &self,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
+        profile_id: &ExecutionProfileId,
     ) -> bool {
         let profiles_model = AIExecutionProfilesModel::as_ref(ctx);
         profiles_model
@@ -565,15 +603,16 @@ impl BlocklistAIPermissions {
     ) -> bool {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
-        self.get_web_search_enabled_for_profile(ctx, *active_profile.id())
+        self.get_web_search_enabled_for_profile(ctx, active_profile.id())
     }
 
     pub fn get_computer_use_setting_for_profile(
         &self,
+        profile_id: &ExecutionProfileId,
+        scope: &impl TeamScope,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
     ) -> crate::ai::execution_profiles::ComputerUsePermission {
-        let autonomy_settings = Self::workspace_autonomy_settings(ctx);
+        let autonomy_settings = Self::team_autonomy_settings(scope, ctx);
         let computer_use_workspace_setting = autonomy_settings.computer_use_setting;
 
         computer_use_workspace_setting.unwrap_or_else(|| {
@@ -588,18 +627,31 @@ impl BlocklistAIPermissions {
 
     pub fn get_computer_use_setting(
         &self,
-        ctx: &AppContext,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
+        ctx: &AppContext,
     ) -> crate::ai::execution_profiles::ComputerUsePermission {
+        if let Some(policy) = Self::team_autonomy_settings(scope, ctx).computer_use_setting {
+            return policy;
+        }
+        if let Some(selection) = terminal_view_id
+            .and_then(|id| AIExecutionProfilesModel::as_ref(ctx).session_computer_use(id))
+        {
+            return if selection.enabled {
+                ComputerUsePermission::AlwaysAllow
+            } else {
+                ComputerUsePermission::Never
+            };
+        }
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
-        self.get_computer_use_setting_for_profile(ctx, *active_profile.id())
+        self.get_computer_use_setting_for_profile(active_profile.id(), scope, ctx)
     }
 
     pub fn get_ask_user_question_setting_for_profile(
         &self,
         ctx: &AppContext,
-        profile_id: ClientProfileId,
+        profile_id: &ExecutionProfileId,
     ) -> AskUserQuestionPermission {
         let profiles_model = AIExecutionProfilesModel::as_ref(ctx);
         profiles_model
@@ -616,7 +668,30 @@ impl BlocklistAIPermissions {
     ) -> AskUserQuestionPermission {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
-        self.get_ask_user_question_setting_for_profile(ctx, *active_profile.id())
+        self.get_ask_user_question_setting_for_profile(ctx, active_profile.id())
+    }
+
+    pub fn get_run_agents_setting_for_profile(
+        &self,
+        ctx: &AppContext,
+        profile_id: &ExecutionProfileId,
+    ) -> crate::ai::execution_profiles::RunAgentsPermission {
+        let profiles_model = AIExecutionProfilesModel::as_ref(ctx);
+        profiles_model
+            .get_profile_by_id(profile_id, ctx)
+            .unwrap_or_else(|| profiles_model.default_profile(ctx))
+            .data()
+            .run_agents
+    }
+
+    pub fn get_run_agents_setting(
+        &self,
+        ctx: &AppContext,
+        terminal_view_id: Option<EntityId>,
+    ) -> crate::ai::execution_profiles::RunAgentsPermission {
+        let active_profile =
+            AIExecutionProfilesModel::as_ref(ctx).active_profile(terminal_view_id, ctx);
+        self.get_run_agents_setting_for_profile(ctx, active_profile.id())
     }
 
     /// Returns whether or not Agent Mode can auto-read the given files.
@@ -625,6 +700,7 @@ impl BlocklistAIPermissions {
         conversation_id: &AIConversationId,
         paths: Vec<PathBuf>,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
         ctx: &AppContext,
     ) -> FileReadPermission {
         if BlocklistAIHistoryModel::as_ref(ctx)
@@ -634,7 +710,7 @@ impl BlocklistAIPermissions {
             return FileReadPermission::Allowed(FileReadPermissionAllowedReason::RunToCompletion);
         }
 
-        self.can_read_files(Some(conversation_id), paths, terminal_view_id, ctx)
+        self.can_read_files(Some(conversation_id), paths, terminal_view_id, scope, ctx)
     }
 
     /// Returns whether or not Warp can auto-read the given files (e.g. for codebase indexing).
@@ -643,6 +719,7 @@ impl BlocklistAIPermissions {
         conversation_id: Option<&AIConversationId>,
         paths: Vec<PathBuf>,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
         ctx: &AppContext,
     ) -> FileReadPermission {
         if paths.is_empty() {
@@ -655,19 +732,18 @@ impl BlocklistAIPermissions {
         // Check if we've already been given permission to read these files in this conversation.
         if let Some(temp_permissions) =
             conversation_id.and_then(|id| self.temporary_file_permissions.get(id))
-        {
-            if paths.iter().all(|path| {
+            && paths.iter().all(|path| {
                 temp_permissions
                     .iter()
                     .any(|allowed| path.starts_with(allowed))
-            }) {
-                return FileReadPermission::Allowed(
-                    FileReadPermissionAllowedReason::AlreadyReadInConvo,
-                );
-            }
+            })
+        {
+            return FileReadPermission::Allowed(
+                FileReadPermissionAllowedReason::AlreadyReadInConvo,
+            );
         }
 
-        match self.get_read_files_setting(ctx, terminal_view_id) {
+        match self.get_read_files_setting(terminal_view_id, scope, ctx) {
             ActionPermission::AgentDecides | ActionPermission::Unknown => {
                 // For now, we always read files. We don't ask the user for permission.
                 FileReadPermission::Allowed(FileReadPermissionAllowedReason::AgentDecided)
@@ -676,7 +752,7 @@ impl BlocklistAIPermissions {
                 FileReadPermission::Allowed(FileReadPermissionAllowedReason::AutoreadSettingEnabled)
             }
             ActionPermission::AlwaysAsk => {
-                let allowlisted_paths = self.get_read_files_allowlist(ctx, terminal_view_id);
+                let allowlisted_paths = self.get_read_files_allowlist(terminal_view_id, scope, ctx);
                 if paths
                     .iter()
                     .all(|p| allowlisted_paths.iter().any(|dir| p.starts_with(dir)))
@@ -697,10 +773,12 @@ impl BlocklistAIPermissions {
         conversation_id: &AIConversationId,
         paths: &[PathBuf],
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
         ctx: &AppContext,
     ) -> FileWritePermission {
-        // Protected paths are always denied, regardless of autonomy settings.
-        if let Some(denied) = check_protected_write_paths(paths) {
+        if !AppExecutionMode::as_ref(ctx).is_sandboxed()
+            && let Some(denied) = check_protected_write_paths(paths)
+        {
             return denied;
         }
 
@@ -711,7 +789,7 @@ impl BlocklistAIPermissions {
             return FileWritePermission::Allowed(FileWritePermissionAllowedReason::RunToCompletion);
         }
 
-        self.determine_write_permissions_from_active_profile(terminal_view_id, ctx)
+        self.determine_write_permissions_from_active_profile(terminal_view_id, scope, ctx)
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -813,9 +891,10 @@ impl BlocklistAIPermissions {
     fn determine_write_permissions_from_active_profile(
         &self,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
         ctx: &AppContext,
     ) -> FileWritePermission {
-        match self.get_apply_code_diffs_setting(ctx, terminal_view_id) {
+        match self.get_apply_code_diffs_setting(terminal_view_id, scope, ctx) {
             ActionPermission::AgentDecides | ActionPermission::Unknown => {
                 FileWritePermission::Denied(FileWritePermissionDeniedReason::AgentDecided)
             }
@@ -838,6 +917,7 @@ impl BlocklistAIPermissions {
         is_read_only: bool,
         is_risky: Option<bool>,
         terminal_view_id: Option<EntityId>,
+        scope: &impl TeamScope,
         ctx: &AppContext,
     ) -> CommandExecutionPermission {
         // Normalize line continuations based on shell type.
@@ -850,10 +930,31 @@ impl BlocklistAIPermissions {
         // The command string might be composed of multiple commands so let's
         // break it up first.
         let (commands, contains_redirection) = decompose_command(&normalized_command, escape_char);
+        let commands_for_denylist = commands
+            .iter()
+            .map(|command| command_for_execution_predicates(command, escape_char))
+            .collect::<Vec<_>>();
 
-        // The denylist takes precedence over all other conditions.
-        let denylist = self.get_execute_commands_denylist(ctx, terminal_view_id);
-        if commands
+        // Local auto-approve may bypass the user-configured denylist, but workspace policy must
+        // always be evaluated. Sandboxed processes use a separate organization-managed denylist
+        // that cannot be bypassed.
+        let auto_approve_enabled = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(conversation_id)
+            .is_some_and(|convo| convo.autoexecute_any_action());
+        let bypass_user_denylist = auto_approve_enabled
+            && !AppExecutionMode::as_ref(ctx).is_sandboxed()
+            && *AISettings::as_ref(ctx).auto_approve_bypasses_command_denylist;
+
+        // The denylist takes precedence over the remaining conditions.
+        let denylist = if bypass_user_denylist {
+            // Auto-approve may bypass the user denylist, but the organization denylist
+            // must always be enforced.
+            Self::get_org_execute_commands_denylist(scope, ctx)
+        } else {
+            // Without the bypass, enforce both the organization and user denylists.
+            self.get_execute_commands_denylist(terminal_view_id, scope, ctx)
+        };
+        if commands_for_denylist
             .iter()
             .any(|c| denylist.iter().any(|d| d.matches(c)))
         {
@@ -862,16 +963,13 @@ impl BlocklistAIPermissions {
             );
         }
 
-        if BlocklistAIHistoryModel::as_ref(ctx)
-            .conversation(conversation_id)
-            .is_some_and(|convo| convo.autoexecute_any_action())
-        {
+        if auto_approve_enabled {
             return CommandExecutionPermission::Allowed(
                 CommandExecutionPermissionAllowedReason::RunToCompletion,
             );
         }
 
-        match self.get_execute_commands_setting(ctx, terminal_view_id) {
+        match self.get_execute_commands_setting(terminal_view_id, scope, ctx) {
             ActionPermission::AgentDecides | ActionPermission::Unknown => {
                 if FeatureFlag::AgentDecidesCommandExecution.is_enabled() && is_risky == Some(false)
                 {
@@ -886,7 +984,7 @@ impl BlocklistAIPermissions {
                     );
                 }
 
-                let allowlist = self.get_execute_commands_allowlist(ctx, terminal_view_id);
+                let allowlist = self.get_execute_commands_allowlist(terminal_view_id, scope, ctx);
                 if commands.iter().all(|command| {
                     allowlist
                         .iter()
@@ -913,7 +1011,7 @@ impl BlocklistAIPermissions {
                 CommandExecutionPermissionAllowedReason::AlwaysAllowed,
             ),
             ActionPermission::AlwaysAsk => {
-                let allowlist = self.get_execute_commands_allowlist(ctx, terminal_view_id);
+                let allowlist = self.get_execute_commands_allowlist(terminal_view_id, scope, ctx);
 
                 if commands.iter().all(|command| {
                     allowlist
@@ -941,15 +1039,11 @@ impl BlocklistAIPermissions {
         command: AgentModeCommandExecutionPredicate,
         ctx: &mut ModelContext<Self>,
     ) -> Result<()> {
-        let mut allowlist = AISettings::as_ref(ctx)
-            .agent_mode_command_execution_allowlist
-            .clone();
-        allowlist.push(command);
-        AISettings::handle(ctx).update(ctx, |settings, ctx| {
-            settings
-                .agent_mode_command_execution_allowlist
-                .set_value(allowlist, ctx)
-        })
+        AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles, ctx| {
+            let profile_id = profiles.default_profile_id();
+            profiles.add_to_command_allowlist(&profile_id, &command, ctx);
+        });
+        Ok(())
     }
 
     /// Removes `command` from the auto-execution allowlist.
@@ -960,15 +1054,11 @@ impl BlocklistAIPermissions {
         command: &AgentModeCommandExecutionPredicate,
         ctx: &mut ModelContext<Self>,
     ) -> Result<()> {
-        let mut allowlist = AISettings::as_ref(ctx)
-            .agent_mode_command_execution_allowlist
-            .clone();
-        allowlist.retain(|c| c != command);
-        AISettings::handle(ctx).update(ctx, |settings, ctx| {
-            settings
-                .agent_mode_command_execution_allowlist
-                .set_value(allowlist, ctx)
-        })
+        AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles, ctx| {
+            let profile_id = profiles.default_profile_id();
+            profiles.remove_from_command_allowlist(&profile_id, command, ctx);
+        });
+        Ok(())
     }
 
     /// Forces Agent Mode to ask for user consent before executing commands that match `command`.
@@ -977,15 +1067,11 @@ impl BlocklistAIPermissions {
         command: AgentModeCommandExecutionPredicate,
         ctx: &mut ModelContext<Self>,
     ) -> Result<()> {
-        let mut denylist = AISettings::as_ref(ctx)
-            .agent_mode_command_execution_denylist
-            .clone();
-        denylist.push(command);
-        AISettings::handle(ctx).update(ctx, |settings, ctx| {
-            settings
-                .agent_mode_command_execution_denylist
-                .set_value(denylist, ctx)
-        })
+        AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles, ctx| {
+            let profile_id = profiles.default_profile_id();
+            profiles.add_to_command_denylist(&profile_id, &command, ctx);
+        });
+        Ok(())
     }
 
     /// Removes `command` from the auto-execution denylist.
@@ -996,15 +1082,11 @@ impl BlocklistAIPermissions {
         command: &AgentModeCommandExecutionPredicate,
         ctx: &mut ModelContext<Self>,
     ) -> Result<()> {
-        let mut denylist = AISettings::as_ref(ctx)
-            .agent_mode_command_execution_denylist
-            .clone();
-        denylist.retain(|c| c != command);
-        AISettings::handle(ctx).update(ctx, |settings, ctx| {
-            settings
-                .agent_mode_command_execution_denylist
-                .set_value(denylist, ctx)
-        })
+        AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles, ctx| {
+            let profile_id = profiles.default_profile_id();
+            profiles.remove_from_command_denylist(&profile_id, command, ctx);
+        });
+        Ok(())
     }
 
     /// Sets whether or not readonly commands can be auto-executed by Agent Mode.
@@ -1048,7 +1130,7 @@ impl BlocklistAIPermissions {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(Some(terminal_view_id), ctx);
         AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-            profiles_model.set_write_to_pty(*active_profile.id(), &permission, ctx);
+            profiles_model.set_write_to_pty(active_profile.id(), &permission, ctx);
         });
         Ok(())
     }
@@ -1069,7 +1151,7 @@ impl BlocklistAIPermissions {
         let active_profile =
             AIExecutionProfilesModel::as_ref(ctx).active_profile(Some(terminal_view_id), ctx);
         AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-            profiles_model.set_read_files(*active_profile.id(), &permissions, ctx);
+            profiles_model.set_read_files(active_profile.id(), &permissions, ctx);
         });
         Ok(())
     }
@@ -1101,15 +1183,11 @@ impl BlocklistAIPermissions {
         filepath: PathBuf,
         ctx: &mut ModelContext<Self>,
     ) -> Result<()> {
-        let mut allowlist = AISettings::as_ref(ctx)
-            .agent_mode_coding_file_read_allowlist
-            .clone();
-        allowlist.push(filepath);
-        AISettings::handle(ctx).update(ctx, |settings, ctx| {
-            settings
-                .agent_mode_coding_file_read_allowlist
-                .set_value(allowlist, ctx)
-        })
+        AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles, ctx| {
+            let profile_id = profiles.default_profile_id();
+            profiles.add_to_directory_allowlist(&profile_id, &filepath, ctx);
+        });
+        Ok(())
     }
 
     /// Counterpart to [`Self::add_filepath_to_code_read_allowlist`].
@@ -1118,15 +1196,11 @@ impl BlocklistAIPermissions {
         filepath: PathBuf,
         ctx: &mut ModelContext<Self>,
     ) -> Result<()> {
-        let mut allowlist = AISettings::as_ref(ctx)
-            .agent_mode_coding_file_read_allowlist
-            .clone();
-        allowlist.retain(|p| p != &filepath);
-        AISettings::handle(ctx).update(ctx, |settings, ctx| {
-            settings
-                .agent_mode_coding_file_read_allowlist
-                .set_value(allowlist, ctx)
-        })
+        AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles, ctx| {
+            let profile_id = profiles.default_profile_id();
+            profiles.remove_from_directory_allowlist(&profile_id, &filepath, ctx);
+        });
+        Ok(())
     }
 
     /// Gives Agent Mode temporary access to the provided `files`.
@@ -1160,12 +1234,16 @@ impl BlocklistAIPermissions {
     }
 }
 
-/// Returns `Some(Denied(ProtectedPath))` if any of the given paths are system-protected
-/// and must never be auto-written regardless of user autonomy settings.
+fn command_for_execution_predicates(command: &str, escape_char: EscapeChar) -> String {
+    command_without_leading_env_vars(command, escape_char)
+        .filter(|command| !command.is_empty())
+        .unwrap_or_else(|| command.to_string())
+}
+
+/// Returns `Some(Denied(ProtectedPath))` if any of the given paths are system-protected.
 /// Returns `None` if no paths are protected.
 fn check_protected_write_paths(paths: &[PathBuf]) -> Option<FileWritePermission> {
-    // MCP config files are always protected from auto-write to prevent security risks
-    // from injecting arbitrary context into the agent.
+    // MCP configs can inject arbitrary context into the agent, so local edits require approval.
     if paths
         .iter()
         .any(|p| mcp_provider_from_file_path(p).is_some())
@@ -1184,13 +1262,16 @@ impl Entity for BlocklistAIPermissions {
 
 impl SingletonEntity for BlocklistAIPermissions {}
 
-/// Returns true iff Agent Mode autonomy features are allowed on this client.
+/// Returns true iff Agent Mode autonomy features are allowed for `scope`.
 /// Granular permissions still need to be checked for specific autonomy features
 /// (e.g. whether a command is auto-executable).
-pub fn is_agent_mode_autonomy_allowed(ctx: &AppContext) -> bool {
-    crate::UserWorkspaces::as_ref(ctx).is_ai_autonomy_allowed()
+pub(crate) fn is_agent_mode_autonomy_allowed<S: TeamScope + ?Sized>(
+    scope: &S,
+    ctx: &AppContext,
+) -> bool {
+    UserWorkspaces::as_ref(ctx).is_ai_autonomy_allowed(scope)
 }
 
 #[cfg(test)]
-#[path = "permissions_test.rs"]
+#[path = "permissions_tests.rs"]
 mod tests;

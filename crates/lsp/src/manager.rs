@@ -1,13 +1,12 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-use crate::{
-    config::LanguageId, model::LanguageServerId, supported_servers::LSPServerType, LspEvent,
-    LspServerConfig, LspServerModel,
-};
-use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
+use warpui_core::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
+
+use crate::config::LanguageId;
+use crate::model::LanguageServerId;
+use crate::supported_servers::LSPServerType;
+use crate::{LspEvent, LspServerConfig, LspServerModel};
 
 #[derive(Debug)]
 pub enum LspManagerModelEvent {
@@ -103,18 +102,18 @@ impl LspManagerModel {
         let path_lang = LanguageId::from_path(path)?;
 
         // First check if this is an external file that was registered via goto-definition
-        if let Some(server_id) = self.external_file_servers.get(path) {
-            if let Some(server) = self.server_by_id(*server_id, ctx) {
-                // Validate that the server supports this file's language
-                if server.as_ref(ctx).supports_language(&path_lang) {
-                    return Some(server);
-                }
-                log::debug!(
-                    "External file server for {} does not support language {:?}, falling back to workspace lookup",
-                    path.display(),
-                    path_lang
-                );
+        if let Some(server_id) = self.external_file_servers.get(path)
+            && let Some(server) = self.server_by_id(*server_id, ctx)
+        {
+            // Validate that the server supports this file's language
+            if server.as_ref(ctx).supports_language(&path_lang) {
+                return Some(server);
             }
+            log::debug!(
+                "External file server for {} does not support language {:?}, falling back to workspace lookup",
+                path.display(),
+                path_lang
+            );
         }
 
         // Then try workspace-based lookup
@@ -188,7 +187,7 @@ impl LspManagerModel {
         let lsp = ctx.add_model(|_| LspServerModel::new(config));
 
         let path_clone = path.clone();
-        ctx.subscribe_to_model(&lsp, move |_, event, ctx| match event {
+        ctx.subscribe_to_model(&lsp, move |_, _, event, ctx| match event {
             LspEvent::Started => {
                 ctx.emit(LspManagerModelEvent::ServerStarted(path_clone.clone()));
             }
@@ -234,7 +233,7 @@ impl LspManagerModel {
 
     pub fn stop_all(&mut self, path: PathBuf, ctx: &mut ModelContext<Self>) {
         let Some(servers) = self.servers.get(&path) else {
-            log::warn!("No server resgistered to stop at path: {}", path.display());
+            log::warn!("No server registered to stop at path: {}", path.display());
             return;
         };
 

@@ -1,41 +1,37 @@
-use super::{
-    common::{
-        add_command_xray_overlay, add_input_suggestions_overlays, add_voltron_overlay,
-        add_workflow_info_overlay, maybe_add_buy_credits_banner,
-        wrap_input_with_terminal_padding_and_focus_handler,
-    },
-    Input, InputAction, InputDropTargetData,
-};
-use crate::{
-    ai::blocklist::{
-        agent_view::{
-            agent_view_bg_fill,
-            shortcuts::{render_agent_shortcuts_view, AgentShortcutsViewContext},
-            AgentViewState,
-        },
-        InputType,
-    },
-    appearance::Appearance,
-    context_chips::spacing::{self},
-    editor::position_id_for_cursor,
-    features::FeatureFlag,
-    settings::InputModeSettings,
-    terminal::{settings::TerminalSettings, view::TerminalAction},
-    BlocklistAIHistoryModel,
-};
+use warp_cli::agent::Harness;
 use warp_core::settings::Setting;
 use warp_core::ui::theme::color::internal_colors;
-use warpui::elements::Expanded;
-use warpui::{
-    elements::{
-        Align, AnchorPair, Border, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
-        DispatchEventResult, DropTarget, Element, Empty, EventHandler, Flex, Hoverable,
-        MainAxisSize, OffsetPositioning, OffsetType, ParentElement, PositionedElementOffsetBounds,
-        PositioningAxis, Radius, SavePosition, Stack, XAxisAnchor, YAxisAnchor,
-    },
-    presenter::ChildView,
-    AppContext, SingletonEntity as _,
+use warpui::elements::{
+    Align, AnchorPair, Border, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
+    DispatchEventResult, DropTarget, Element, Empty, EventHandler, Expanded, Flex, Hoverable,
+    MainAxisSize, OffsetPositioning, OffsetType, ParentElement, PositionedElementOffsetBounds,
+    PositioningAxis, Radius, SavePosition, Stack, XAxisAnchor, YAxisAnchor,
 };
+use warpui::presenter::ChildView;
+use warpui::{AppContext, SingletonEntity as _, ViewHandle};
+
+use super::common::{
+    add_command_xray_overlay, add_input_suggestions_overlays, add_voltron_overlay,
+    add_workflow_info_overlay, maybe_add_buy_credits_banner,
+    wrap_input_with_terminal_padding_and_focus_handler,
+};
+use super::{Input, InputAction, InputDropTargetData};
+use crate::BlocklistAIHistoryModel;
+use crate::ai::blocklist::InputType;
+use crate::ai::blocklist::agent_view::AgentViewState;
+use crate::ai::blocklist::agent_view::shortcuts::{
+    AgentShortcutsViewContext, render_agent_shortcuts_view,
+};
+use crate::ai::connected_self_hosted_workers::ConnectedSelfHostedWorkersModel;
+use crate::ai::harness_availability::HarnessAvailabilityModel;
+use crate::appearance::Appearance;
+use crate::context_chips::spacing::{self};
+use crate::editor::position_id_for_cursor;
+use crate::features::FeatureFlag;
+use crate::settings::InputModeSettings;
+use crate::terminal::settings::TerminalSettings;
+use crate::terminal::view::TerminalAction;
+use crate::terminal::view::ambient_agent::HostSelector;
 
 pub(super) const CLOUD_MODE_V2_MAX_WIDTH: f32 = 720.;
 
@@ -67,9 +63,14 @@ impl Input {
     pub fn is_cloud_mode_input_v2_composing(&self, app: &AppContext) -> bool {
         FeatureFlag::CloudModeInputV2.is_enabled()
             && FeatureFlag::CloudMode.is_enabled()
-            && self
-                .ambient_agent_view_model()
-                .is_some_and(|model| model.as_ref(app).is_configuring_ambient_agent())
+            && self.ambient_agent_view_model().is_some_and(|model| {
+                let view_model = model.as_ref(app);
+                view_model.is_configuring_ambient_agent()
+                    // The handoff pane intentionally stays on the existing input UI even
+                    // when V2 is on — V2 is for fresh cloud-mode runs only, and handoff has
+                    // its own pre-spawn flow (submit interception).
+                    && !view_model.is_local_to_cloud_handoff()
+            })
     }
 
     /// Renders the input when there is an active `AgentView`.
@@ -107,18 +108,17 @@ impl Input {
 
         if FeatureFlag::ImageAsContext.is_enabled()
             && matches!(ai_input_model.input_type(), InputType::AI)
+            && let Some(images) = self.render_attachment_chips(appearance)
         {
-            if let Some(images) = self.render_attachment_chips(appearance) {
-                column.add_child(
-                    Container::new(images)
-                        .with_margin_top(spacing::UDI_CHIP_MARGIN)
-                        .finish(),
-                );
-            }
+            column.add_child(
+                Container::new(images)
+                    .with_margin_top(spacing::UDI_CHIP_MARGIN)
+                    .finish(),
+            );
         }
 
         let show_harness_row = FeatureFlag::CloudMode.is_enabled()
-            && FeatureFlag::AgentHarness.is_enabled()
+            && HarnessAvailabilityModel::as_ref(app).should_show_harness_selector()
             && self
                 .ambient_agent_view_model()
                 .is_some_and(|ambient_agent_model| {
@@ -126,21 +126,19 @@ impl Input {
                         .as_ref(app)
                         .is_configuring_ambient_agent()
                 });
-        if show_harness_row {
-            if let Some(harness_selector) = self.harness_selector() {
-                // Temporarily render the harness selector in the cloud mode UDI until we fully
-                // implement the new designs.
-                let harness_row = Flex::row()
-                    .with_main_axis_size(MainAxisSize::Min)
-                    .with_child(ChildView::new(harness_selector).finish())
-                    .finish();
-                column.add_child(
-                    Container::new(harness_row)
-                        .with_padding_top(spacing::UDI_CHIP_MARGIN)
-                        .with_padding_bottom(4.)
-                        .finish(),
-                );
-            }
+        if show_harness_row && let Some(harness_selector) = self.harness_selector() {
+            // Temporarily render the harness selector in the cloud mode UDI until we fully
+            // implement the new designs.
+            let harness_row = Flex::row()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_child(ChildView::new(harness_selector).finish())
+                .finish();
+            column.add_child(
+                Container::new(harness_row)
+                    .with_padding_top(spacing::UDI_CHIP_MARGIN)
+                    .with_padding_bottom(4.)
+                    .finish(),
+            );
         }
 
         let terminal_spacing = TerminalSettings::as_ref(app)
@@ -168,15 +166,14 @@ impl Input {
         ));
 
         if let Some(selected_workflow_state) = self.workflows_state.selected_workflow_state.as_ref()
+            && selected_workflow_state.should_show_more_info_view
         {
-            if selected_workflow_state.should_show_more_info_view {
-                add_workflow_info_overlay(
-                    &mut stack,
-                    selected_workflow_state,
-                    self.size_info(app).pane_height_px().as_f32(),
-                    menu_positioning,
-                );
-            }
+            add_workflow_info_overlay(
+                &mut stack,
+                selected_workflow_state,
+                self.size_info(app).pane_height_px().as_f32(),
+                menu_positioning,
+            );
         }
 
         if self.is_voltron_open && self.is_pane_focused(app) {
@@ -204,7 +201,9 @@ impl Input {
         )
         .finish();
 
-        let border_color = if !self.ai_input_model.as_ref(app).is_ai_input_enabled()
+        let border_color = if self.handoff_compose_state.as_ref(app).is_active() {
+            appearance.theme().ansi_fg_magenta()
+        } else if !self.ai_input_model.as_ref(app).is_ai_input_enabled()
             && !self.suggestions_mode_model.as_ref(app).is_slash_commands()
             && !self.slash_command_model.as_ref(app).state().is_detected_command()
             // If NLD, don't color the border if the input is empty, because the current
@@ -218,7 +217,7 @@ impl Input {
             styles::default_border_color(appearance.theme())
         };
 
-        let mut input = Container::new(
+        let input = Container::new(
             Hoverable::new(self.hoverable_handle.clone(), |_| drop_target)
                 .on_hover(|is_hovered, ctx, _app, _position| {
                     ctx.dispatch_typed_action(InputAction::SetUDIHovered(is_hovered));
@@ -229,13 +228,8 @@ impl Input {
                 .finish(),
         )
         .with_border(Border::top(1.).with_border_color(border_color))
-        .with_padding_bottom(4.);
-
-        if self.agent_view_controller.as_ref(app).is_inline() {
-            input = input.with_background(agent_view_bg_fill(app));
-        }
-
-        let input = input.finish();
+        .with_padding_bottom(4.)
+        .finish();
 
         let mut column = Flex::column();
 
@@ -319,7 +313,13 @@ impl Input {
                 app,
             ));
         }
-        column.add_children([ChildView::new(&self.agent_status_view).finish(), input]);
+        column.add_child(ChildView::new(&self.agent_status_view).finish());
+        if let Some(panel) = self.queued_prompts_panel.as_ref()
+            && panel.as_ref(app).should_render(app)
+        {
+            column.add_child(ChildView::new(panel).finish());
+        }
+        column.add_child(input);
 
         let mut outer_stack = Stack::new().with_constrain_absolute_children();
         outer_stack.add_child(column.finish());
@@ -329,6 +329,8 @@ impl Input {
             self.is_pane_focused(app),
             self.terminal_view_id,
             self.is_input_at_top(&model, app),
+            &self.team_scope(app),
+            &model,
             app,
         );
 
@@ -397,58 +399,56 @@ impl Input {
             );
         }
 
-        if self.suggestions_mode_model.as_ref(app).is_slash_commands() {
-            if let Some(view) = self.cloud_mode_v2_slash_commands_view.as_ref() {
-                let cursor_position = position_id_for_cursor(self.editor.id());
-                stack.add_positioned_overlay_child(
-                    ChildView::new(view).finish(),
-                    OffsetPositioning::from_axes(
-                        PositioningAxis::relative_to_stack_child(
-                            &cursor_position,
-                            PositionedElementOffsetBounds::WindowByPosition,
-                            OffsetType::Pixel(0.),
-                            AnchorPair::new(XAxisAnchor::Left, XAxisAnchor::Left),
-                        ),
-                        PositioningAxis::relative_to_stack_child(
-                            &cursor_position,
-                            PositionedElementOffsetBounds::Unbounded,
-                            OffsetType::Pixel(4.),
-                            AnchorPair::new(YAxisAnchor::Bottom, YAxisAnchor::Top),
-                        ),
+        if self.suggestions_mode_model.as_ref(app).is_slash_commands()
+            && let Some(view) = self.cloud_mode_v2_slash_commands_view.as_ref()
+        {
+            let cursor_position = position_id_for_cursor(self.editor.id());
+            stack.add_positioned_overlay_child(
+                ChildView::new(view).finish(),
+                OffsetPositioning::from_axes(
+                    PositioningAxis::relative_to_stack_child(
+                        &cursor_position,
+                        PositionedElementOffsetBounds::WindowByPosition,
+                        OffsetType::Pixel(0.),
+                        AnchorPair::new(XAxisAnchor::Left, XAxisAnchor::Left),
                     ),
-                );
-            }
+                    PositioningAxis::relative_to_stack_child(
+                        &cursor_position,
+                        PositionedElementOffsetBounds::Unbounded,
+                        OffsetType::Pixel(4.),
+                        AnchorPair::new(YAxisAnchor::Bottom, YAxisAnchor::Top),
+                    ),
+                ),
+            );
         }
 
         if let Some(selected_workflow_state) = self.workflows_state.selected_workflow_state.as_ref()
+            && selected_workflow_state.should_show_more_info_view
         {
-            if selected_workflow_state.should_show_more_info_view {
-                let prompt_position = self.prompt_save_position_id();
-                let workflows_info_view = Container::new(
-                    ChildView::new(&selected_workflow_state.more_info_view).finish(),
-                )
-                .finish();
-                stack.add_positioned_overlay_child(
-                    ConstrainedBox::new(workflows_info_view)
-                        .with_max_width(CLOUD_MODE_V2_MAX_WIDTH)
-                        .with_max_height(self.size_info(app).pane_height_px().as_f32() * 0.35)
-                        .finish(),
-                    OffsetPositioning::from_axes(
-                        PositioningAxis::relative_to_stack_child(
-                            &prompt_position,
-                            PositionedElementOffsetBounds::WindowByPosition,
-                            OffsetType::Pixel(0.),
-                            AnchorPair::new(XAxisAnchor::Left, XAxisAnchor::Left),
-                        ),
-                        PositioningAxis::relative_to_stack_child(
-                            &prompt_position,
-                            PositionedElementOffsetBounds::Unbounded,
-                            OffsetType::Pixel(0.),
-                            AnchorPair::new(YAxisAnchor::Top, YAxisAnchor::Bottom),
-                        ),
+            let prompt_position = self.prompt_save_position_id();
+            let workflows_info_view =
+                Container::new(ChildView::new(&selected_workflow_state.more_info_view).finish())
+                    .finish();
+            stack.add_positioned_overlay_child(
+                ConstrainedBox::new(workflows_info_view)
+                    .with_max_width(CLOUD_MODE_V2_MAX_WIDTH)
+                    .with_max_height(self.size_info(app).pane_height_px().as_f32() * 0.35)
+                    .finish(),
+                OffsetPositioning::from_axes(
+                    PositioningAxis::relative_to_stack_child(
+                        &prompt_position,
+                        PositionedElementOffsetBounds::WindowByPosition,
+                        OffsetType::Pixel(0.),
+                        AnchorPair::new(XAxisAnchor::Left, XAxisAnchor::Left),
                     ),
-                );
-            }
+                    PositioningAxis::relative_to_stack_child(
+                        &prompt_position,
+                        PositionedElementOffsetBounds::Unbounded,
+                        OffsetType::Pixel(0.),
+                        AnchorPair::new(YAxisAnchor::Top, YAxisAnchor::Bottom),
+                    ),
+                ),
+            );
         }
         if self.is_voltron_open && self.is_pane_focused(app) {
             add_voltron_overlay(&mut stack, &self.voltron_view, menu_positioning);
@@ -490,10 +490,38 @@ impl Input {
             self.is_pane_focused(app),
             self.terminal_view_id,
             self.is_input_at_top(&model, app),
+            &self.team_scope(app),
+            &model,
             app,
         );
 
         SavePosition::new(outer_stack.finish(), &self.save_position_id()).finish()
+    }
+
+    pub(super) fn should_show_auth_secret_ftux(&self, app: &AppContext) -> bool {
+        let Some(view_model) = self.ambient_agent_view_model() else {
+            return false;
+        };
+        let vm = view_model.as_ref(app);
+        let harness = vm.selected_harness();
+        if harness == Harness::Oz {
+            return false;
+        }
+        // Skip FTUX for harnesses that have no auth secret types defined.
+        if crate::ai::auth_secret_types::auth_secret_types_for_harness(harness).is_empty() {
+            return false;
+        }
+        if let Some(ftux_view) = self.auth_secret_ftux_view()
+            && ftux_view.as_ref(app).has_creation_state()
+        {
+            return true;
+        }
+        if crate::ai::cloud_agent_settings::CloudAgentSettings::as_ref(app)
+            .is_harness_auth_ftux_completed(harness)
+        {
+            return false;
+        }
+        vm.selected_harness_auth_secret_name().is_none()
     }
 
     fn render_cloud_mode_v2_content(
@@ -506,14 +534,33 @@ impl Input {
             .with_main_axis_size(MainAxisSize::Min)
             .with_spacing(CLOUD_MODE_V2_TOP_ROW_GAP);
 
-        column.add_child(self.render_cloud_mode_v2_top_row());
-        column.add_child(self.render_cloud_mode_v2_input_container(appearance, app));
+        column.add_child(self.render_cloud_mode_v2_top_row(app));
+
+        if let Some(panel) = self.queued_prompts_panel.as_ref()
+            && panel.as_ref(app).should_render(app)
+        {
+            column.add_child(ChildView::new(panel).finish());
+        }
+
+        if self.should_show_auth_secret_ftux(app) {
+            column.add_child(self.render_auth_secret_ftux_content());
+        } else {
+            column.add_child(self.render_cloud_mode_v2_input_container(appearance, app));
+        }
+
         Align::new(
             ConstrainedBox::new(column.finish())
                 .with_max_width(CLOUD_MODE_V2_MAX_WIDTH)
                 .finish(),
         )
         .finish()
+    }
+
+    fn render_auth_secret_ftux_content(&self) -> Box<dyn Element> {
+        match self.auth_secret_ftux_view() {
+            Some(view) => ChildView::new(view).finish(),
+            None => Empty::new().finish(),
+        }
     }
 
     fn render_cloud_mode_v2_history_menu(&self, app: &AppContext) -> Option<Box<dyn Element>> {
@@ -528,17 +575,41 @@ impl Input {
         Some(ChildView::new(view).finish())
     }
 
-    fn render_cloud_mode_v2_top_row(&self) -> Box<dyn Element> {
+    /// Returns the composer-only Execution host dropdown when it should be shown.
+    pub(super) fn visible_host_selector(
+        &self,
+        app: &AppContext,
+    ) -> Option<&ViewHandle<HostSelector>> {
+        let host_selector = self.host_selector()?;
+        let scope = self.team_scope(app);
+        let should_show = host_selector.as_ref(app).has_default_host()
+            || !ConnectedSelfHostedWorkersModel::as_ref(app)
+                .worker_hosts_excluding(&scope, None)
+                .is_empty();
+        should_show.then_some(host_selector)
+    }
+
+    fn render_cloud_mode_v2_top_row(&self, app: &AppContext) -> Box<dyn Element> {
         let mut row = Flex::row()
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(CLOUD_MODE_V2_TOP_ROW_INNER_GAP);
 
-        if let Some(host) = self.host_selector() {
+        if let Some(host) = self.visible_host_selector(app) {
             row.add_child(ChildView::new(host).finish());
         }
         if let Some(harness_selector) = self.harness_selector() {
             row.add_child(ChildView::new(harness_selector).finish());
+        }
+
+        if let Some(auth_secret_selector) = self.auth_secret_selector() {
+            let harness = self
+                .ambient_agent_view_model()
+                .map(|m| m.as_ref(app).selected_harness())
+                .unwrap_or(warp_cli::agent::Harness::Oz);
+            if harness != warp_cli::agent::Harness::Oz && !self.should_show_auth_secret_ftux(app) {
+                row.add_child(ChildView::new(auth_secret_selector).finish());
+            }
         }
 
         row.finish()
@@ -565,16 +636,14 @@ impl Input {
         let ai_input_model = self.ai_input_model.as_ref(app);
         let show_chips = FeatureFlag::ImageAsContext.is_enabled()
             && matches!(ai_input_model.input_type(), InputType::AI);
-        if show_chips {
-            if let Some(chips) = self.render_attachment_chips(appearance) {
-                editor_column.add_child(
-                    Container::new(chips)
-                        .with_padding_top(CLOUD_MODE_V2_CHIPS_ROW_TOP_PADDING)
-                        .with_padding_left(CLOUD_MODE_V2_INPUT_HORIZONTAL_PADDING)
-                        .with_padding_right(CLOUD_MODE_V2_INPUT_HORIZONTAL_PADDING)
-                        .finish(),
-                );
-            }
+        if show_chips && let Some(chips) = self.render_attachment_chips(appearance) {
+            editor_column.add_child(
+                Container::new(chips)
+                    .with_padding_top(CLOUD_MODE_V2_CHIPS_ROW_TOP_PADDING)
+                    .with_padding_left(CLOUD_MODE_V2_INPUT_HORIZONTAL_PADDING)
+                    .with_padding_right(CLOUD_MODE_V2_INPUT_HORIZONTAL_PADDING)
+                    .finish(),
+            );
         }
 
         editor_column.add_child(
@@ -628,6 +697,8 @@ impl Input {
             self.focus_handle.as_ref().is_none_or(|h| h.is_focused(app)),
             self.terminal_view_id,
             self.is_input_at_top(&model, app),
+            &self.team_scope(app),
+            &model,
             app,
         );
 

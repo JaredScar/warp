@@ -5,19 +5,14 @@ use warp_graphql::mutations::generate_metadata_for_command::{
 };
 use warpui::{SingletonEntity, ViewContext};
 
-use crate::{
-    ai::AIRequestUsageModel,
-    auth::AuthStateProvider,
-    send_telemetry_from_ctx,
-    server::telemetry::TelemetryEvent,
-    workflows::workflow::{Argument, Workflow},
-    workspaces::user_workspaces::UserWorkspaces,
-};
-
-use super::{
-    arguments::ArgumentsState,
-    modal::{AiAssistState, WorkflowModal, WorkflowModalEvent},
-};
+use super::arguments::ArgumentsState;
+use super::modal::{AiAssistState, WorkflowModal, WorkflowModalEvent};
+use crate::ai::AIRequestUsageModel;
+use crate::auth::AuthStateProvider;
+use crate::send_telemetry_from_ctx;
+use crate::server::telemetry::TelemetryEvent;
+use crate::workflows::workflow::{Argument, Workflow};
+use crate::workspaces::user_workspaces::UserWorkspaces;
 
 /// Generated command metadata from server.
 #[derive(Debug)]
@@ -143,7 +138,7 @@ impl WorkflowModal {
                         if let GeneratedCommandMetadataError::RateLimited = err {
                             let auth_state = AuthStateProvider::as_ref(ctx).get();
                             let current_user_id = auth_state.user_id().unwrap_or_default();
-                            if let Some(team) = UserWorkspaces::as_ref(ctx).current_team() {
+                            if let Some(team) = UserWorkspaces::as_ref(ctx).team_for_view(ctx) {
                                 let current_user_email =
                                     auth_state.user_email().unwrap_or_default();
                                 let has_admin_permissions = team.has_admin_permissions(&current_user_email);

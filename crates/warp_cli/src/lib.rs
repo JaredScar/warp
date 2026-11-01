@@ -1,10 +1,10 @@
 #![cfg_attr(target_family = "wasm", allow(dead_code))]
 
-use std::{env, fmt, path::Path};
+use std::path::Path;
+use std::{env, fmt};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use url::Url;
-
 use warp_core::channel::ChannelState;
 use warp_core::features::FeatureFlag;
 
@@ -16,29 +16,45 @@ mod process_handle;
 pub mod artifact;
 pub mod scope;
 pub mod skill;
+mod sort_order;
+pub use sort_order::SortOrderArg;
 
 pub mod agent;
+pub mod api_key;
 pub mod completions;
 pub mod config_file;
+mod date_time;
 pub mod environment;
+pub mod environment_checkout;
 pub mod federate;
 pub mod harness_support;
 pub mod integration;
 pub mod json_filter;
+pub mod local_control;
 pub mod mcp;
+pub mod memory_store;
 pub mod model;
 pub mod provider;
+pub mod runner;
 pub mod schedule;
 pub mod secret;
 pub mod share;
 pub mod task;
+// Each of these variables is injected under both its `OZ_` and its `WARP_` name, carrying the
+// identical value. Read sites still use the `OZ_` names.
 pub const OZ_RUN_ID_ENV: &str = "OZ_RUN_ID";
+pub const WARP_RUN_ID_ENV: &str = "WARP_RUN_ID";
 pub const OZ_PARENT_RUN_ID_ENV: &str = "OZ_PARENT_RUN_ID";
+pub const WARP_PARENT_RUN_ID_ENV: &str = "WARP_PARENT_RUN_ID";
 pub const OZ_CLI_ENV: &str = "OZ_CLI";
+pub const WARP_CLI_ENV: &str = "WARP_CLI";
 pub const OZ_HARNESS_ENV: &str = "OZ_HARNESS";
+pub const WARP_HARNESS_ENV: &str = "WARP_HARNESS";
 pub const SERVER_ROOT_URL_OVERRIDE_ENV: &str = "WARP_SERVER_ROOT_URL";
 pub const WS_SERVER_URL_OVERRIDE_ENV: &str = "WARP_WS_SERVER_URL";
 pub const SESSION_SHARING_SERVER_URL_OVERRIDE_ENV: &str = "WARP_SESSION_SHARING_SERVER_URL";
+pub const PREWARMED_SANDBOX_CONTROL_URL_OVERRIDE_ENV: &str = "WARP_PREWARMED_SANDBOX_CONTROL_URL";
+pub const WARP_PREWARMED_SANDBOX_ID_ENV: &str = "WARP_PREWARMED_SANDBOX_ID";
 
 /// Options related to the parent process that spawned this Warp instance.
 #[derive(Debug, Default, Clone, clap::Args)]
@@ -61,6 +77,17 @@ pub struct ParentOpts {
     pub handle: Option<process_handle::ProcessHandle>,
 }
 
+/// Returns whether an argument requests one of Warp's hidden worker modes.
+pub fn is_worker_invocation(arg: &str) -> bool {
+    let command = WorkerCommand::augment_subcommands(clap::Command::new("worker"));
+    command.find_subcommand(arg).is_some()
+        || arg.strip_prefix("--").is_some_and(|long_flag| {
+            command
+                .get_subcommands()
+                .any(|subcommand| subcommand.get_long_flag() == Some(long_flag))
+        })
+}
+
 /// Hidden worker args used to scope remote-server proxy/daemon sockets by
 /// Warp identity without exposing credentials.
 #[derive(Debug, Clone, Default, clap::Args)]
@@ -74,7 +101,12 @@ pub struct RemoteServerIdentityArgs {
 #[derive(Debug, Default, Clone, clap::Args)]
 pub struct GlobalOptions {
     /// API key for server authentication.
-    #[arg(long = "api-key", global = true, env = "WARP_API_KEY")]
+    #[arg(
+        long = "api-key",
+        global = true,
+        env = "WARP_API_KEY",
+        hide_env_values = true
+    )]
     pub api_key: Option<String>,
 
     /// Set the output format.
@@ -88,7 +120,11 @@ pub struct GlobalOptions {
     pub output_format: OutputFormat,
 }
 
-/// Command-line argument parser for the main Warp binary. This is used across all channels.
+/// Normal argument parser for the shared Warp executable across all channels.
+///
+/// Oz commands are subcommands of this parser, so invoking an `oz` symlink does
+/// not require a mode flag. Warp Control uses its separate [`local_control::ControlArgs`]
+/// parser, selected before this parser sees the arguments.
 #[derive(Debug, Default, Parser, Clone)]
 #[command(
     name = "oz",
@@ -102,7 +138,7 @@ Use the CLI to:
 * Manage the environments that cloud agents run in
 * Upload secrets to Oz's secure storage"#
 )]
-#[clap(args_conflicts_with_subcommands = true)]
+#[clap(subcommand_precedence_over_arg = true)]
 pub struct Args {
     #[clap(flatten)]
     global_options: GlobalOptions,
@@ -243,6 +279,24 @@ impl Args {
                     }
                 }
 
+                if !FeatureFlag::APIKeyManagement.is_enabled() {
+                    let args: Vec<String> = env::args().collect();
+                    if args.len() > 1 && args[1] == "api-key" {
+                        eprintln!("error: unrecognized subcommand 'api-key'\n");
+                        eprintln!("For more information, try '--help'");
+                        std::process::exit(2);
+                    }
+                }
+
+                if !FeatureFlag::CloudAgentRunners.is_enabled() {
+                    let args: Vec<String> = env::args().collect();
+                    if args.len() > 1 && args[1] == "runner" {
+                        eprintln!("error: unrecognized subcommand 'runner'\n");
+                        eprintln!("For more information, try '--help'");
+                        std::process::exit(2);
+                    }
+                }
+
                 let command = Self::clap_command();
 
                 command.try_get_matches()
@@ -297,6 +351,20 @@ impl Args {
             });
         }
 
+        // Hide the third-party harness flags on `run-cloud` when the harness
+        // feature is off, so `--help` matches the runtime gating (a non-oz
+        // `--harness` is rejected unless AgentHarness is enabled).
+        if !FeatureFlag::AgentHarness.is_enabled() {
+            command = command.mut_subcommand("agent", |agent_cmd| {
+                agent_cmd.mut_subcommand("run-cloud", |cloud_cmd| {
+                    cloud_cmd
+                        .mut_arg("harness", |arg| arg.hide(true))
+                        .mut_arg("claude_auth_secret", |arg| arg.hide(true))
+                        .mut_arg("codex_auth_secret", |arg| arg.hide(true))
+                })
+            });
+        }
+
         // Hide the provider subcommand from help text
         if !FeatureFlag::ProviderCommand.is_enabled() {
             command = command.mut_subcommand("provider", |c| c.hide(true));
@@ -337,16 +405,20 @@ impl Args {
                     })
             });
         }
-        // Hide the message subcommand from help text.
-        if !FeatureFlag::OrchestrationV2.is_enabled() {
-            command = command.mut_subcommand("run", |run_cmd| {
-                run_cmd.mut_subcommand("message", |c| c.hide(true))
-            });
-        }
 
         // Hide the artifact subcommand from help text.
         if !FeatureFlag::ArtifactCommand.is_enabled() {
             command = command.mut_subcommand("artifact", |c| c.hide(true));
+        }
+
+        // Hide the api-key subcommand from help text.
+        if !FeatureFlag::APIKeyManagement.is_enabled() {
+            command = command.mut_subcommand("api-key", |c| c.hide(true));
+        }
+
+        // Hide the runner subcommand from help text.
+        if !FeatureFlag::CloudAgentRunners.is_enabled() {
+            command = command.mut_subcommand("runner", |c| c.hide(true));
         }
 
         // Wire up `--version` / `-V` using the same version metadata used elsewhere in the
@@ -430,14 +502,6 @@ pub enum WorkerCommand {
     #[cfg(unix)]
     TerminalServer(TerminalServerArgs),
 
-    /// Run this process as the plugin host rather than the main app.
-    #[cfg(feature = "plugin_host")]
-    #[clap(long_flag = "plugin-host")]
-    PluginHost {
-        #[clap(flatten)]
-        parent: ParentOpts,
-    },
-
     /// Run the minidump server.
     #[clap(hide = true)]
     MinidumpServer {
@@ -458,6 +522,18 @@ pub enum WorkerCommand {
     #[cfg(not(target_family = "wasm"))]
     #[clap(hide = true)]
     RemoteServerDaemon(RemoteServerIdentityArgs),
+
+    /// Connect an Agent Client Protocol agent's stdin/stdout to the loopback socket the agent
+    /// driver is listening on. Run from the driver's terminal session so the agent inherits the
+    /// shell state established by environment setup commands.
+    #[cfg(not(target_family = "wasm"))]
+    #[clap(hide = true)]
+    AcpBridge {
+        /// File the driver wrote with the address to connect to, the token to present, and the
+        /// agent command line.
+        #[clap(long = "launch-file")]
+        launch_file: std::path::PathBuf,
+    },
 
     /// Run a headless ripgrep search worker.
     #[cfg(not(target_family = "wasm"))]
@@ -488,6 +564,9 @@ pub enum CliCommand {
     #[command(subcommand)]
     Environment(crate::environment::EnvironmentCommand),
 
+    #[command(hide = true)]
+    EnvironmentCheckout(crate::environment_checkout::EnvironmentCheckoutArgs),
+
     /// Manage MCP servers.
     #[command(subcommand)]
     MCP(crate::mcp::MCPCommand),
@@ -499,6 +578,12 @@ pub enum CliCommand {
     /// Manage available models.
     #[command(subcommand)]
     Model(crate::model::ModelCommand),
+    /// Manage memory stores.
+    #[command(subcommand, alias = "memory-stores")]
+    MemoryStore(crate::memory_store::MemoryStoreCommand),
+    /// Manage memories.
+    #[command(subcommand)]
+    Memory(crate::memory_store::MemoryCommand),
 
     /// Log in to Warp.
     Login,
@@ -535,6 +620,42 @@ pub enum CliCommand {
     /// Manage artifacts.
     #[command(subcommand)]
     Artifact(crate::artifact::ArtifactCommand),
+
+    /// Manage API keys.
+    #[command(subcommand)]
+    ApiKey(crate::api_key::ApiKeyCommand),
+
+    /// Manage cloud agent runners.
+    #[command(subcommand)]
+    Runner(crate::runner::RunnerCommand),
+}
+
+impl CliCommand {
+    /// Returns the command path used to identify this invocation in tracing.
+    pub fn as_str_for_tracing(&self) -> &'static str {
+        match self {
+            CliCommand::Agent(command) => command.as_str_for_tracing(),
+            CliCommand::Environment(command) => command.as_str_for_tracing(),
+            CliCommand::EnvironmentCheckout(_) => "environment_checkout",
+            CliCommand::MCP(command) => command.as_str_for_tracing(),
+            CliCommand::Run(command) => command.as_str_for_tracing(),
+            CliCommand::Model(command) => command.as_str_for_tracing(),
+            CliCommand::Login => "login",
+            CliCommand::Logout => "logout",
+            CliCommand::Whoami => "whoami",
+            CliCommand::Provider(command) => command.as_str_for_tracing(),
+            CliCommand::Integration(command) => command.as_str_for_tracing(),
+            CliCommand::Schedule(command) => command.as_str_for_tracing(),
+            CliCommand::Secret(command) => command.as_str_for_tracing(),
+            CliCommand::Federate(command) => command.as_str_for_tracing(),
+            CliCommand::HarnessSupport(args) => args.command.as_str_for_tracing(),
+            CliCommand::Artifact(command) => command.as_str_for_tracing(),
+            CliCommand::ApiKey(command) => command.as_str_for_tracing(),
+            CliCommand::MemoryStore(command) => command.as_str_for_tracing(),
+            CliCommand::Memory(command) => command.as_str_for_tracing(),
+            CliCommand::Runner(command) => command.as_str_for_tracing(),
+        }
+    }
 }
 
 /// A subcommand of the main Warp application. This includes all [`WorkerCommand`]s as well as app-specific debugging tools.
@@ -573,6 +694,12 @@ pub enum Command {
     /// Print debugging information and exit.
     #[clap(long_flag = "dump-debug-info")]
     DumpDebugInfo,
+    /// Print the JSON schema for the current Warp channel's settings and exit.
+    #[cfg(not(target_family = "wasm"))]
+    DumpSettingsSchema {
+        /// Write the schema to this path instead of standard output.
+        output_path: Option<std::path::PathBuf>,
+    },
 
     /// Print telemetry events in production and exit.
     #[clap(long_flag = "print-telemetry-events", hide = true)]
@@ -587,6 +714,8 @@ impl Command {
             Command::Worker(_) => false,
             Command::CommandLine(_) | Command::DumpDebugInfo => true,
             Command::Completions { .. } => true,
+            #[cfg(not(target_family = "wasm"))]
+            Command::DumpSettingsSchema { output_path } => output_path.is_none(),
             #[cfg(not(target_family = "wasm"))]
             Command::PrintTelemetryEvents => true,
         }
@@ -603,7 +732,7 @@ pub struct TerminalServerArgs {
 
 #[derive(Debug, Copy, Clone, clap::ValueEnum)]
 pub enum RecoveryMechanism {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[value(name = "force-x11")]
     X11,
     #[value(name = "force-dedicated-gpu")]

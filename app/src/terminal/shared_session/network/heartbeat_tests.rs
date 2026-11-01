@@ -1,7 +1,9 @@
-use super::{Event, Heartbeat};
 use std::time::Duration;
-use warpui::r#async::Timer;
+
 use warpui::App;
+use warpui::r#async::Timer;
+
+use super::{Event, Heartbeat};
 
 #[test]
 #[ignore = "Flakes in CI"]

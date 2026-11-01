@@ -1,32 +1,34 @@
 //! Integration tests for text selection and copying functionality in AI blocks.
 //! This module tests AI blocks with markdown **enabled**.
 //! There are no tests with markdown disabled because Agent Mode Markdown has been fully rolled out.
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use lazy_static::lazy_static;
+use pathfinder_geometry::vector::{Vector2F, vec2f};
+use settings::ToggleableSetting;
+use warp::cmd_or_ctrl_shift;
+use warp::features::FeatureFlag;
+use warp::integration_testing::clipboard::assert_clipboard_contains_string;
+use warp::integration_testing::step::new_step_with_default_assertions;
+use warp::integration_testing::terminal::{
+    assert_view_has_text_selection, clear_blocklist_to_remove_bootstrapped_blocks,
+    execute_echo_str, wait_until_bootstrapped_single_pane_for_tab,
+};
+use warp::integration_testing::view_getters::single_terminal_view_for_tab;
+use warp::settings::SelectionSettings;
+use warp_multi_agent_api as api;
+use warpui_core::integration::TestStep;
+use warpui_core::text::SelectionType;
+use warpui_core::{Event, SingletonEntity, async_assert};
 
 use super::new_builder;
-use crate::{util::skip_if_powershell_core_2303, Builder};
-use lazy_static::lazy_static;
-use pathfinder_geometry::vector::{vec2f, Vector2F};
-use settings::ToggleableSetting;
-use warp::{
-    cmd_or_ctrl_shift,
-    features::FeatureFlag,
-    integration_testing::{
-        clipboard::assert_clipboard_contains_string,
-        step::new_step_with_default_assertions,
-        terminal::{
-            assert_view_has_text_selection, clear_blocklist_to_remove_bootstrapped_blocks,
-            execute_echo_str, wait_until_bootstrapped_single_pane_for_tab,
-        },
-        view_getters::single_terminal_view_for_tab,
-    },
-    settings::SelectionSettings,
-};
-use warp_multi_agent_api as api;
-use warpui::{async_assert, integration::TestStep, text::SelectionType, Event, SingletonEntity};
+use crate::Builder;
+use crate::util::skip_if_powershell_core_2303;
 
 cfg_if::cfg_if! {
-    if #[cfg(target_os = "linux")] {
+    if #[cfg(any(target_os = "linux", target_os = "freebsd"))] {
         lazy_static! {
             /// Position directly to the left of the first user query.
             static ref START_OF_FIRST_BLOCK_POSITION: Vector2F = vec2f(17.0, 239.0);
@@ -131,9 +133,11 @@ fn restored_user_query_message(task_id: &str, request_id: &str, directory: &str)
             referenced_attachments: HashMap::new(),
             mode: None,
             intended_agent: Default::default(),
+            ..Default::default()
         })),
         request_id: request_id.to_string(),
         timestamp: None,
+        fetched_memories: vec![],
     }
 }
 
@@ -159,6 +163,7 @@ fn restored_agent_output_message(task_id: &str, request_id: &str) -> api::Messag
         )),
         request_id: request_id.to_string(),
         timestamp: None,
+        fetched_memories: vec![],
     }
 }
 
@@ -218,6 +223,61 @@ pub fn test_restored_ai_block_renders_mermaid_and_local_images() -> Builder {
                         async_assert!(
                             view.last_ai_block().is_some(),
                             "Restored AI block should exist"
+                        )
+                    })
+                }),
+        )
+}
+
+/// Renders an orchestrate card whose `run_agents` tool call was still streaming
+/// when the conversation was cancelled. The call never reaches the action
+/// queue, so it has no action status and the card must fall back to its
+/// terminal cancelled state instead of the "Configuring agents…" placeholder.
+pub fn test_cancelled_run_agents_card_renders_cancelled_state() -> Builder {
+    new_builder()
+        .with_real_display()
+        // A dummy AI block is not attached to an agent view conversation, so with
+        // `AgentView` on it is filtered out of the terminal transcript and never
+        // renders. The user preference is the only override that wins over the
+        // flag state the app installs during startup.
+        .with_step(
+            TestStep::new("Render AI blocks inline in the blocklist").with_action(|_, _, _| {
+                FeatureFlag::AgentView.set_user_preference(false);
+            }),
+        )
+        .with_step(wait_until_bootstrapped_single_pane_for_tab(0))
+        .with_step(clear_blocklist_to_remove_bootstrapped_blocks())
+        .with_step(execute_echo_str(0, "orchestrate card repro"))
+        .with_step(
+            new_step_with_default_assertions("Insert cancelled orchestrate AI block").with_action(
+                |app, window_id, _| {
+                    let terminal_view = single_terminal_view_for_tab(app, window_id, 0);
+                    terminal_view.update(app, |view, ctx| {
+                        view.insert_dummy_cancelled_run_agents_ai_block(
+                            "Can you parallelize the migration?".to_owned(),
+                            "Splitting the migration across three agents.".to_owned(),
+                            vec![
+                                "schema-migration".to_owned(),
+                                "api-handlers".to_owned(),
+                                "integration-tests".to_owned(),
+                            ],
+                            ctx,
+                        );
+                    });
+                },
+            ),
+        )
+        .with_step(
+            TestStep::new("Capture the cancelled orchestrate card")
+                .set_timeout(Duration::from_secs(20))
+                .set_post_step_pause(Duration::from_secs(3))
+                .with_take_screenshot("run_agents_cancelled_card.png")
+                .add_assertion(|app, window_id| {
+                    let terminal_view = single_terminal_view_for_tab(app, window_id, 0);
+                    terminal_view.read(app, |view, _ctx| {
+                        async_assert!(
+                            view.last_ai_block().is_some(),
+                            "Cancelled orchestrate AI block should exist"
                         )
                     })
                 }),
@@ -320,6 +380,51 @@ T This is a dummy title
         );
     }
     builder
+}
+
+/// Text we mark as selected within the AI block for the copy regression test.
+const AI_BLOCK_SELECTED_TEXT: &str = "agent mode and this is my dummy output";
+
+/// Regression test for copying a selection that lives *entirely within* an AI
+/// block (select text in an AI response, then copy). This is the case broken by
+/// #12079's `mouse_down` `if !handled` guard: the AI block's `SelectableArea`
+/// consumes the mouse-down, so the terminal model selection is never started and
+/// `selection_to_string` returns nothing on copy.
+///
+/// Unlike the `*_through_ai_*` tests, the selection here does NOT start in a
+/// command block, so there is no point-based model selection to fall back on —
+/// it exercises the AI-block-only path that the fix repairs.
+///
+/// We simulate the in-AI selection the same way the `SelectableArea` does for a
+/// pure in-block drag (write the block-level selected text and notify the
+/// terminal view), rather than relying on layout-sensitive pixel coordinates
+/// (which is why the `*_through_ai_*` tests are currently ignored).
+pub fn test_copy_selection_within_ai_block() -> Builder {
+    builder_with_setup()
+        .with_step(
+            new_step_with_default_assertions("Select text within the AI block").with_action(
+                |app, _, _| {
+                    let window_id = app.window_ids()[0];
+                    let terminal_view = single_terminal_view_for_tab(app, window_id, 0);
+                    let ai_block = terminal_view
+                        .read(app, |view, _| view.last_ai_block())
+                        .expect("AI block exists");
+                    ai_block.update(app, |block, ctx| {
+                        block.simulate_text_selection_for_test(
+                            Some(AI_BLOCK_SELECTED_TEXT.to_owned()),
+                            ctx,
+                        );
+                    });
+                },
+            ),
+        )
+        .with_step(
+            new_step_with_default_assertions("Copy the in-AI-block selection")
+                .with_keystrokes(&[cmd_or_ctrl_shift("c")])
+                .add_assertion(assert_clipboard_contains_string(
+                    AI_BLOCK_SELECTED_TEXT.to_owned(),
+                )),
+        )
 }
 
 pub fn test_selection_first_to_last_through_ai_simple() -> Builder {

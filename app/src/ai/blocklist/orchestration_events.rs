@@ -1,21 +1,18 @@
-use super::history_model::{BlocklistAIHistoryEvent, BlocklistAIHistoryModel};
-use super::telemetry::{
-    BlocklistOrchestrationTelemetryEvent, TeamAgentCommunicationFailedEvent,
-    TeamAgentCommunicationFailureReason, TeamAgentCommunicationKind,
-    TeamAgentCommunicationTransport, TeamAgentOrchestrationVersion,
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+use warp_multi_agent_api as api;
+use warpui::{Entity, ModelContext, SingletonEntity};
+
+use super::history_model::{
+    BlocklistAIHistoryEvent, BlocklistAIHistoryModel, ConversationStatusUpdate,
 };
+use crate::ai::agent::conversation::{AIConversationId, ConversationStatus};
+use crate::ai::agent::task::TaskId;
 use crate::ai::agent::{
-    conversation::{AIConversationId, ConversationStatus},
-    task::TaskId,
     AIAgentExchangeId, AIAgentInput, AIAgentOutputMessageType, LifecycleEventType,
     ReceivedMessageInput,
 };
-use std::collections::{HashMap, HashSet};
-use uuid::Uuid;
-use warp_core::features::FeatureFlag;
-use warp_core::send_telemetry_from_ctx;
-use warp_multi_agent_api as api;
-use warpui::{Entity, ModelContext, SingletonEntity};
 
 const MAX_RETRY_ATTEMPTS: i32 = 3;
 const MAX_PENDING_LIFECYCLE_EVENTS_PER_TARGET: usize = 200;
@@ -24,14 +21,7 @@ const MAX_PENDING_LIFECYCLE_EVENTS_PER_TARGET: usize = 200;
 /// This keeps persisted/runtime metadata consistent across API payloads and DB rows.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum LifecycleEventDetailStage {
-    Startup,
     Runtime,
-}
-
-#[derive(Debug, Clone)]
-struct LifecycleSubscriptionRoute {
-    target_agent_id: String,
-    subscribed_event_types: Option<Vec<LifecycleEventType>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -46,13 +36,12 @@ impl LifecycleEventDetailStage {
     /// Canonical lowercase representation used in persistence/API payloads.
     fn as_str(self) -> &'static str {
         match self {
-            Self::Startup => "startup",
             Self::Runtime => "runtime",
         }
     }
 }
 
-/// Type-specific queued data, including service-generated fields.
+/// Type-specific queued data.
 #[derive(Debug, Clone)]
 pub enum PendingEventDetail {
     Message {
@@ -75,37 +64,52 @@ pub struct PendingEvent {
     pub detail: PendingEventDetail,
 }
 
-/// Result returned from lifecycle send operations.
-pub enum SendEventResult {
-    LifecycleSent,
-    LifecycleDropped,
-    Error(String),
-}
-
-pub enum SendMessageResult {
-    MessageSent { message_id: String },
-    Error(String),
-}
-
 pub enum OrchestrationEventServiceEvent {
     /// Signals that a conversation may have pending orchestration events
     /// ready to drain.
     EventsReady { conversation_id: AIConversationId },
 }
 
-/// Synchronous state manager for orchestration event queuing, delivery
-/// tracking, lifecycle dispatch, and readiness detection.
+/// Thread-safe handle that commits a conversation's ambient run as exiting from any thread,
+/// without needing model access — including from an idle-timeout's background timer thread, at
+/// the exact moment it decides to fire, before anything (including the timer's own completion
+/// signal) can make that decision observable elsewhere (QUALITY-1801). This is the only writer
+/// of the exiting flag; queued-event cleanup (`drop_pending_events_for_exiting_conversation`)
+/// runs later, once model access is available, and never needs to touch it.
+///
+/// Gated to `not(target_family = "wasm")`: nothing compiled into a wasm build ever needs to
+/// commit off the model thread this way, so an unguarded `pub` item here would be dead code
+/// under the wasm lint's `-D warnings`.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone)]
+pub struct ExitCommitHandle(Arc<Mutex<HashSet<AIConversationId>>>);
+
+#[cfg(not(target_family = "wasm"))]
+impl ExitCommitHandle {
+    /// Commits `conversation_id` as exiting. Safe to call from any thread, including
+    /// concurrently with a model-thread read of `is_conversation_exiting`.
+    pub fn commit(&self, conversation_id: AIConversationId) {
+        if let Ok(mut exiting) = self.0.lock() {
+            exiting.insert(conversation_id);
+        }
+    }
+}
+
+/// Synchronous state manager for orchestration event queuing, delivery tracking, and readiness detection.
 pub struct OrchestrationEventService {
     pending_events: HashMap<AIConversationId, Vec<PendingEvent>>,
     awaiting_server_echo_events: HashMap<AIConversationId, Vec<PendingEvent>>,
-    lifecycle_subscription_routes: HashMap<AIConversationId, Vec<LifecycleSubscriptionRoute>>,
     conversation_statuses: HashMap<AIConversationId, ConversationStatus>,
+    /// Conversations whose ambient run has begun a terminal exit with no further idle window
+    /// to cancel it (see [`ExitCommitHandle`]). Shared and mutex-guarded, rather than a
+    /// plain `HashSet`, so `ExitCommitHandle` can commit this state from a non-model thread.
+    exiting_conversations: Arc<Mutex<HashSet<AIConversationId>>>,
 }
 
 impl OrchestrationEventService {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
         let history_model = BlocklistAIHistoryModel::handle(ctx);
-        ctx.subscribe_to_model(&history_model, move |me, event, ctx| {
+        ctx.subscribe_to_model(&history_model, move |me, _, event, ctx| {
             me.handle_history_event(event, ctx);
         });
         Self::new_without_subscriptions()
@@ -115,221 +119,64 @@ impl OrchestrationEventService {
         Self {
             pending_events: HashMap::new(),
             awaiting_server_echo_events: HashMap::new(),
-            lifecycle_subscription_routes: HashMap::new(),
             conversation_statuses: HashMap::new(),
+            exiting_conversations: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    pub fn register_lifecycle_subscription(
+    /// Vends a thread-safe handle that can commit conversations as exiting from any thread. See
+    /// [`ExitCommitHandle`].
+    #[cfg(not(target_family = "wasm"))]
+    pub fn exit_commit_handle(&self) -> ExitCommitHandle {
+        ExitCommitHandle(Arc::clone(&self.exiting_conversations))
+    }
+
+    /// Drops any orchestration events still queued for `conversation_id`, since its ambient
+    /// run's exit is now being finalized and they arrived too late to ever be delivered
+    /// (QUALITY-1801). Assumes [`ExitCommitHandle::commit`] already committed the exiting flag
+    /// for this conversation — by the time this runs, on the model thread, it always has — so
+    /// this only does the part that needs model access: the flag itself is not touched here.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn drop_pending_events_for_exiting_conversation(
         &mut self,
-        source_conversation_id: AIConversationId,
-        target_agent_id: String,
-        subscribed_event_types: Option<Vec<LifecycleEventType>>,
+        conversation_id: AIConversationId,
     ) {
-        let routes = self
-            .lifecycle_subscription_routes
-            .entry(source_conversation_id)
-            .or_default();
-        if let Some(existing_route) = routes
-            .iter_mut()
-            .find(|route| route.target_agent_id == target_agent_id)
+        if let Some(dropped) = self.pending_events.remove(&conversation_id)
+            && !dropped.is_empty()
         {
-            existing_route.subscribed_event_types = subscribed_event_types;
-            return;
-        }
-        routes.push(LifecycleSubscriptionRoute {
-            target_agent_id,
-            subscribed_event_types,
-        });
-    }
-
-    #[allow(deprecated)]
-    pub fn emit_child_startup_started(
-        &mut self,
-        child_conversation_id: AIConversationId,
-        ctx: &mut ModelContext<Self>,
-    ) {
-        let result = self.dispatch_lifecycle_event(
-            child_conversation_id,
-            LifecycleEventType::Started,
-            LifecycleEventDetailPayload::default(),
-            ctx,
-        );
-        self.log_lifecycle_dispatch_result(
-            child_conversation_id,
-            LifecycleEventType::Started,
-            result,
-        );
-    }
-
-    pub fn emit_child_startup_errored(
-        &mut self,
-        child_conversation_id: AIConversationId,
-        reason: String,
-        error_message: String,
-        ctx: &mut ModelContext<Self>,
-    ) {
-        let result = self.dispatch_lifecycle_event(
-            child_conversation_id,
-            LifecycleEventType::Errored,
-            LifecycleEventDetailPayload {
-                stage: Some(LifecycleEventDetailStage::Startup),
-                reason: Some(reason),
-                error_message: Some(error_message),
-                blocked_action: None,
-            },
-            ctx,
-        );
-        self.log_lifecycle_dispatch_result(
-            child_conversation_id,
-            LifecycleEventType::Errored,
-            result,
-        );
-    }
-
-    fn dispatch_lifecycle_event(
-        &mut self,
-        source_conversation_id: AIConversationId,
-        event_type: LifecycleEventType,
-        detail_payload: LifecycleEventDetailPayload,
-        ctx: &mut ModelContext<Self>,
-    ) -> SendEventResult {
-        if event_type == LifecycleEventType::Unspecified {
-            send_telemetry_from_ctx!(
-                BlocklistOrchestrationTelemetryEvent::TeamAgentCommunicationFailed(
-                    TeamAgentCommunicationFailedEvent {
-                        communication_kind: TeamAgentCommunicationKind::LifecycleEvent,
-                        transport: TeamAgentCommunicationTransport::Local,
-                        orchestration_version: TeamAgentOrchestrationVersion::V1,
-                        failure_reason:
-                            TeamAgentCommunicationFailureReason::InvalidLifecycleEventType,
-                        source_conversation_id,
-                        source_run_id: None,
-                        target_count: None,
-                        lifecycle_event_type: Some(
-                            lifecycle_event_type_name(event_type).to_string(),
-                        ),
-                        error_message: None,
-                    }
-                ),
-                ctx
-            );
-            return SendEventResult::Error(
-                "Cannot send lifecycle event with unspecified type".to_string(),
+            log::warn!(
+                "Dropping {} orchestration event(s) for conversation {conversation_id:?}: \
+                 its ambient run began terminal exit before they could be delivered",
+                dropped.len()
             );
         }
+    }
 
-        let sender_agent_id = {
-            let history_model = BlocklistAIHistoryModel::as_ref(ctx);
-            let Some(source_conversation) = history_model.conversation(&source_conversation_id)
-            else {
-                send_telemetry_from_ctx!(
-                    BlocklistOrchestrationTelemetryEvent::TeamAgentCommunicationFailed(
-                        TeamAgentCommunicationFailedEvent {
-                            communication_kind: TeamAgentCommunicationKind::LifecycleEvent,
-                            transport: TeamAgentCommunicationTransport::Local,
-                            orchestration_version: TeamAgentOrchestrationVersion::V1,
-                            failure_reason:
-                                TeamAgentCommunicationFailureReason::MissingSourceConversation,
-                            source_conversation_id,
-                            source_run_id: None,
-                            target_count: None,
-                            lifecycle_event_type: Some(
-                                lifecycle_event_type_name(event_type).to_string(),
-                            ),
-                            error_message: None,
-                        }
-                    ),
-                    ctx
-                );
-                return SendEventResult::Error("Source conversation not found".to_string());
-            };
-            let Some(sender_agent_id) = source_conversation
-                .server_conversation_token()
-                .map(|token| token.as_str().to_string())
-            else {
-                send_telemetry_from_ctx!(
-                    BlocklistOrchestrationTelemetryEvent::TeamAgentCommunicationFailed(
-                        TeamAgentCommunicationFailedEvent {
-                            communication_kind: TeamAgentCommunicationKind::LifecycleEvent,
-                            transport: TeamAgentCommunicationTransport::Local,
-                            orchestration_version: TeamAgentOrchestrationVersion::V1,
-                            failure_reason:
-                                TeamAgentCommunicationFailureReason::MissingSourceIdentifier,
-                            source_conversation_id,
-                            source_run_id: None,
-                            target_count: None,
-                            lifecycle_event_type: Some(
-                                lifecycle_event_type_name(event_type).to_string(),
-                            ),
-                            error_message: None,
-                        }
-                    ),
-                    ctx
-                );
-                return SendEventResult::Error(
-                    "Source conversation has no server token — cannot send events".to_string(),
-                );
-            };
-            sender_agent_id
-        };
-
-        let Some(routes) = self
-            .lifecycle_subscription_routes
-            .get(&source_conversation_id)
-        else {
-            return SendEventResult::LifecycleDropped;
-        };
-
-        let mut resolved_targets = Vec::new();
+    /// Drops any orchestration events still queued for `conversation_id` because an external
+    /// harness drives its turns (see `ConversationDriver::owns_turn_lifecycle`): this client never
+    /// dispatches to Warp's agent loop for it, and the server wakes such runs itself when new
+    /// messages arrive.
+    pub fn drop_pending_events_for_external_harness_conversation(
+        &mut self,
+        conversation_id: AIConversationId,
+    ) {
+        if let Some(dropped) = self.pending_events.remove(&conversation_id)
+            && !dropped.is_empty()
         {
-            let history_model = BlocklistAIHistoryModel::as_ref(ctx);
-            for route in routes {
-                if !is_subscribed(route.subscribed_event_types.as_deref(), event_type) {
-                    continue;
-                }
-                let Some(conversation_id) =
-                    history_model.conversation_id_for_agent_id(&route.target_agent_id)
-                else {
-                    send_telemetry_from_ctx!(
-                        BlocklistOrchestrationTelemetryEvent::TeamAgentCommunicationFailed(
-                            TeamAgentCommunicationFailedEvent {
-                                communication_kind: TeamAgentCommunicationKind::LifecycleEvent,
-                                transport: TeamAgentCommunicationTransport::Local,
-                                orchestration_version: TeamAgentOrchestrationVersion::V1,
-                                failure_reason: TeamAgentCommunicationFailureReason::UnknownAgent,
-                                source_conversation_id,
-                                source_run_id: None,
-                                target_count: Some(1),
-                                lifecycle_event_type: Some(
-                                    lifecycle_event_type_name(event_type).to_string(),
-                                ),
-                                error_message: None,
-                            }
-                        ),
-                        ctx
-                    );
-                    log::warn!(
-                        "OrchestrationEventService: could not resolve lifecycle target {}",
-                        route.target_agent_id
-                    );
-                    continue;
-                };
-                resolved_targets.push((route.target_agent_id.clone(), conversation_id));
-            }
+            log::info!(
+                "[orch-external-harness] Dropping {} queued orchestration event(s) for \
+                 conversation {conversation_id:?}: an external harness drives its turns, so \
+                 they cannot be injected into Warp's agent loop",
+                dropped.len()
+            );
         }
+    }
 
-        if resolved_targets.is_empty() {
-            return SendEventResult::LifecycleDropped;
-        }
-
-        self.send_lifecycle_event(
-            &sender_agent_id,
-            &resolved_targets,
-            event_type,
-            &detail_payload,
-            ctx,
-        )
+    /// True once [`ExitCommitHandle::commit`] has been called for `conversation_id`.
+    pub fn is_conversation_exiting(&self, conversation_id: AIConversationId) -> bool {
+        self.exiting_conversations
+            .lock()
+            .is_ok_and(|exiting| exiting.contains(&conversation_id))
     }
 
     pub fn handle_history_event(
@@ -340,9 +187,12 @@ impl OrchestrationEventService {
         match event {
             BlocklistAIHistoryEvent::UpdatedConversationStatus {
                 conversation_id,
-                is_restored,
+                update,
                 ..
-            } => self.on_conversation_status_updated(*conversation_id, *is_restored, ctx),
+            } => {
+                let is_restored = matches!(update, ConversationStatusUpdate::Restored);
+                self.on_conversation_status_updated(*conversation_id, is_restored, ctx)
+            }
             BlocklistAIHistoryEvent::UpdatedStreamingExchange {
                 conversation_id,
                 exchange_id,
@@ -357,42 +207,6 @@ impl OrchestrationEventService {
             } => {
                 for conversation_id in conversation_ids {
                     self.sync_conversation_status(*conversation_id, ctx);
-                    // Under V1 local lifecycle dispatch, child status
-                    // transitions are forwarded to the parent via
-                    // `lifecycle_subscription_routes`. That map is not
-                    // persisted, so re-register subscriptions for each
-                    // restored child whose parent is loaded locally so that
-                    // child status transitions continue to propagate after
-                    // a restart. V2 uses the server event log and does not
-                    // need this.
-                    if !FeatureFlag::OrchestrationV2.is_enabled() {
-                        let parent_agent_id = {
-                            let history_model = BlocklistAIHistoryModel::as_ref(ctx);
-                            let Some(child_conv) = history_model.conversation(conversation_id)
-                            else {
-                                continue;
-                            };
-                            if !child_conv.is_child_agent_conversation() {
-                                continue;
-                            }
-                            child_conv
-                                .parent_conversation_id()
-                                .and_then(|pid| history_model.conversation(&pid))
-                                .and_then(|p| p.server_conversation_token())
-                                .map(|t| t.as_str().to_string())
-                        };
-                        if let Some(parent_agent_id) = parent_agent_id {
-                            // `None` event-type filter = subscribe to all
-                            // lifecycle types. The original filter (if any)
-                            // is not persisted; subscribing broader than the
-                            // original is acceptable per the tech spec.
-                            self.register_lifecycle_subscription(
-                                *conversation_id,
-                                parent_agent_id,
-                                None,
-                            );
-                        }
-                    }
                 }
             }
             BlocklistAIHistoryEvent::RemoveConversation {
@@ -403,36 +217,12 @@ impl OrchestrationEventService {
             } => {
                 self.pending_events.remove(conversation_id);
                 self.awaiting_server_echo_events.remove(conversation_id);
-                self.lifecycle_subscription_routes.remove(conversation_id);
                 self.conversation_statuses.remove(conversation_id);
+                if let Ok(mut exiting) = self.exiting_conversations.lock() {
+                    exiting.remove(conversation_id);
+                }
             }
             _ => {}
-        }
-    }
-
-    fn log_lifecycle_dispatch_result(
-        &self,
-        child_conversation_id: AIConversationId,
-        event_type: LifecycleEventType,
-        result: SendEventResult,
-    ) {
-        let event_type_name = lifecycle_event_type_name(event_type);
-        match result {
-            SendEventResult::LifecycleSent => {
-                log::debug!(
-                    "LIFECYCLE-EVENT-DEBUG: Emitted child lifecycle event: event_type={event_type_name} child_conversation_id={child_conversation_id:?}"
-                );
-            }
-            SendEventResult::LifecycleDropped => {
-                log::debug!(
-                    "LIFECYCLE-EVENT-DEBUG: Dropped child lifecycle event due to lifecycle subscription filtering: event_type={event_type_name} child_conversation_id={child_conversation_id:?}"
-                );
-            }
-            SendEventResult::Error(error) => {
-                log::warn!(
-                    "LIFECYCLE-EVENT-WARN: Failed to emit lifecycle event for child agent: event_type={event_type_name} child_conversation_id={child_conversation_id:?} error={error}"
-                );
-            }
         }
     }
 
@@ -457,387 +247,35 @@ impl OrchestrationEventService {
         is_restored: bool,
         ctx: &mut ModelContext<Self>,
     ) {
-        let (is_child_agent_conversation, current_status, status_error_message) = {
+        let current_status = {
             let Some(conversation) =
                 BlocklistAIHistoryModel::as_ref(ctx).conversation(&conversation_id)
             else {
                 self.conversation_statuses.remove(&conversation_id);
                 return;
             };
-            (
-                conversation.is_child_agent_conversation(),
-                conversation.status().clone(),
-                conversation.status_error_message().map(str::to_string),
-            )
+            conversation.status().clone()
         };
 
-        let previous_status = self
-            .conversation_statuses
+        self.conversation_statuses
             .insert(conversation_id, current_status.clone());
         let has_pending = self
             .pending_events
             .get(&conversation_id)
             .is_some_and(|events| !events.is_empty());
-        if !is_restored && matches!(&current_status, ConversationStatus::Success) && has_pending {
+        // Re-fire EventsReady whenever the conversation reaches a status
+        // that `conversation_ready_for_pending_events` would accept, so
+        // events queued while the stream was in flight drain as soon as
+        // the stream finishes — either to `Success` or to
+        // `WaitingForEvents` via a `wait_for_events` yield.
+        if !is_restored
+            && matches!(
+                &current_status,
+                ConversationStatus::Success | ConversationStatus::WaitingForEvents
+            )
+            && has_pending
+        {
             ctx.emit(OrchestrationEventServiceEvent::EventsReady { conversation_id });
-        }
-
-        if is_restored || !is_child_agent_conversation {
-            return;
-        }
-
-        // When v2 is enabled, lifecycle events are delivered via the server
-        // event log (poller reports → polls back → enqueues). Skip the v1
-        // local dispatch to avoid duplicate delivery.
-        if FeatureFlag::OrchestrationV2.is_enabled() {
-            return;
-        }
-
-        #[allow(deprecated)]
-        match (previous_status.as_ref(), &current_status) {
-            (Some(ConversationStatus::Success), ConversationStatus::InProgress) => {
-                let result = self.dispatch_lifecycle_event(
-                    conversation_id,
-                    LifecycleEventType::Restarted,
-                    LifecycleEventDetailPayload::default(),
-                    ctx,
-                );
-                self.log_lifecycle_dispatch_result(
-                    conversation_id,
-                    LifecycleEventType::Restarted,
-                    result,
-                );
-            }
-            (Some(ConversationStatus::Blocked { .. }), ConversationStatus::InProgress) => {
-                let result = self.dispatch_lifecycle_event(
-                    conversation_id,
-                    LifecycleEventType::Restarted,
-                    LifecycleEventDetailPayload::default(),
-                    ctx,
-                );
-                self.log_lifecycle_dispatch_result(
-                    conversation_id,
-                    LifecycleEventType::Restarted,
-                    result,
-                );
-            }
-            (Some(ConversationStatus::InProgress), ConversationStatus::Success) => {
-                let result = self.dispatch_lifecycle_event(
-                    conversation_id,
-                    LifecycleEventType::Idle,
-                    LifecycleEventDetailPayload::default(),
-                    ctx,
-                );
-                self.log_lifecycle_dispatch_result(
-                    conversation_id,
-                    LifecycleEventType::Idle,
-                    result,
-                );
-            }
-            (Some(ConversationStatus::InProgress), ConversationStatus::Error) => {
-                let result = self.dispatch_lifecycle_event(
-                    conversation_id,
-                    LifecycleEventType::Errored,
-                    LifecycleEventDetailPayload {
-                        stage: Some(LifecycleEventDetailStage::Runtime),
-                        reason: Some("conversation_error".to_string()),
-                        error_message: status_error_message,
-                        blocked_action: None,
-                    },
-                    ctx,
-                );
-                self.log_lifecycle_dispatch_result(
-                    conversation_id,
-                    LifecycleEventType::Errored,
-                    result,
-                );
-            }
-            (
-                Some(ConversationStatus::InProgress),
-                ConversationStatus::Blocked { blocked_action },
-            ) => {
-                let result = self.dispatch_lifecycle_event(
-                    conversation_id,
-                    LifecycleEventType::Blocked,
-                    LifecycleEventDetailPayload {
-                        stage: None,
-                        reason: None,
-                        error_message: None,
-                        blocked_action: Some(blocked_action.clone()),
-                    },
-                    ctx,
-                );
-                self.log_lifecycle_dispatch_result(
-                    conversation_id,
-                    LifecycleEventType::Blocked,
-                    result,
-                );
-            }
-            (Some(ConversationStatus::InProgress), ConversationStatus::Cancelled)
-            | (Some(ConversationStatus::Blocked { .. }), ConversationStatus::Cancelled) => {
-                let result = self.dispatch_lifecycle_event(
-                    conversation_id,
-                    LifecycleEventType::Cancelled,
-                    LifecycleEventDetailPayload::default(),
-                    ctx,
-                );
-                self.log_lifecycle_dispatch_result(
-                    conversation_id,
-                    LifecycleEventType::Cancelled,
-                    result,
-                );
-            }
-            _ => {}
-        }
-    }
-
-    /// Send an orchestration event from `source_conversation_id` to each agent
-    /// in `target_agent_ids`. Resolves addresses, queues, and emits
-    /// `EventsReady` for each target conversation.
-    pub fn send_message(
-        &mut self,
-        source_conversation_id: AIConversationId,
-        target_agent_ids: &[String],
-        subject: String,
-        message_body: String,
-        ctx: &mut ModelContext<Self>,
-    ) -> SendMessageResult {
-        let (sender_agent_id, resolved_targets) = {
-            let history_model = BlocklistAIHistoryModel::as_ref(ctx);
-            let Some(source_conversation) = history_model.conversation(&source_conversation_id)
-            else {
-                send_telemetry_from_ctx!(
-                    BlocklistOrchestrationTelemetryEvent::TeamAgentCommunicationFailed(
-                        TeamAgentCommunicationFailedEvent {
-                            communication_kind: TeamAgentCommunicationKind::Message,
-                            transport: TeamAgentCommunicationTransport::Local,
-                            orchestration_version: TeamAgentOrchestrationVersion::V1,
-                            failure_reason:
-                                TeamAgentCommunicationFailureReason::MissingSourceConversation,
-                            source_conversation_id,
-                            source_run_id: None,
-                            target_count: Some(target_agent_ids.len()),
-                            lifecycle_event_type: None,
-                            error_message: None,
-                        }
-                    ),
-                    ctx
-                );
-                let error = "Source conversation not found".to_string();
-                self.log_send_message_error(
-                    source_conversation_id,
-                    target_agent_ids,
-                    &subject,
-                    &error,
-                );
-                return SendMessageResult::Error(error);
-            };
-            let Some(sender_agent_id) = source_conversation
-                .server_conversation_token()
-                .map(|token| token.as_str().to_string())
-            else {
-                send_telemetry_from_ctx!(
-                    BlocklistOrchestrationTelemetryEvent::TeamAgentCommunicationFailed(
-                        TeamAgentCommunicationFailedEvent {
-                            communication_kind: TeamAgentCommunicationKind::Message,
-                            transport: TeamAgentCommunicationTransport::Local,
-                            orchestration_version: TeamAgentOrchestrationVersion::V1,
-                            failure_reason:
-                                TeamAgentCommunicationFailureReason::MissingSourceIdentifier,
-                            source_conversation_id,
-                            source_run_id: None,
-                            target_count: Some(target_agent_ids.len()),
-                            lifecycle_event_type: None,
-                            error_message: None,
-                        }
-                    ),
-                    ctx
-                );
-                let error =
-                    "Source conversation has no server token — cannot send events".to_string();
-                self.log_send_message_error(
-                    source_conversation_id,
-                    target_agent_ids,
-                    &subject,
-                    &error,
-                );
-                return SendMessageResult::Error(error);
-            };
-
-            let mut resolved_targets = Vec::new();
-            for agent_id in target_agent_ids {
-                match history_model.conversation_id_for_agent_id(agent_id) {
-                    Some(conversation_id) => {
-                        resolved_targets.push((agent_id.clone(), conversation_id));
-                    }
-                    None => {
-                        send_telemetry_from_ctx!(
-                            BlocklistOrchestrationTelemetryEvent::TeamAgentCommunicationFailed(
-                                TeamAgentCommunicationFailedEvent {
-                                    communication_kind: TeamAgentCommunicationKind::Message,
-                                    transport: TeamAgentCommunicationTransport::Local,
-                                    orchestration_version: TeamAgentOrchestrationVersion::V1,
-                                    failure_reason:
-                                        TeamAgentCommunicationFailureReason::UnknownAgent,
-                                    source_conversation_id,
-                                    source_run_id: None,
-                                    target_count: Some(target_agent_ids.len()),
-                                    lifecycle_event_type: None,
-                                    error_message: None,
-                                }
-                            ),
-                            ctx
-                        );
-                        let error = format!("Unknown agent address: {agent_id}");
-                        self.log_send_message_error(
-                            source_conversation_id,
-                            target_agent_ids,
-                            &subject,
-                            &error,
-                        );
-                        return SendMessageResult::Error(error);
-                    }
-                }
-            }
-            (sender_agent_id, resolved_targets)
-        };
-
-        if resolved_targets.is_empty() {
-            send_telemetry_from_ctx!(
-                BlocklistOrchestrationTelemetryEvent::TeamAgentCommunicationFailed(
-                    TeamAgentCommunicationFailedEvent {
-                        communication_kind: TeamAgentCommunicationKind::Message,
-                        transport: TeamAgentCommunicationTransport::Local,
-                        orchestration_version: TeamAgentOrchestrationVersion::V1,
-                        failure_reason: TeamAgentCommunicationFailureReason::NoTargets,
-                        source_conversation_id,
-                        source_run_id: None,
-                        target_count: Some(0),
-                        lifecycle_event_type: None,
-                        error_message: None,
-                    }
-                ),
-                ctx
-            );
-            let error = "No target agents provided".to_string();
-            self.log_send_message_error(source_conversation_id, target_agent_ids, &subject, &error);
-            return SendMessageResult::Error(error);
-        }
-
-        self.send_message_event(
-            &sender_agent_id,
-            &resolved_targets,
-            target_agent_ids,
-            subject,
-            message_body,
-            ctx,
-        )
-    }
-
-    fn send_message_event(
-        &mut self,
-        sender_agent_id: &str,
-        resolved_targets: &[(String, AIConversationId)],
-        target_agent_ids: &[String],
-        subject: String,
-        message_body: String,
-        ctx: &mut ModelContext<Self>,
-    ) -> SendMessageResult {
-        // One logical message fanout maps to many delivery envelopes (message rows).
-        // We keep `message_id` stable across targets so dedupe/threading can reason
-        // about a single message delivered to multiple recipients.
-        let message_id = Uuid::new_v4().to_string();
-
-        for (_, target_conversation_id) in resolved_targets {
-            let event_id = Uuid::new_v4().to_string();
-
-            let pending = PendingEvent {
-                event_id,
-                source_agent_id: sender_agent_id.to_string(),
-                attempt_count: 0,
-                detail: PendingEventDetail::Message {
-                    message_id: message_id.clone(),
-                    addresses: target_agent_ids.to_vec(),
-                    subject: subject.clone(),
-                    message_body: message_body.clone(),
-                },
-            };
-            self.pending_events
-                .entry(*target_conversation_id)
-                .or_default()
-                .push(pending);
-
-            // Signal the controller to check this conversation for pending events.
-            // The controller will check readiness (ownership, no in-flight) before draining.
-            ctx.emit(OrchestrationEventServiceEvent::EventsReady {
-                conversation_id: *target_conversation_id,
-            });
-        }
-
-        SendMessageResult::MessageSent { message_id }
-    }
-
-    fn log_send_message_error(
-        &self,
-        source_conversation_id: AIConversationId,
-        target_agent_ids: &[String],
-        subject: &str,
-        error: &str,
-    ) {
-        log::warn!(
-            "Failed to send child-agent message: source_conversation_id={source_conversation_id:?} target_agent_ids={target_agent_ids:?} subject={subject:?} error={error}"
-        );
-    }
-
-    /// Broadcast a lifecycle signal to subscribed targets.
-    /// Enqueues an in-memory `AgentEvent` for controller delivery.
-    fn send_lifecycle_event(
-        &mut self,
-        sender_agent_id: &str,
-        resolved_targets: &[(String, AIConversationId)],
-        event_type: LifecycleEventType,
-        detail_payload: &LifecycleEventDetailPayload,
-        ctx: &mut ModelContext<Self>,
-    ) -> SendEventResult {
-        if event_type == LifecycleEventType::Unspecified {
-            return SendEventResult::Error(
-                "Cannot send lifecycle event with unspecified type".to_string(),
-            );
-        }
-        // Use one timestamp for every target in this fanout so all delivered copies of
-        // the same logical lifecycle signal carry identical `occurred_at` semantics.
-        let occurred_at = chrono::Utc::now();
-        let occurred_at_proto = prost_types::Timestamp {
-            seconds: occurred_at.timestamp(),
-            nanos: occurred_at.timestamp_subsec_nanos() as i32,
-        };
-        for (_, target_conversation_id) in resolved_targets {
-            let event_id = Uuid::new_v4().to_string();
-            let agent_event = build_lifecycle_event(
-                event_id.clone(),
-                sender_agent_id.to_string(),
-                event_type,
-                occurred_at_proto,
-                detail_payload,
-            );
-
-            let pending = PendingEvent {
-                event_id: event_id.clone(),
-                source_agent_id: sender_agent_id.to_string(),
-                attempt_count: 0,
-                detail: PendingEventDetail::Lifecycle { event: agent_event },
-            };
-            self.enqueue_lifecycle_event(*target_conversation_id, pending);
-
-            // Signal the controller to check this conversation for pending events.
-            ctx.emit(OrchestrationEventServiceEvent::EventsReady {
-                conversation_id: *target_conversation_id,
-            });
-        }
-        if resolved_targets.is_empty() {
-            SendEventResult::LifecycleDropped
-        } else {
-            SendEventResult::LifecycleSent
         }
     }
 
@@ -866,7 +304,7 @@ impl OrchestrationEventService {
     }
 
     /// Accepts pre-built events from the v2 streamer and enqueues them
-    /// for drain by the controller via the normal v1 path.
+    /// for drain by the controller via the normal injection path.
     /// Lifecycle events go through coalescing and cap enforcement.
     pub fn enqueue_event_batch(
         &mut self,
@@ -888,6 +326,13 @@ impl OrchestrationEventService {
             }
         }
         ctx.emit(OrchestrationEventServiceEvent::EventsReady { conversation_id });
+    }
+
+    #[cfg(any(test, not(target_family = "wasm")))]
+    pub fn has_pending_events(&self, conversation_id: AIConversationId) -> bool {
+        self.pending_events
+            .get(&conversation_id)
+            .is_some_and(|events| !events.is_empty())
     }
 
     /// Drain and return all pending events for a conversation.
@@ -1002,18 +447,22 @@ impl OrchestrationEventService {
         }
     }
 
-    /// Scans the exchange output for orchestration IDs echoed back by the
-    /// server, then clears matching entries from awaiting_server_echo_events.
+    /// Clears events whose IDs the server echoed back in the exchange output. An echoed event
+    /// that is still pending was delivered by another route, so injecting it would repeat a turn.
     fn confirm_delivery_from_exchange(
         &mut self,
         conversation_id: AIConversationId,
         exchange_id: AIAgentExchangeId,
         ctx: &ModelContext<Self>,
     ) {
-        if !self
+        let has_awaiting = self
             .awaiting_server_echo_events
-            .contains_key(&conversation_id)
-        {
+            .contains_key(&conversation_id);
+        let has_pending = self
+            .pending_events
+            .get(&conversation_id)
+            .is_some_and(|events| !events.is_empty());
+        if !has_awaiting && !has_pending {
             return;
         }
 
@@ -1070,7 +519,7 @@ impl OrchestrationEventService {
         }
     }
 
-    /// Clears awaiting_server_echo_events entries that match the given IDs.
+    /// Clears awaiting and pending entries that match the given echoed IDs.
     fn acknowledge_delivery_from_server_echo(
         &mut self,
         conversation_id: AIConversationId,
@@ -1087,39 +536,35 @@ impl OrchestrationEventService {
             .iter()
             .map(String::as_str)
             .collect();
-        let should_remove_entry = {
-            let Some(awaiting_events) = self.awaiting_server_echo_events.get_mut(&conversation_id)
-            else {
-                return;
-            };
-
-            awaiting_events.retain(|pending_event| {
-                let was_echoed = did_event_round_trip_through_server(
-                    pending_event,
-                    &echoed_message_ids,
-                    &echoed_lifecycle_event_ids,
-                );
-                !was_echoed
-            });
-
-            awaiting_events.is_empty()
+        let was_echoed = |pending_event: &PendingEvent| {
+            did_event_round_trip_through_server(
+                pending_event,
+                &echoed_message_ids,
+                &echoed_lifecycle_event_ids,
+            )
         };
 
-        if should_remove_entry {
-            self.awaiting_server_echo_events.remove(&conversation_id);
+        if let Some(awaiting_events) = self.awaiting_server_echo_events.get_mut(&conversation_id) {
+            awaiting_events.retain(|event| !was_echoed(event));
+            if awaiting_events.is_empty() {
+                self.awaiting_server_echo_events.remove(&conversation_id);
+            }
         }
-    }
-}
 
-/// `None` means \"subscribe to all lifecycle types\" (input omitted).
-/// `Some([])` means subscribe to no lifecycle events.
-fn is_subscribed(
-    subscription: Option<&[LifecycleEventType]>,
-    event_type: LifecycleEventType,
-) -> bool {
-    match subscription {
-        None => true,
-        Some(subscription) => subscription.contains(&event_type),
+        if let Some(pending_events) = self.pending_events.get_mut(&conversation_id) {
+            let before = pending_events.len();
+            pending_events.retain(|event| !was_echoed(event));
+            let dropped = before - pending_events.len();
+            if dropped > 0 {
+                log::info!(
+                    "Dropped {dropped} pending orchestration event(s) for conversation \
+                     {conversation_id:?} already delivered by another route"
+                );
+            }
+            if pending_events.is_empty() {
+                self.pending_events.remove(&conversation_id);
+            }
+        }
     }
 }
 
@@ -1135,22 +580,6 @@ fn did_event_round_trip_through_server(
         PendingEventDetail::Lifecycle { event } => {
             echoed_lifecycle_event_ids.contains(event.event_id.as_str())
         }
-    }
-}
-
-#[allow(deprecated)]
-pub(super) fn lifecycle_event_type_name(event_type: LifecycleEventType) -> &'static str {
-    match event_type {
-        LifecycleEventType::Started => "started",
-        LifecycleEventType::Idle => "idle",
-        LifecycleEventType::Restarted => "restarted",
-        LifecycleEventType::InProgress => "in_progress",
-        LifecycleEventType::Succeeded => "succeeded",
-        LifecycleEventType::Failed => "failed",
-        LifecycleEventType::Errored => "errored",
-        LifecycleEventType::Cancelled => "cancelled",
-        LifecycleEventType::Blocked => "blocked",
-        LifecycleEventType::Unspecified => "unspecified",
     }
 }
 

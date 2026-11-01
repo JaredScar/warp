@@ -1,11 +1,10 @@
 //! CLI agent detection and configuration.
 //!
 //! This module provides types for detecting and working with CLI-based AI agents
-//! like Claude Code, Gemini CLI, Codex, Amp, and Droid.
+//! like Claude Code, Gemini CLI, Codex, Amp, Droid, OpenCode, Grok Build, and Muse Code.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::Path;
 
 use ai::skills::SkillProvider;
 use enum_iterator::Sequence;
@@ -13,19 +12,19 @@ use markdown_parser::parse_markdown;
 use pathfinder_color::ColorU;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use warp_editor::content::{buffer::Buffer, markdown::MarkdownStyle};
-
+use warp_cli::agent::Harness;
+use warp_completer::parsers::simple::{all_parsed_commands, top_level_command};
+use warp_editor::content::buffer::Buffer;
+use warp_editor::content::markdown::MarkdownStyle;
+use warp_util::path::EscapeChar;
 use warpui::{AppContext, SingletonEntity};
 
 use crate::ai::agent::{AgentReviewCommentBatch, DiffSetHunk};
 use crate::ai::blocklist::CLAUDE_ORANGE;
 use crate::code::editor::line::EditorLineLocation;
 use crate::code_review::comments::AttachedReviewCommentTarget;
-use crate::server::telemetry::CLIAgentType;
 use crate::ui_components::icons::Icon;
 use crate::workspaces::user_workspaces::UserWorkspaces;
-use warp_completer::parsers::simple::top_level_command;
-use warp_util::path::EscapeChar;
 
 /// UID for the Uber team.
 /// See https://warp.metabaseapp.com/dashboard/1454?team_id=46347
@@ -64,7 +63,7 @@ const DROID_COLOR: ColorU = ColorU {
 };
 
 /// OpenCode brand color (gray, used for contrast calculation only)
-const OPENCODE_COLOR: ColorU = ColorU {
+pub(crate) const OPENCODE_COLOR: ColorU = ColorU {
     r: 128,
     g: 128,
     b: 128,
@@ -81,6 +80,14 @@ const COPILOT_COLOR: ColorU = ColorU {
 
 /// Pi brand color (white, monochrome logo)
 const PI_COLOR: ColorU = ColorU {
+    r: 255,
+    g: 255,
+    b: 255,
+    a: 255,
+};
+
+/// Antigravity brand color (white, monochrome logo)
+const ANTIGRAVITY_COLOR: ColorU = ColorU {
     r: 255,
     g: 255,
     b: 255,
@@ -111,7 +118,46 @@ const GOOSE_COLOR: ColorU = ColorU {
     a: 255,
 };
 
-/// Represents a CLI agent (e.g., Claude Code, Gemini CLI, Codex, Amp, Droid, OpenCode, Copilot, Pi, Auggie, Cursor, Goose)
+/// Hermes brand color (Nous Research purple #7C3AED)
+const HERMES_PURPLE: ColorU = ColorU {
+    r: 124,
+    g: 58,
+    b: 237,
+    a: 255,
+};
+
+/// Mistral brand orange (#FA520F)
+const MISTRAL_ORANGE: ColorU = ColorU {
+    r: 250,
+    g: 82,
+    b: 15,
+    a: 255,
+};
+
+/// Grok / SpaceXAI brand color (near-black, monochrome logomark on circular tile)
+const GROK_COLOR: ColorU = ColorU {
+    r: 16,
+    g: 16,
+    b: 16,
+    a: 255,
+};
+
+const KIRO_PURPLE: ColorU = ColorU {
+    r: 144,
+    g: 70,
+    b: 255,
+    a: 255,
+};
+
+/// Muse Code / Meta brand blue (#0081FB)
+const MUSE_COLOR: ColorU = ColorU {
+    r: 0,
+    g: 129,
+    b: 251,
+    a: 255,
+};
+
+/// Represents a CLI agent (e.g., Claude Code, Gemini CLI, Codex, Amp, Droid, OpenCode, Copilot, Pi, Auggie, Cursor, Goose, Hermes, Mistral Vibe, Grok Build, Kiro CLI, Muse Code)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Sequence, Serialize, Deserialize)]
 pub enum CLIAgent {
     Claude,
@@ -122,30 +168,86 @@ pub enum CLIAgent {
     OpenCode,
     Copilot,
     Pi,
+    OhMyPi,
     Auggie,
     CursorCli,
     Goose,
+    Hermes,
+    Vibe,
+    Antigravity,
+    Grok,
+    Kiro,
+    Muse,
+    /// Warp's own headless TUI.
+    WarpTui,
     /// Represents an unknown/custom CLI agent matched by user-configured regex patterns.
     Unknown,
 }
 
 impl CLIAgent {
-    /// The command prefix used to invoke this CLI agent.
-    pub fn command_prefix(&self) -> &'static str {
+    /// Stable analytics values, independent of display names and session-sharing serialization.
+    pub fn telemetry_name(&self) -> &'static str {
         match self {
-            CLIAgent::Claude => "claude",
-            CLIAgent::Gemini => "gemini",
-            CLIAgent::Codex => "codex",
-            CLIAgent::Amp => "amp",
-            CLIAgent::Droid => "droid",
-            CLIAgent::OpenCode => "opencode",
-            CLIAgent::Copilot => "copilot",
-            CLIAgent::Pi => "pi",
-            CLIAgent::Auggie => "auggie",
-            CLIAgent::CursorCli => "agent",
-            CLIAgent::Goose => "goose",
-            CLIAgent::Unknown => "",
+            CLIAgent::Claude => "Claude",
+            CLIAgent::Gemini => "Gemini",
+            CLIAgent::Codex => "Codex",
+            CLIAgent::Amp => "Amp",
+            CLIAgent::Droid => "Droid",
+            CLIAgent::OpenCode => "OpenCode",
+            CLIAgent::Copilot => "Copilot",
+            CLIAgent::Pi => "Pi",
+            CLIAgent::OhMyPi => "OhMyPi",
+            CLIAgent::Auggie => "Auggie",
+            CLIAgent::CursorCli => "Cursor",
+            CLIAgent::Goose => "Goose",
+            CLIAgent::Hermes => "Hermes",
+            CLIAgent::Vibe => "Vibe",
+            CLIAgent::Antigravity => "Antigravity",
+            CLIAgent::Grok => "Grok",
+            CLIAgent::Kiro => "Kiro",
+            CLIAgent::Muse => "Muse",
+            CLIAgent::WarpTui => "WarpTui",
+            CLIAgent::Unknown => "Unknown",
         }
+    }
+
+    /// Command prefixes that identify this CLI agent.
+    pub(crate) fn command_prefixes(&self) -> &'static [&'static str] {
+        match self {
+            CLIAgent::Claude => &["claude"],
+            CLIAgent::Gemini => &["gemini"],
+            CLIAgent::Codex => &["codex"],
+            CLIAgent::Amp => &["amp"],
+            CLIAgent::Droid => &["droid"],
+            CLIAgent::OpenCode => &["opencode"],
+            CLIAgent::Copilot => &["copilot"],
+            CLIAgent::Pi => &["pi"],
+            CLIAgent::OhMyPi => &["omp"],
+            CLIAgent::Auggie => &["auggie"],
+            CLIAgent::CursorCli => &["agent"],
+            CLIAgent::Goose => &["goose"],
+            CLIAgent::Hermes => &["hermes"],
+            CLIAgent::Vibe => &["vibe", "vibe-acp"],
+            CLIAgent::Antigravity => &["agy", "antigravity"],
+            CLIAgent::WarpTui => &[
+                "warp",
+                "warp-preview",
+                "warp-dev",
+                "warp-tui",
+                "warp-tui-oss",
+                "run-tui",
+            ],
+            CLIAgent::Grok => &["grok"],
+            CLIAgent::Kiro => &["kiro-cli", "kiro"],
+            CLIAgent::Muse => &["muse"],
+            CLIAgent::Unknown => &[],
+        }
+    }
+
+    /// The canonical command prefix used to identify this CLI agent in places
+    /// that require one stable value.
+    pub fn command_prefix(&self) -> &'static str {
+        self.command_prefixes().first().copied().unwrap_or_default()
     }
 
     /// Serialized version of the CLIAgent name (e.g. "Claude", "Gemini"). Used for the
@@ -162,6 +264,20 @@ impl CLIAgent {
         serde_json::from_value(name.into()).unwrap_or(CLIAgent::Unknown)
     }
 
+    /// Returns the [`CLIAgent`] corresponding to a cloud-agent [`Harness`] when it represents a
+    /// third-party agent. Returns `None` for [`Harness::Oz`] (Warp's built-in harness has no
+    /// distinct CLI agent identity).
+    pub fn from_harness(harness: Harness) -> Option<Self> {
+        match harness {
+            Harness::Oz => None,
+            Harness::Claude => Some(CLIAgent::Claude),
+            Harness::Gemini => Some(CLIAgent::Gemini),
+            Harness::OpenCode => Some(CLIAgent::OpenCode),
+            Harness::Codex => Some(CLIAgent::Codex),
+            Harness::Pi | Harness::Unknown => Some(CLIAgent::Unknown),
+        }
+    }
+
     pub fn display_name(&self) -> &'static str {
         match self {
             CLIAgent::Claude => "Claude Code",
@@ -172,9 +288,17 @@ impl CLIAgent {
             CLIAgent::OpenCode => "OpenCode",
             CLIAgent::Copilot => "Copilot",
             CLIAgent::Pi => "Pi",
+            CLIAgent::OhMyPi => "oh-my-pi",
             CLIAgent::Auggie => "Auggie",
             CLIAgent::CursorCli => "Cursor",
             CLIAgent::Goose => "Goose",
+            CLIAgent::Hermes => "Hermes",
+            CLIAgent::Vibe => "Mistral Vibe",
+            CLIAgent::Antigravity => "Antigravity",
+            CLIAgent::Grok => "Grok Build",
+            CLIAgent::Kiro => "Kiro CLI",
+            CLIAgent::Muse => "Muse Code",
+            CLIAgent::WarpTui => "Warp TUI",
             CLIAgent::Unknown => "CLI Agent",
         }
     }
@@ -190,9 +314,20 @@ impl CLIAgent {
             CLIAgent::OpenCode => Some(Icon::OpenCodeLogo),
             CLIAgent::Copilot => Some(Icon::CopilotLogo),
             CLIAgent::Pi => Some(Icon::PiLogo),
+            CLIAgent::OhMyPi => Some(Icon::OhMyPiLogo),
             CLIAgent::Auggie => Some(Icon::AuggieLogo),
             CLIAgent::CursorCli => Some(Icon::CursorLogo),
             CLIAgent::Goose => Some(Icon::GooseLogo),
+            CLIAgent::Hermes => None,
+            // Vibe is recognized but ships without a brand asset. The brand color
+            // still drives the toolbar tile; an `Icon::MistralLogo` can be wired
+            // up in a follow-up once an officially licensed SVG is available.
+            CLIAgent::Vibe => None,
+            CLIAgent::Antigravity => Some(Icon::AntigravityLogo),
+            CLIAgent::Grok => Some(Icon::GrokLogo),
+            CLIAgent::Kiro => Some(Icon::KiroLogo),
+            CLIAgent::Muse => Some(Icon::MuseLogo),
+            CLIAgent::WarpTui => Some(Icon::Warp),
             CLIAgent::Unknown => None,
         }
     }
@@ -218,9 +353,21 @@ impl CLIAgent {
             CLIAgent::Copilot => &[SkillProvider::Agents, SkillProvider::Copilot],
             CLIAgent::Droid => &[SkillProvider::Droid, SkillProvider::Agents],
             CLIAgent::Pi => &[SkillProvider::Agents],
+            CLIAgent::OhMyPi => &[SkillProvider::Agents],
             CLIAgent::Auggie => &[SkillProvider::Agents],
             CLIAgent::CursorCli => &[SkillProvider::Agents],
             CLIAgent::Goose => &[SkillProvider::Agents],
+            CLIAgent::Hermes => &[SkillProvider::Agents],
+            CLIAgent::Vibe => &[SkillProvider::Agents],
+            CLIAgent::Antigravity => &[],
+            CLIAgent::Grok => &[SkillProvider::Agents],
+            CLIAgent::Kiro => &[],
+            CLIAgent::Muse => &[
+                SkillProvider::Agents,
+                SkillProvider::Claude,
+                SkillProvider::Codex,
+            ],
+            CLIAgent::WarpTui => &[],
             CLIAgent::Unknown => &[],
         }
     }
@@ -243,8 +390,19 @@ impl CLIAgent {
     pub fn supports_bash_mode(&self) -> bool {
         matches!(
             self,
-            CLIAgent::Claude | CLIAgent::Codex | CLIAgent::OpenCode
+            CLIAgent::Claude
+                | CLIAgent::Codex
+                | CLIAgent::OpenCode
+                | CLIAgent::OhMyPi
+                | CLIAgent::Grok
+                | CLIAgent::Kiro
+                | CLIAgent::Muse
         )
+    }
+
+    /// Whether Warp should show its CLI-agent footer for this agent.
+    pub(crate) fn supports_cli_agent_footer(&self) -> bool {
+        !matches!(self, CLIAgent::WarpTui)
     }
 
     /// Returns the brand color for this CLI agent, or `None` for unknown/custom agents.
@@ -258,9 +416,17 @@ impl CLIAgent {
             CLIAgent::OpenCode => Some(OPENCODE_COLOR),
             CLIAgent::Copilot => Some(COPILOT_COLOR),
             CLIAgent::Pi => Some(PI_COLOR),
+            CLIAgent::OhMyPi => Some(PI_COLOR),
             CLIAgent::Auggie => Some(AUGGIE_COLOR),
             CLIAgent::CursorCli => Some(CURSOR_COLOR),
             CLIAgent::Goose => Some(GOOSE_COLOR),
+            CLIAgent::Hermes => Some(HERMES_PURPLE),
+            CLIAgent::Vibe => Some(MISTRAL_ORANGE),
+            CLIAgent::Antigravity => Some(ANTIGRAVITY_COLOR),
+            CLIAgent::Grok => Some(GROK_COLOR),
+            CLIAgent::Kiro => Some(KIRO_PURPLE),
+            CLIAgent::Muse => Some(MUSE_COLOR),
+            CLIAgent::WarpTui => Some(ColorU::black()),
             CLIAgent::Unknown => None,
         }
     }
@@ -269,7 +435,11 @@ impl CLIAgent {
     /// Agents with light brand colors use a dark icon for contrast.
     pub fn brand_icon_color(&self) -> ColorU {
         match self {
-            CLIAgent::Pi | CLIAgent::Auggie | CLIAgent::Droid => ColorU::new(0, 0, 0, 255),
+            CLIAgent::Pi
+            | CLIAgent::OhMyPi
+            | CLIAgent::Auggie
+            | CLIAgent::Droid
+            | CLIAgent::Antigravity => ColorU::new(0, 0, 0, 255),
             _ => ColorU::white(),
         }
     }
@@ -284,6 +454,36 @@ impl CLIAgent {
             Some(esc) => top_level_command(command, esc),
             None => command.split_whitespace().next().map(String::from),
         }
+    }
+
+    /// Returns whether the command's executable name identifies this CLI agent.
+    pub(super) fn matches_command(&self, command: &str, escape_char: Option<EscapeChar>) -> bool {
+        let Some(first_word) = Self::extract_first_command(command.trim_start(), escape_char)
+        else {
+            return false;
+        };
+        let basename = first_word.rsplit(['/', '\\']).next().unwrap_or(&first_word);
+        if !self.command_prefixes().contains(&basename) {
+            return false;
+        }
+        if matches!(self, CLIAgent::WarpTui) {
+            // The ACP bridge uses this executable but receives prompts over a socket, not its PTY.
+            let is_acp_bridge = match escape_char {
+                Some(esc) => all_parsed_commands(command, esc)
+                    .next()
+                    .is_some_and(|command| {
+                        command
+                            .parts
+                            .get(1)
+                            .is_some_and(|part| part.item == "acp-bridge")
+                    }),
+                None => command.split_whitespace().nth(1) == Some("acp-bridge"),
+            };
+            if is_acp_bridge {
+                return false;
+            }
+        }
+        true
     }
 
     /// Detects the CLI agent from a command string.
@@ -319,14 +519,12 @@ impl CLIAgent {
             })
             .unwrap_or(Cow::Borrowed(trimmed));
 
-        let resolved_first_word = Self::extract_first_command(&resolved_command, escape_char)?;
-
         // Check if resolved command matches any known CLI agent.
         // Also matches `aifx agent run claude` as Claude for Uber employees.
         enum_iterator::all::<CLIAgent>()
             .filter(|agent| !matches!(agent, CLIAgent::Unknown))
             .find(|agent| {
-                resolved_first_word == agent.command_prefix()
+                agent.matches_command(&resolved_command, escape_char)
                     || (matches!(agent, CLIAgent::Claude)
                         && Self::is_aifx_agent_run_claude(&resolved_command, ctx))
             })
@@ -376,7 +574,7 @@ pub fn build_review_prompt(review: &AgentReviewCommentBatch) -> String {
                 line,
                 ..
             } => {
-                let path = absolute_file_path.display();
+                let path = absolute_file_path.display_path();
                 match line {
                     EditorLineLocation::Current { line_number, .. } => {
                         let n = line_number.as_usize() + 1;
@@ -396,10 +594,9 @@ pub fn build_review_prompt(review: &AgentReviewCommentBatch) -> String {
                 }
             }
             AttachedReviewCommentTarget::File { absolute_file_path } => {
-                let path = absolute_file_path.display();
-                let abs_str = absolute_file_path.to_string_lossy();
+                let path = absolute_file_path.display_path();
                 let is_deleted = review.diff_set.iter().any(|(file_key, hunks)| {
-                    abs_str.ends_with(file_key.as_str())
+                    path.ends_with(file_key.as_str())
                         && !hunks.is_empty()
                         && hunks
                             .iter()
@@ -408,7 +605,7 @@ pub fn build_review_prompt(review: &AgentReviewCommentBatch) -> String {
                 if is_deleted {
                     format!("{path} (deleted file — see `git diff`)")
                 } else {
-                    format!("{path}")
+                    path
                 }
             }
             AttachedReviewCommentTarget::General => "General".to_string(),
@@ -444,15 +641,14 @@ fn export_review_comment_for_cli_prompt(comment: &str) -> String {
 /// `<path> L<start>-L<end>` where `start` and `end` are 1-indexed and both
 /// ends are **inclusive**.
 pub fn build_diff_hunk_prompt(
-    file_path: &Path,
+    file_path: &str,
     start_line: usize,
     end_line: usize,
     lines_added: u32,
     lines_removed: u32,
 ) -> String {
-    let path = file_path.display();
     format!(
-        "{path} L{start_line}-L{end_line} (+{lines_added} -{lines_removed}) \
+        "{file_path} L{start_line}-L{end_line} (+{lines_added} -{lines_removed}) \
          -- run `git diff` to see the full context."
     )
 }
@@ -506,25 +702,6 @@ pub fn build_selection_line_range_prompt(
     end_line: usize,
 ) -> String {
     format!("{file_path} L{start_line}-L{end_line}")
-}
-
-impl From<CLIAgent> for CLIAgentType {
-    fn from(agent: CLIAgent) -> Self {
-        match agent {
-            CLIAgent::Claude => CLIAgentType::Claude,
-            CLIAgent::Gemini => CLIAgentType::Gemini,
-            CLIAgent::Codex => CLIAgentType::Codex,
-            CLIAgent::Amp => CLIAgentType::Amp,
-            CLIAgent::Droid => CLIAgentType::Droid,
-            CLIAgent::OpenCode => CLIAgentType::OpenCode,
-            CLIAgent::Copilot => CLIAgentType::Copilot,
-            CLIAgent::Pi => CLIAgentType::Pi,
-            CLIAgent::Auggie => CLIAgentType::Auggie,
-            CLIAgent::CursorCli => CLIAgentType::Cursor,
-            CLIAgent::Goose => CLIAgentType::Goose,
-            CLIAgent::Unknown => CLIAgentType::Unknown,
-        }
-    }
 }
 
 #[cfg(test)]

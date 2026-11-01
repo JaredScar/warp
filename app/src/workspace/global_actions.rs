@@ -1,23 +1,25 @@
-use crate::auth;
-use crate::network::NetworkStatus;
-use crate::persistence::ModelEvent;
-use crate::server::server_api::auth::AuthClient;
-use crate::terminal::alt_screen_reporting::AltScreenReporting;
-use crate::terminal::general_settings::GeneralSettings;
-use crate::{app_state::get_app_state, server::server_api::ServerApiProvider};
+use std::path::PathBuf;
+
 use ::settings::ToggleableSetting;
 use warp_core::execution_mode::AppExecutionMode;
-
-use crate::ai::agent::conversation::AIConversationId;
-use crate::ai::agent::AIAgentExchangeId;
-use crate::root_view::OpenPath;
-use crate::undo_close::UndoCloseStack;
-use crate::workspace::{Workspace, WorkspaceAction};
-use crate::GlobalResourceHandlesProvider;
-use std::path::PathBuf;
+use warp_errors::report_error;
 use warp_graphql::mutations::create_anonymous_user::AnonymousUserType;
 use warpui::windowing::WindowManager;
 use warpui::{AppContext, SingletonEntity, TypedActionView};
+
+use crate::ai::agent::AIAgentExchangeId;
+use crate::ai::agent::conversation::AIConversationId;
+use crate::app_state::get_app_state;
+use crate::network::NetworkStatus;
+use crate::persistence::ModelEvent;
+use crate::root_view::OpenPath;
+use crate::server::server_api::ServerApiProvider;
+use crate::terminal::alt_screen_reporting::AltScreenReporting;
+use crate::terminal::general_settings::GeneralSettings;
+use crate::undo_close::UndoCloseStack;
+use crate::workspace::cross_window_tab_drag::CrossWindowTabDrag;
+use crate::workspace::{Workspace, WorkspaceAction};
+use crate::{GlobalResourceHandlesProvider, auth};
 
 /// Specifies where a forked conversation should be opened.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -32,6 +34,16 @@ pub enum ForkedConversationDestination {
 }
 
 impl ForkedConversationDestination {
+    /// Fork destination from an Enter (`false`) / Cmd-or-Ctrl+Enter (`true`) trigger: Enter
+    /// opens a new split pane, Cmd/Ctrl+Enter opens a new tab. Shared by all fork-style commands.
+    pub fn for_fork_trigger(cmd_or_ctrl_enter: bool) -> Self {
+        if cmd_or_ctrl_enter {
+            Self::NewTab
+        } else {
+            Self::SplitPane
+        }
+    }
+
     pub fn is_new_tab(&self) -> bool {
         matches!(self, Self::NewTab)
     }
@@ -127,6 +139,18 @@ fn save_app(_: &(), ctx: &mut AppContext) {
         return;
     }
 
+    // While a cross-window tab drag is active, the dragged tab's pane group
+    // is in flight between source and preview windows and `get_app_state`
+    // would produce a snapshot with zero windows. Persisting that snapshot
+    // wipes the on-disk session via `save_app_state`'s delete-then-insert
+    // transaction. `save_app` fires from window move / focus / resize /
+    // close callbacks (see `app_callbacks` in `lib.rs`), all of which run
+    // during a drag, so we have to short-circuit at this boundary. The
+    // first save after the drag finalizes will rewrite the snapshot.
+    if CrossWindowTabDrag::as_ref(ctx).is_active() {
+        return;
+    }
+
     let Some(model_event_sender) = GlobalResourceHandlesProvider::as_ref(ctx)
         .get()
         .model_event_sender
@@ -140,7 +164,7 @@ fn save_app(_: &(), ctx: &mut AppContext) {
     let event = ModelEvent::Snapshot(app_state);
 
     if let Err(err) = model_event_sender.send(event) {
-        log::error!("Error trying to send model event {err:?}");
+        report_error!(anyhow::Error::new(err).context("Error trying to send model event"));
     }
 }
 
@@ -160,12 +184,13 @@ fn toggle_debug_network_status(_: &(), ctx: &mut AppContext) {
 fn create_anonymous_user(_: &(), ctx: &mut AppContext) {
     log::info!("Creating anonymous user");
     let anonymous_user_type = AnonymousUserType::NativeClientAnonymousUser;
-    let server_api = ServerApiProvider::handle(ctx).read(ctx, |provider, _ctx| provider.get());
+    let auth_client =
+        ServerApiProvider::handle(ctx).read(ctx, |provider, _ctx| provider.get_auth_client());
     let result =
-        warpui::r#async::block_on(server_api.create_anonymous_user(None, anonymous_user_type));
+        warpui::r#async::block_on(auth_client.create_anonymous_user(None, anonymous_user_type));
     match result {
         Ok(user) => log::info!("Successfully created anonymous user {user:?}"),
-        Err(err) => log::error!("Failed to create anonymous user: {err:?}"),
+        Err(err) => report_error!(err.context("Failed to create anonymous user")),
     }
 }
 
@@ -182,14 +207,13 @@ fn trigger_maybe_log_out(_: &(), ctx: &mut AppContext) {
 
 /// Dispatches an action to the active workspace, if one exists.
 fn dispatch_to_active_workspace(ctx: &mut AppContext, action: WorkspaceAction) {
-    if let Some(window_id) = WindowManager::as_ref(ctx).active_window() {
-        if let Some(workspaces) = ctx.views_of_type::<Workspace>(window_id) {
-            if let Some(workspace) = workspaces.into_iter().next() {
-                workspace.update(ctx, |workspace, ctx| {
-                    workspace.handle_action(&action, ctx);
-                });
-            }
-        }
+    if let Some(window_id) = WindowManager::as_ref(ctx).active_window()
+        && let Some(workspaces) = ctx.views_of_type::<Workspace>(window_id)
+        && let Some(workspace) = workspaces.into_iter().next()
+    {
+        workspace.update(ctx, |workspace, ctx| {
+            workspace.handle_action(&action, ctx);
+        });
     }
 }
 
@@ -218,6 +242,7 @@ fn fork_ai_conversation(params: &ForkAIConversationParams, ctx: &mut AppContext)
             summarize_after_fork: params.summarize_after_fork,
             summarization_prompt: params.summarization_prompt.clone(),
             initial_prompt: params.initial_prompt.clone(),
+            initial_attachments: vec![],
             destination: params.destination,
         },
     );

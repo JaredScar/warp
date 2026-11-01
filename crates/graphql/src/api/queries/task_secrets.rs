@@ -1,4 +1,6 @@
-use crate::{error::UserFacingError, request_context::RequestContext, schema};
+use crate::error::UserFacingError;
+use crate::request_context::RequestContext;
+use crate::schema;
 
 /// A GraphQL query to fetch secrets for a specific task.
 ///
@@ -52,6 +54,8 @@ pub enum ManagedSecretValue {
     ManagedSecretAnthropicApiKeyValue(ManagedSecretAnthropicApiKeyValue),
     ManagedSecretAnthropicBedrockAccessKeyValue(ManagedSecretAnthropicBedrockAccessKeyValue),
     ManagedSecretAnthropicBedrockApiKeyValue(ManagedSecretAnthropicBedrockApiKeyValue),
+    ManagedSecretOpenAiApiKeyValue(ManagedSecretOpenAiApiKeyValue),
+    ManagedSecretLlmProviderApiKeyValue(ManagedSecretLlmProviderApiKeyValue),
     #[cynic(fallback)]
     Unknown,
 }
@@ -79,4 +83,25 @@ pub struct ManagedSecretAnthropicBedrockAccessKeyValue {
 pub struct ManagedSecretAnthropicBedrockApiKeyValue {
     pub aws_bearer_token_bedrock: String,
     pub aws_region: String,
+}
+
+#[derive(cynic::QueryFragment, Debug)]
+pub struct ManagedSecretOpenAiApiKeyValue {
+    pub api_key: String,
+    /// Optional base URL for regional endpoints.
+    pub base_url: Option<String>,
+}
+
+#[derive(cynic::QueryFragment)]
+pub struct ManagedSecretLlmProviderApiKeyValue {
+    pub provider_id: String,
+    pub api_key: String,
+    pub base_url: Option<String>,
+}
+
+impl std::fmt::Debug for ManagedSecretLlmProviderApiKeyValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedSecretLlmProviderApiKeyValue")
+            .finish_non_exhaustive()
+    }
 }

@@ -1,7 +1,9 @@
-use crate::{
-    error::UserFacingError, object::CloudObjectEventEntrypoint, request_context::RequestContext,
-    response_context::ResponseContext, schema, workspace::Workspace,
-};
+use crate::error::UserFacingError;
+use crate::object::CloudObjectEventEntrypoint;
+use crate::request_context::RequestContext;
+use crate::response_context::ResponseContext;
+use crate::schema;
+use crate::workspace::Workspace;
 
 /*
 mutation CreateTeam($input: CreateTeamInput!, $request_context: RequestContext!) {
@@ -14,14 +16,17 @@ mutation CreateTeam($input: CreateTeamInput!, $request_context: RequestContext!)
           uid
           email
           role
+          isDisabled
         }
         teams {
           uid
           name
+          inviteLink
           members {
             uid
             email
             role
+            isDisabled
           }
         }
         billingMetadata {
@@ -35,6 +40,7 @@ mutation CreateTeam($input: CreateTeamInput!, $request_context: RequestContext!)
               isCodeSuggestionsToggleable
               isPromptSuggestionsToggleable
               isNextCommandEnabled
+              isGitOperationsAiEnabled
               isVoiceEnabled
             }
             teamSizePolicy {
@@ -90,10 +96,10 @@ mutation CreateTeam($input: CreateTeamInput!, $request_context: RequestContext!)
           }
         }
         hasBillingHistory
-        inviteCode
         pendingEmailInvites {
           email
           expired
+          teamUid
         }
         inviteLinkDomainRestrictions {
           uid

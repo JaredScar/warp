@@ -6,36 +6,36 @@ use lsp::{
     LanguageId, LanguageServerId, LspManagerModel, LspManagerModelEvent, LspServerModel,
     LspState as LspModelState,
 };
-use warp_core::send_telemetry_from_ctx;
-
-use crate::code::lsp_telemetry::{LspControlActionType, LspEnablementSource, LspTelemetryEvent};
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
+#[cfg(feature = "local_fs")]
+use repo_metadata::repositories::DetectedRepositories;
+use warp_core::send_telemetry_from_ctx;
+use warp_core::ui::Icon;
+use warp_core::ui::appearance::Appearance;
 use warp_core::ui::theme::color::internal_colors;
-use warp_core::ui::theme::{Fill as ThemeFill, WarpTheme};
-use warp_core::ui::{appearance::Appearance, Icon};
+use warp_core::ui::theme::{AnsiColorIdentifier, Fill as ThemeFill, WarpTheme};
+#[cfg(feature = "local_fs")]
+use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warpui::elements::{
-    ChildAnchor, ChildView, Dismiss, Empty, Hoverable, MainAxisSize, MouseStateHandle,
-    ParentAnchor, ParentOffsetBounds, Rect, Shrinkable,
+    Border, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
+    Dismiss, Empty, Fill, Flex, Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle,
+    OffsetPositioning, Padding, ParentAnchor, ParentElement, ParentOffsetBounds, Radius, Rect,
+    Shrinkable, Stack,
 };
 use warpui::platform::Cursor;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::{
-    elements::{
-        Border, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Fill, Flex,
-        MainAxisAlignment, OffsetPositioning, Padding, ParentElement, Radius, Stack,
-    },
-    AppContext, Element, Entity, ModelHandle, SingletonEntity, View, WeakModelHandle,
+    AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
+    ViewHandle, WeakModelHandle,
 };
-use warpui::{TypedActionView, ViewContext, ViewHandle};
-
-use warp_core::ui::theme::AnsiColorIdentifier;
 
 #[cfg(feature = "local_fs")]
 use crate::ai::persisted_workspace::PersistedWorkspaceEvent;
 use crate::ai::persisted_workspace::{
     LSPEnablementResultForFile, LspRepoStatus, PersistedWorkspace,
 };
+use crate::code::lsp_telemetry::{LspControlActionType, LspEnablementSource, LspTelemetryEvent};
 use crate::settings::AISettings;
 use crate::ui_components::blended_colors;
 #[cfg(feature = "local_fs")]
@@ -43,8 +43,6 @@ use crate::user_config::is_tab_config_toml;
 use crate::view_components::action_button::{
     ActionButton, ButtonSize, NakedTheme, PaneHeaderTheme,
 };
-#[cfg(feature = "local_fs")]
-use repo_metadata::repositories::DetectedRepositories;
 
 const FOOTER_HEIGHT: f32 = 24.;
 /// Margin around the LSP icon container
@@ -276,7 +274,7 @@ impl CodeFooterView {
     fn create_tab_config_skill_button(ctx: &mut ViewContext<Self>) -> ViewHandle<ActionButton> {
         ctx.add_typed_action_view(|_ctx| {
             ActionButton::new("/update-tab-config", NakedTheme)
-                .with_icon(Icon::Oz)
+                .with_icon(Icon::Agent)
                 .with_size(ButtonSize::Small)
                 .with_disabled_theme(PaneHeaderTheme)
                 .on_click(|ctx| {
@@ -384,12 +382,12 @@ impl CodeFooterView {
             let status = Self::detect_installation_status(&path, ctx);
 
             // Update button label based on initial status (handles cached results)
-            if let Some(enable_button) = &enable_lsp_button {
-                if let Some(label) = Self::button_label_for_status(&status) {
-                    enable_button.update(ctx, |button, ctx| {
-                        button.set_label(label, ctx);
-                    });
-                }
+            if let Some(enable_button) = &enable_lsp_button
+                && let Some(label) = Self::button_label_for_status(&status)
+            {
+                enable_button.update(ctx, |button, ctx| {
+                    button.set_label(label, ctx);
+                });
             }
 
             // Subscribe to InstallStatusUpdate events from PersistedWorkspace
@@ -699,7 +697,8 @@ impl CodeFooterView {
 
         let repo_root = DetectedRepositories::handle(ctx)
             .as_ref(ctx)
-            .get_root_for_path(file_path)
+            .get_root_for_path(&LocalOrRemotePath::Local(file_path.to_path_buf()))
+            .and_then(|r| r.to_local_path().map(std::path::Path::to_path_buf))
             .or_else(|| file_path.parent().map(|p| p.to_path_buf()));
 
         let Some(repo_root) = repo_root else {
@@ -1549,13 +1548,13 @@ impl CodeFooterView {
             // Then check for any starting/busy server
             for server in &live {
                 let server_ref = server.as_ref(app);
-                if let Some(msg) = Self::server_status_message(server_ref) {
-                    if matches!(
+                if let Some(msg) = Self::server_status_message(server_ref)
+                    && matches!(
                         server_ref.state(),
                         LspModelState::Starting | LspModelState::Available { .. }
-                    ) {
-                        return (Some(msg), false);
-                    }
+                    )
+                {
+                    return (Some(msg), false);
                 }
             }
             // Then check stopped
@@ -1730,7 +1729,7 @@ impl View for CodeFooterView {
                     Self::render_status_text(
                         theme,
                         appearance,
-                        "Use Oz to update this config".to_string(),
+                        "Use the Warp Agent to update this config".to_string(),
                     ),
                 )
                 .finish(),
@@ -1757,16 +1756,14 @@ impl View for CodeFooterView {
                 );
             }
 
-            if should_show_enable_button {
-                if let Some(enable_lsp) = &self.enable_lsp_button {
-                    // Left margin only to separate from status text; right margin removed
-                    // to tighten padding between elements
-                    footer_content.add_child(
-                        Container::new(ChildView::new(enable_lsp).finish())
-                            .with_margin_left(ICON_MARGIN)
-                            .finish(),
-                    );
-                }
+            if should_show_enable_button && let Some(enable_lsp) = &self.enable_lsp_button {
+                // Left margin only to separate from status text; right margin removed
+                // to tighten padding between elements
+                footer_content.add_child(
+                    Container::new(ChildView::new(enable_lsp).finish())
+                        .with_margin_left(ICON_MARGIN)
+                        .finish(),
+                );
             }
         }
 

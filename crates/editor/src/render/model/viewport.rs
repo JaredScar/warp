@@ -1,21 +1,17 @@
 use float_cmp::ApproxEq;
-use sum_tree::{SeekBias, SumTree};
-use warpui::{
-    SizeConstraint,
-    geometry::{
-        rect::RectF,
-        vector::{Vector2F, vec2f},
-    },
-    units::{IntoPixels, Pixels},
-};
-
-use crate::render::element::RenderContext;
 use string_offset::CharOffset;
+use sum_tree::{SeekBias, SumTree};
+use warpui_core::SizeConstraint;
+use warpui_core::geometry::rect::RectF;
+use warpui_core::geometry::vector::{Vector2F, vec2f};
+use warpui_core::units::{IntoPixels, Pixels};
 
+use super::positioned::PositionedCursor;
 use super::{
     AUTO_SCROLL_MARGIN, BlockItem, BlockSpacing, Height, HitTestOptions, LayoutSummary, Location,
-    RenderState, UNIT_MARGIN, bounds, positioned::PositionedCursor,
+    RenderState, UNIT_MARGIN, bounds,
 };
+use crate::render::element::RenderContext;
 
 /// For horizontal autoscrolling, it is very easy to "stuck" on a character if it is aligned exactly on the viewport boundary.
 /// To help make scrolling more smooth, add a small margin here to overcome these boundaries.
@@ -160,6 +156,17 @@ impl ViewportState {
         self.scroll_left
     }
 
+    /// The current vertical scroll position as a fraction of the scrollable range, in `0..=1`.
+    /// Returns 0 when the content fits within the viewport (no scrollable range).
+    pub fn scroll_fraction(&self, content_height: Pixels) -> f32 {
+        let max_scroll = (content_height - self.height).max(Pixels::zero()).as_f32();
+        if max_scroll <= 0.0 {
+            0.0
+        } else {
+            (self.scroll_top.as_f32() / max_scroll).clamp(0.0, 1.0)
+        }
+    }
+
     /// Vertically scroll by `delta` pixels. Scrolling is capped at `content_height`,
     /// which should be the height of the buffer content.
     ///
@@ -182,6 +189,15 @@ impl ViewportState {
             self.scroll_top = scroll_top;
         }
         changed
+    }
+
+    /// Scroll to the given `fraction` (clamped to `0..=1`) of the scrollable range.
+    ///
+    /// Returns whether or not the view needs to be re-rendered.
+    pub(super) fn scroll_to_fraction(&mut self, fraction: f32, content_height: Pixels) -> bool {
+        let max_scroll = (content_height - self.height).max(Pixels::zero()).as_f32();
+        let scroll_top = (max_scroll * fraction.clamp(0.0, 1.0)).into_pixels();
+        self.scroll_to(scroll_top, content_height)
     }
 
     pub(super) fn scroll_horizontally_to(

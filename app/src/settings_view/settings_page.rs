@@ -1,65 +1,69 @@
-use crate::ui_components::blended_colors;
 use core::fmt::{self, Display};
-use itertools::Itertools as _;
-use pathfinder_color::ColorU;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use super::{
-    about_page::AboutPageView,
-    ai_page::{AISettingsPageAction, AISettingsPageView},
-    appearance_page::AppearanceSettingsPageView,
-    billing_and_usage_page::BillingAndUsagePageView,
-    code_page::CodeSettingsPageView,
-    environments_page::EnvironmentsPageView,
-    features_page::FeaturesPageView,
-    keybindings::KeybindingsView,
-    main_page::MainSettingsPageView,
-    mcp_servers_page::MCPServersSettingsPageView,
-    privacy_page::PrivacyPageView,
-    referrals_page::ReferralsPageView,
-    show_blocks_view::ShowBlocksView,
-    teams_page::TeamsPageView,
-    warp_drive_page::WarpDriveSettingsPageView,
-    warpify_page::WarpifyPageView,
-    SettingsSection,
-};
-use crate::{
-    appearance::Appearance,
-    settings::CloudPreferencesSettings,
-    themes::theme::Fill,
-    ui_components::icons::Icon,
-    view_components::{Dropdown, SubmittableTextInput},
-};
+use itertools::Itertools as _;
+use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
+use pathfinder_color::ColorU;
+use pathfinder_geometry::vector::vec2f;
 use settings::Setting;
-use warp_core::{
-    settings::SyncToCloud,
-    ui::{color::blend::Blend, theme::color::internal_colors},
+use warp_core::settings::SyncToCloud;
+use warp_core::ui::color::blend::Blend;
+use warp_core::ui::theme::color::internal_colors;
+use warpui::elements::new_scrollable::{
+    ClippedAxisConfiguration, DualAxisConfig, SingleAxisConfig,
 };
-use warpui::{
-    elements::{
-        new_scrollable::{ClippedAxisConfiguration, DualAxisConfig, SingleAxisConfig},
-        Align, Border, ChildView, ClippedScrollStateHandle, ConstrainedBox, Container,
-        CornerRadius, CrossAxisAlignment, Element, Empty, Expanded, Flex, Hoverable,
-        MainAxisAlignment, MainAxisSize, MouseStateHandle, NewScrollable, ParentElement, Radius,
-        SavePosition, ScrollTarget, ScrollToPositionMode, Shrinkable, SizeConstraintCondition,
-        SizeConstraintSwitch, Text,
-    },
-    fonts::{Properties, Weight},
-    platform::Cursor,
-    ui_components::{
-        button::{Button, ButtonVariant},
-        components::{Coords, UiComponent, UiComponentStyles},
-    },
-    units::Pixels,
-    Action, AppContext, SingletonEntity, ViewContext, ViewHandle,
+use warpui::elements::{
+    Align, Border, ChildAnchor, ChildView, ClippedScrollStateHandle, ConstrainedBox, Container,
+    CornerRadius, CrossAxisAlignment, Element, Empty, Expanded, Flex, FormattedTextElement,
+    HighlightedHyperlink, Hoverable, HyperlinkLens, MainAxisAlignment, MainAxisSize,
+    MouseStateHandle, NewScrollable, OffsetPositioning, ParentAnchor, ParentElement,
+    ParentOffsetBounds, Radius, SavePosition, ScrollTarget, ScrollToPositionMode, Shrinkable,
+    SizeConstraintCondition, SizeConstraintSwitch, Stack, Text,
+};
+use warpui::fonts::{Properties, Weight};
+use warpui::platform::Cursor;
+use warpui::ui_components::button::{Button, ButtonVariant};
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
+use warpui::units::Pixels;
+use warpui::{Action, AppContext, SingletonEntity, ViewContext, ViewHandle};
+
+use super::SettingsSection;
+use super::about_page::AboutPageView;
+use super::agent_profiles_page::AgentProfilesPageView;
+use super::appearance_page::AppearanceSettingsPageView;
+use super::billing_and_usage_dispatch::BillingAndUsageDispatchView;
+use super::cli_agents_page::CLIAgentsPageView;
+use super::code_editor_review_page::EditorAndCodeReviewPageView;
+use super::code_indexing_page::CodeIndexingPageView;
+use super::environments_page::EnvironmentsPageView;
+use super::features_page::FeaturesPageView;
+use super::keybindings::KeybindingsView;
+use super::knowledge_page::KnowledgePageView;
+use super::main_page::MainSettingsPageView;
+use super::mcp_servers_page::MCPServersSettingsPageView;
+use super::privacy_page::PrivacyPageView;
+use super::referrals_page::ReferralsPageView;
+use super::scripting_page::ScriptingSettingsPageView;
+use super::show_blocks_view::ShowBlocksView;
+use super::teams_page::TeamsPageView;
+use super::warp_agent_page::WarpAgentPageView;
+use super::warp_drive_page::WarpDriveSettingsPageView;
+use super::warpify_page::WarpifyPageView;
+use crate::appearance::Appearance;
+use crate::settings::CloudPreferencesSettings;
+use crate::themes::theme::Fill;
+use crate::ui_components::blended_colors;
+use crate::ui_components::icons::Icon;
+use crate::view_components::{
+    Dropdown, DropdownItemAction, FilterableDropdown, SubmittableTextInput,
 };
 
 pub const TOGGLE_BUTTON_RIGHT_PADDING: f32 = 5.;
 pub const HEADER_PADDING: f32 = 15.;
 pub const CONTENT_FONT_SIZE: f32 = 12.;
 pub const SUBHEADER_MARGIN_BOTTOM: f32 = 4.;
-pub const PAGE_TITLE_MARGIN_BOTTOM: f32 = 4.;
+pub const PAGE_TITLE_MARGIN_BOTTOM: f32 = HEADER_PADDING;
 pub(super) const PAGE_PADDING: f32 = 28.;
 pub(super) const HEADER_FONT_SIZE: f32 = 23.;
 pub const SUBHEADER_FONT_SIZE: f32 = 16.;
@@ -68,6 +72,7 @@ const ALTERNATING_LIST_ITEM_PADDING: f32 = 8.0;
 const GREY_TEXT_OPACITY: u8 = 60;
 const MIN_PAGE_WIDTH: f32 = 520.;
 const MAX_PAGE_WIDTH: f32 = 800.;
+const INFO_TOOLTIP_MAX_WIDTH: f32 = 320.;
 
 /// Left margin for top-level sidebar nav items (pages and umbrella labels).
 pub(super) const NAV_ITEM_LEFT_MARGIN: f32 = 12.;
@@ -109,15 +114,20 @@ pub enum SettingsPageViewHandle {
     SharedBlocks(ViewHandle<ShowBlocksView>),
     Keybindings(ViewHandle<KeybindingsView>),
     About(ViewHandle<AboutPageView>),
-    Code(ViewHandle<CodeSettingsPageView>),
+    CodeIndexing(ViewHandle<CodeIndexingPageView>),
+    EditorAndCodeReview(ViewHandle<EditorAndCodeReviewPageView>),
     Teams(ViewHandle<TeamsPageView>),
-    OzCloudAPIKeys(ViewHandle<super::platform_page::PlatformPageView>),
+    WarpCloudAgentAPIKeys(ViewHandle<super::platform_page::PlatformPageView>),
     Privacy(ViewHandle<PrivacyPageView>),
     Warpify(ViewHandle<WarpifyPageView>),
     Referrals(ViewHandle<ReferralsPageView>),
-    AI(ViewHandle<AISettingsPageView>),
+    Scripting(ViewHandle<ScriptingSettingsPageView>),
+    WarpAgent(ViewHandle<WarpAgentPageView>),
+    AgentProfiles(ViewHandle<AgentProfilesPageView>),
+    Knowledge(ViewHandle<KnowledgePageView>),
+    CLIAgents(ViewHandle<CLIAgentsPageView>),
     CloudEnvironments(ViewHandle<EnvironmentsPageView>),
-    BillingAndUsage(ViewHandle<BillingAndUsagePageView>),
+    BillingAndUsage(ViewHandle<BillingAndUsageDispatchView>),
     MCPServers(ViewHandle<MCPServersSettingsPageView>),
     WarpDrive(ViewHandle<WarpDriveSettingsPageView>),
 }
@@ -132,13 +142,18 @@ impl SettingsPageViewHandle {
             SharedBlocks(view_handle) => ChildView::new(view_handle).finish(),
             Keybindings(view_handle) => ChildView::new(view_handle).finish(),
             About(view_handle) => ChildView::new(view_handle).finish(),
-            Code(view_handle) => ChildView::new(view_handle).finish(),
+            CodeIndexing(view_handle) => ChildView::new(view_handle).finish(),
+            EditorAndCodeReview(view_handle) => ChildView::new(view_handle).finish(),
             Teams(view_handle) => ChildView::new(view_handle).finish(),
-            OzCloudAPIKeys(view_handle) => ChildView::new(view_handle).finish(),
+            WarpCloudAgentAPIKeys(view_handle) => ChildView::new(view_handle).finish(),
             Privacy(view_handle) => ChildView::new(view_handle).finish(),
             Warpify(view_handle) => ChildView::new(view_handle).finish(),
             Referrals(view_handle) => ChildView::new(view_handle).finish(),
-            AI(view_handle) => ChildView::new(view_handle).finish(),
+            Scripting(view_handle) => ChildView::new(view_handle).finish(),
+            WarpAgent(view_handle) => ChildView::new(view_handle).finish(),
+            AgentProfiles(view_handle) => ChildView::new(view_handle).finish(),
+            Knowledge(view_handle) => ChildView::new(view_handle).finish(),
+            CLIAgents(view_handle) => ChildView::new(view_handle).finish(),
             CloudEnvironments(view_handle) => ChildView::new(view_handle).finish(),
             BillingAndUsage(view_handle) => ChildView::new(view_handle).finish(),
             MCPServers(view_handle) => ChildView::new(view_handle).finish(),
@@ -385,11 +400,88 @@ pub fn render_separator(appearance: &Appearance) -> Box<dyn Element> {
         .finish()
 }
 
+/// A single line of sub-text whose leading phrase is a hyperlink dispatching `action`.
+pub fn render_cta_line<A: Action + Clone>(
+    link_text: &str,
+    trailing_copy: &str,
+    action: A,
+    font_size: f32,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let sub_text = theme.sub_text_color(theme.background());
+    FormattedTextElement::new(
+        FormattedText::new([FormattedTextLine::Line(vec![
+            FormattedTextFragment::hyperlink_action(link_text, action),
+            FormattedTextFragment::plain_text(format!(" {trailing_copy}")),
+        ])]),
+        font_size,
+        appearance.ui_font_family(),
+        appearance.ui_font_family(),
+        sub_text.into(),
+        HighlightedHyperlink::default(),
+    )
+    .with_no_text_wrapping()
+    .with_hyperlink_font_color(theme.accent().into_solid())
+    .register_default_click_handlers_with_action_support(|lens, event, ctx| match lens {
+        HyperlinkLens::Url(url) => ctx.open_url(url),
+        HyperlinkLens::Action(dispatched) => {
+            if let Some(action) = dispatched.as_any().downcast_ref::<A>() {
+                event.dispatch_typed_action(action.clone());
+            }
+        }
+    })
+    .finish()
+}
+
+pub fn render_cta_banner<A: Action + Clone>(
+    icon: Icon,
+    link_text: &str,
+    trailing_copy: &str,
+    action: A,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let body = render_cta_line(
+        link_text,
+        trailing_copy,
+        action,
+        appearance.ui_font_size(),
+        appearance,
+    );
+    render_banner(icon, body, appearance)
+}
+
+pub fn render_banner(
+    icon: Icon,
+    body: Box<dyn Element>,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let sub_text = theme.sub_text_color(theme.background());
+    let icon = ConstrainedBox::new(icon.to_warpui_icon(sub_text).finish())
+        .with_width(14.)
+        .with_height(14.)
+        .finish();
+
+    let row = Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_child(Container::new(icon).with_margin_right(8.).finish())
+        .with_child(body)
+        .finish();
+
+    Container::new(row)
+        .with_background_color(theme.surface_1().into_solid())
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+        .with_uniform_padding(12.)
+        .finish()
+}
+
 pub fn render_full_pane_width_ai_button(
     text: &str,
     is_any_ai_enabled: bool,
     mouse_state: MouseStateHandle,
-    action: AISettingsPageAction,
+    action: impl Action + Clone,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
     let (text_color, bg, icon_bg) = if is_any_ai_enabled {
@@ -482,11 +574,7 @@ pub enum ToggleState {
 
 impl From<bool> for ToggleState {
     fn from(value: bool) -> Self {
-        if value {
-            Self::Enabled
-        } else {
-            Self::Disabled
-        }
+        if value { Self::Enabled } else { Self::Disabled }
     }
 }
 
@@ -549,26 +637,54 @@ pub fn render_info_icon<T: Clone + Action>(
     appearance: &Appearance,
     additional_info: AdditionalInfo<T>,
 ) -> Box<dyn Element> {
-    let info_button = appearance
-        .ui_builder()
-        .info_button_with_tooltip(
-            13.,
-            additional_info
-                .tooltip_override_text
-                .unwrap_or("Click to learn more in docs".to_owned()),
-            additional_info.mouse_state.clone(),
+    let tooltip_text = additional_info
+        .tooltip_override_text
+        .unwrap_or("Click to learn more in docs".to_owned());
+    let icon = Container::new(
+        ConstrainedBox::new(
+            Icon::Info
+                .to_warpui_icon(appearance.theme().active_ui_text_color())
+                .finish(),
         )
-        .on_click(move |ctx, _, _| {
-            if let Some(on_click_action) = &additional_info.on_click_action {
-                ctx.dispatch_typed_action(on_click_action.clone());
-            }
-        })
-        .finish();
+        .with_width(13.)
+        .with_height(13.)
+        .finish(),
+    )
+    .finish();
 
-    Container::new(info_button)
+    let mut info_button = Hoverable::new(additional_info.mouse_state.clone(), move |state| {
+        let mut stack = Stack::new().with_child(icon);
+        if state.is_hovered() {
+            let tool_tip = ConstrainedBox::new(
+                appearance
+                    .ui_builder()
+                    .tool_tip(tooltip_text)
+                    .build()
+                    .finish(),
+            )
+            .with_max_width(INFO_TOOLTIP_MAX_WIDTH)
+            .finish();
+            stack.add_positioned_child(
+                tool_tip,
+                OffsetPositioning::offset_from_parent(
+                    vec2f(0., -3.),
+                    ParentOffsetBounds::WindowByPosition,
+                    ParentAnchor::TopMiddle,
+                    ChildAnchor::BottomMiddle,
+                ),
+            );
+        }
+        stack.finish()
+    })
+    .with_cursor(Cursor::PointingHand);
+
+    if let Some(on_click_action) = additional_info.on_click_action {
+        info_button = info_button
+            .on_click(move |ctx, _, _| ctx.dispatch_typed_action(on_click_action.clone()));
+    }
+
+    Container::new(Box::new(info_button))
         .with_margin_left(4.)
-        // Since the icon is smaller than the font, we need some margin to be in alignment.
-        .with_margin_top(1.5)
         .finish()
 }
 
@@ -586,11 +702,7 @@ pub fn render_local_only_icon(
         )
         .finish();
 
-    Container::new(info_button)
-        .with_margin_left(4.)
-        // Since the icon is smaller than the font, we need some margin to be in alignment.
-        .with_margin_top(1.5)
-        .finish()
+    Container::new(info_button).with_margin_left(4.).finish()
 }
 
 pub fn render_body_item_label<T: Clone + Action>(
@@ -733,19 +845,21 @@ pub fn render_body_item_label_internal<T: Clone + Action>(
     }
 }
 
-pub fn render_page_title(text: &str, size: f32, appearance: &Appearance) -> Box<dyn Element> {
-    Container::new(
-        Align::new(
-            Text::new_inline(text.to_string(), appearance.ui_font_family(), size)
-                .with_style(Properties::default().weight(Weight::Bold))
-                .with_color(appearance.theme().active_ui_text_color().into())
-                .finish(),
-        )
-        .left()
-        .finish(),
+fn render_title_text(text: &str, size: f32, appearance: &Appearance) -> Box<dyn Element> {
+    Align::new(
+        Text::new_inline(text.to_string(), appearance.ui_font_family(), size)
+            .with_style(Properties::default().weight(Weight::Bold))
+            .with_color(appearance.theme().active_ui_text_color().into())
+            .finish(),
     )
-    .with_margin_bottom(PAGE_TITLE_MARGIN_BOTTOM)
+    .left()
     .finish()
+}
+
+pub fn render_page_title(text: &str, size: f32, appearance: &Appearance) -> Box<dyn Element> {
+    Container::new(render_title_text(text, size, appearance))
+        .with_margin_bottom(PAGE_TITLE_MARGIN_BOTTOM)
+        .finish()
 }
 
 /// Renders a toggle with a label on the left and a toggle on the right,
@@ -894,7 +1008,7 @@ pub fn render_dropdown_item_label(
     }
 }
 
-pub(crate) fn render_dropdown_item<T: Clone + Action>(
+pub(crate) fn render_dropdown_item<T: DropdownItemAction>(
     appearance: &Appearance,
     label: &str,
     secondary_text: Option<&str>,
@@ -902,6 +1016,49 @@ pub(crate) fn render_dropdown_item<T: Clone + Action>(
     local_only_icon_state: LocalOnlyIconState,
     color_override: Option<Fill>,
     handle: &ViewHandle<Dropdown<T>>,
+) -> Box<dyn Element> {
+    let row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+
+    let dropdown_item_label = Align::new(render_dropdown_item_label(
+        label.to_string(),
+        secondary_text.map(|secondary_text| secondary_text.to_string()),
+        local_only_icon_state,
+        color_override,
+        appearance,
+    ))
+    .left()
+    .finish();
+
+    let mut dropdown = Flex::column().with_child(ChildView::new(handle).finish());
+    if let Some(dropdown_subtext) = dropdown_subtext {
+        dropdown.add_child(dropdown_subtext);
+    }
+
+    row.with_child(
+        Shrinkable::new(
+            1.0,
+            Container::new(dropdown_item_label)
+                .with_margin_bottom(4.)
+                .with_padding_right(16.)
+                .finish(),
+        )
+        .finish(),
+    )
+    .with_child(dropdown.finish())
+    .finish()
+}
+
+/// Like [`render_dropdown_item`], but for a [`FilterableDropdown`] (a dropdown
+/// with a built-in search box). Used for long option lists such as the
+/// voice-input Speech Language picker.
+pub(crate) fn render_filterable_dropdown_item<T: DropdownItemAction>(
+    appearance: &Appearance,
+    label: &str,
+    secondary_text: Option<&str>,
+    dropdown_subtext: Option<Box<dyn Element>>,
+    local_only_icon_state: LocalOnlyIconState,
+    color_override: Option<Fill>,
+    handle: &ViewHandle<FilterableDropdown<T>>,
 ) -> Box<dyn Element> {
     let row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
 
@@ -953,16 +1110,18 @@ pub(crate) fn render_settings_info_banner(
     .finish();
 
     let text = {
-        let mut children = vec![Container::new(
-            Text::new(
-                text.to_string(),
-                appearance.ui_font_family(),
-                appearance.ui_font_size(),
+        let mut children = vec![
+            Container::new(
+                Text::new(
+                    text.to_string(),
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size(),
+                )
+                .with_color(appearance.theme().active_ui_text_color().into())
+                .finish(),
             )
-            .with_color(appearance.theme().active_ui_text_color().into())
             .finish(),
-        )
-        .finish()];
+        ];
 
         if let Some(subtext) = subtext {
             children.push(
@@ -1000,12 +1159,17 @@ pub(crate) fn render_settings_info_banner(
     .finish()
 }
 
+const WORKSPACE_OVERRIDE_TOOLTIP_TEXT: &str =
+    "This option is enforced by your organization's settings and cannot be customized.";
+
 pub struct InputListItem<SettingsPageAction: Action + Clone> {
     pub item: String,
     pub mouse_state_handle: MouseStateHandle,
     pub on_remove_action: SettingsPageAction,
+    pub is_disabled: bool,
+    /// Must be pre-created (not inline during render) to preserve mouse tracking.
+    pub tooltip_mouse_state: Option<MouseStateHandle>,
 }
-
 /// Renders a title, an input field to add new items and a list of already
 /// added items.
 ///
@@ -1014,7 +1178,6 @@ pub fn render_input_list<SettingsPageAction: Action + Clone>(
     title: Option<&str>,
     items: impl IntoIterator<Item = InputListItem<SettingsPageAction>>,
     handle: Option<&ViewHandle<SubmittableTextInput>>,
-    disabled: bool,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
     let mut column = Flex::column();
@@ -1040,15 +1203,21 @@ pub fn render_input_list<SettingsPageAction: Action + Clone>(
     let background = appearance.theme().surface_1();
     let peekable = items.into_iter().peekable();
     for item in peekable {
-        let mut container = Container::new(render_alternating_color_list_item(
+        let disabled = item.is_disabled;
+        let row_element = render_alternating_color_list_item(
             background,
             item.item,
             item.mouse_state_handle,
             item.on_remove_action,
             disabled,
             appearance,
-        ));
-        container = container.with_margin_bottom(4.);
+        );
+        let row_element = if let Some(tooltip_mouse_state) = item.tooltip_mouse_state {
+            render_workspace_override_row_tooltip(row_element, tooltip_mouse_state, appearance)
+        } else {
+            row_element
+        };
+        let container = Container::new(row_element).with_margin_bottom(4.);
         column.add_child(container.finish());
     }
 
@@ -1090,6 +1259,34 @@ pub fn render_alternating_color_list<
     }
 }
 
+fn render_workspace_override_row_tooltip(
+    child: Box<dyn Element>,
+    mouse_state: MouseStateHandle,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    Hoverable::new(mouse_state, |state| {
+        let mut stack = Stack::new().with_child(child);
+        if state.is_hovered() {
+            let tooltip = appearance
+                .ui_builder()
+                .tool_tip(WORKSPACE_OVERRIDE_TOOLTIP_TEXT.to_string())
+                .build()
+                .finish();
+            stack.add_positioned_child(
+                tooltip,
+                OffsetPositioning::offset_from_parent(
+                    vec2f(0., -4.),
+                    ParentOffsetBounds::Unbounded,
+                    ParentAnchor::TopLeft,
+                    ChildAnchor::BottomLeft,
+                ),
+            );
+        }
+        stack.finish()
+    })
+    .finish()
+}
+
 fn render_alternating_color_list_item<SettingsPageAction: Action + Clone>(
     background: impl Into<Fill>,
     item_label: String,
@@ -1106,10 +1303,12 @@ fn render_alternating_color_list_item<SettingsPageAction: Action + Clone>(
         remove_button = remove_button.disabled();
     }
 
-    let remove_button = remove_button
-        .build()
-        .on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()))
-        .finish();
+    let mut remove_button = remove_button.build();
+    if !disabled {
+        remove_button =
+            remove_button.on_click(move |ctx, _, _| ctx.dispatch_typed_action(action.clone()));
+    }
+    let remove_button = remove_button.finish();
 
     let background = background.into();
     let font_color = if disabled {
@@ -1151,7 +1350,7 @@ fn render_alternating_color_list_item<SettingsPageAction: Action + Clone>(
     .with_uniform_padding(ALTERNATING_LIST_ITEM_PADDING)
     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
     // The bottom has a bit of extra padding b/c lines of text have more space above the text
-    // than below. This visually balances that to make it lok vertically centered.
+    // than below. This visually balances that to make it look vertically centered.
     .with_padding_bottom(ALTERNATING_LIST_ITEM_PADDING + 2.)
     .finish()
 }
@@ -1177,6 +1376,30 @@ where
     }
 }
 
+pub(super) struct PageTitle<V: warpui::View> {
+    text: &'static str,
+    /// An optional accessory that renders alongside it whenever the title itself renders.
+    pub(super) trailing_element: Option<TrailingElementRenderer<V>>,
+}
+
+impl<V: warpui::View> PageTitle<V> {
+    pub(super) fn new(text: &'static str) -> Self {
+        Self {
+            text,
+            trailing_element: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn with_trailing_element(
+        mut self,
+        render: impl Fn(&V, &Appearance, &AppContext) -> Box<dyn Element> + 'static,
+    ) -> Self {
+        self.trailing_element = Some(Box::new(render));
+        self
+    }
+}
+
 /// Structured contents of a settings tab page. This type breaks all the content into
 /// [`SettingsWidget`]s.
 pub(super) enum PageType<V: warpui::View> {
@@ -1197,7 +1420,7 @@ pub(super) enum PageType<V: warpui::View> {
     /// A page which is a series of [`SettingsWidget`]s that don't fall under sub-categories.
     Uncategorized {
         widgets: Vec<Box<dyn SettingsWidget<View = V>>>,
-        title: Option<&'static str>,
+        title: Option<PageTitle<V>>,
         filter: Vec<usize>,
         vertical_scroll_state: ClippedScrollStateHandle,
         horizontal_scroll_state: ClippedScrollStateHandle,
@@ -1207,7 +1430,7 @@ pub(super) enum PageType<V: warpui::View> {
     /// A page which is a series of [`SettingsWidget`]s that fall under sub-categories.
     Categorized {
         categories: Vec<Category<V>>,
-        title: Option<&'static str>,
+        title: Option<PageTitle<V>>,
         filter: Vec<Vec<usize>>,
         vertical_scroll_state: ClippedScrollStateHandle,
         horizontal_scroll_state: ClippedScrollStateHandle,
@@ -1259,6 +1482,60 @@ impl From<usize> for MatchData {
     }
 }
 
+/// Returns true if every whitespace-delimited word in `query` appears somewhere
+/// in `terms` (case-insensitive). An empty query matches everything.
+pub(super) fn search_terms_match(terms: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let terms_lower = terms.to_lowercase();
+    query
+        .to_lowercase()
+        .split_whitespace()
+        .all(|word| terms_lower.contains(word))
+}
+
+/// Combines `header` with `trailing_element`, in a space-between row, when the accessory is
+/// present. Otherwise returns `header` unchanged.
+fn render_header_with_trailing_element<V: warpui::View>(
+    header: Box<dyn Element>,
+    trailing_element: Option<&TrailingElementRenderer<V>>,
+    view: &V,
+    appearance: &Appearance,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let Some(trailing_element) = trailing_element else {
+        return header;
+    };
+    Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+        .with_child(Shrinkable::new(1., header).finish())
+        .with_child(trailing_element(view, appearance, app))
+        .finish()
+}
+
+/// Renders the page title with its optional trailing accessory (see
+/// [`PageTitle::with_trailing_element`]), preserving `render_page_title`'s margin.
+fn render_page_title_with_trailing<V: warpui::View>(
+    title: &PageTitle<V>,
+    size: f32,
+    view: &V,
+    appearance: &Appearance,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let title_row = render_header_with_trailing_element(
+        render_title_text(title.text, size, appearance),
+        title.trailing_element.as_ref(),
+        view,
+        appearance,
+        app,
+    );
+    Container::new(title_row)
+        .with_margin_bottom(PAGE_TITLE_MARGIN_BOTTOM)
+        .finish()
+}
+
 impl<V: warpui::View> PageType<V> {
     /// A page where the contents cannot be separated for showing search results. If any part
     /// matches the search query, the whole page must show. The whole page is one big
@@ -1290,7 +1567,7 @@ impl<V: warpui::View> PageType<V> {
     /// A page which is a series of [`SettingsWidget`]s that don't fall under sub-categories.
     pub(super) fn new_uncategorized(
         widgets: Vec<Box<dyn SettingsWidget<View = V>>>,
-        title: Option<&'static str>,
+        title: Option<PageTitle<V>>,
     ) -> Self {
         Self::Uncategorized {
             filter: widgets.iter().enumerate().map(|(i, _)| i).collect(),
@@ -1306,7 +1583,7 @@ impl<V: warpui::View> PageType<V> {
     /// A page which is a series of [`SettingsWidget`]s that fall under sub-categories.
     pub(super) fn new_categorized(
         categories: Vec<Category<V>>,
-        title: Option<&'static str>,
+        title: Option<PageTitle<V>>,
     ) -> Self {
         Self::Categorized {
             filter: categories
@@ -1333,18 +1610,6 @@ impl<V: warpui::View> PageType<V> {
     /// Uses all-words matching: every word in the query must appear somewhere in the
     /// widget's search terms (but not necessarily contiguously).
     pub(super) fn update_filter(&mut self, query: &str, app: &AppContext) -> MatchData {
-        /// Returns true if every whitespace-delimited word in `query` appears
-        /// somewhere in `terms` (case-insensitive). An empty query matches everything.
-        fn search_terms_match(terms: &str, query: &str) -> bool {
-            if query.is_empty() {
-                return true;
-            }
-            let terms_lower = terms.to_lowercase();
-            query
-                .to_lowercase()
-                .split_whitespace()
-                .all(|word| terms_lower.contains(word))
-        }
         match self {
             Self::Monolith { widget, filter, .. } => {
                 *filter =
@@ -1476,7 +1741,7 @@ impl<V: warpui::View> PageType<V> {
                 ..
             } => FilteredPageType::Uncategorized {
                 widgets: filter.iter().map(|i| widgets[*i].as_ref()).collect(),
-                title: *title,
+                title: title.as_ref(),
                 vertical_scroll_state: vertical_scroll_state.clone(),
                 horizontal_scroll_state: horizontal_scroll_state.clone(),
                 highlighted_widget_id: *highlighted_widget_id,
@@ -1496,9 +1761,11 @@ impl<V: warpui::View> PageType<V> {
                     .filter(|(_, indices)| !indices.is_empty())
                     .map(|(i, indices)| {
                         let category = &categories[i];
+                        let header = category.header.as_ref();
                         FilteredCategory {
-                            title: category.title,
-                            subtitle: category.subtitle,
+                            title: header.map_or("", |h| h.title),
+                            subtitle: header.and_then(|h| h.subtitle),
+                            trailing_element: header.and_then(|h| h.trailing_element.as_ref()),
                             widgets: indices
                                 .iter()
                                 .map(|i| category.widgets[*i].as_ref())
@@ -1506,7 +1773,7 @@ impl<V: warpui::View> PageType<V> {
                         }
                     })
                     .collect(),
-                title: *title,
+                title: title.as_ref(),
                 vertical_scroll_state: vertical_scroll_state.clone(),
                 horizontal_scroll_state: horizontal_scroll_state.clone(),
                 highlighted_widget_id: *highlighted_widget_id,
@@ -1539,7 +1806,7 @@ impl<V: warpui::View> PageType<V> {
         }
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
     pub fn scroll_by(&self, delta: Pixels) {
         match self {
             PageType::Monolith {
@@ -1563,16 +1830,16 @@ impl<V: warpui::View> PageType<V> {
         let page = match self.get_filtered() {
             FilteredPageType::Monolith { widget, title, .. } => {
                 let mut page = Empty::new().finish();
-                if let Some(widget) = widget {
-                    if widget.should_render(app) {
-                        if let Some(title) = title {
-                            let col = Flex::column()
-                                .with_child(render_page_title(title, HEADER_FONT_SIZE, appearance))
-                                .with_child(widget.render_widget(view, false, appearance, app));
-                            page = col.finish();
-                        } else {
-                            page = widget.render_widget(view, false, appearance, app);
-                        }
+                if let Some(widget) = widget
+                    && widget.should_render(app)
+                {
+                    if let Some(title) = title {
+                        let col = Flex::column()
+                            .with_child(render_page_title(title, HEADER_FONT_SIZE, appearance))
+                            .with_child(widget.render_widget(view, false, appearance, app));
+                        page = col.finish();
+                    } else {
+                        page = widget.render_widget(view, false, appearance, app);
                     }
                 }
                 page
@@ -1585,7 +1852,13 @@ impl<V: warpui::View> PageType<V> {
             } => {
                 let mut page = Flex::column();
                 if let Some(title) = title {
-                    page.add_child(render_page_title(title, HEADER_FONT_SIZE, appearance));
+                    page.add_child(render_page_title_with_trailing(
+                        title,
+                        HEADER_FONT_SIZE,
+                        view,
+                        appearance,
+                        app,
+                    ));
                 }
                 for widget in widgets {
                     let highlighted =
@@ -1602,22 +1875,40 @@ impl<V: warpui::View> PageType<V> {
                 highlighted_widget_id,
                 ..
             } => {
+                let categories = categories_with_visible_content(categories, app);
+
                 let mut page = Flex::column();
                 if let Some(title) = title {
-                    page.add_child(render_page_title(title, HEADER_FONT_SIZE, appearance));
+                    page.add_child(render_page_title_with_trailing(
+                        title,
+                        HEADER_FONT_SIZE,
+                        view,
+                        appearance,
+                        app,
+                    ));
+                    // The title's own margin only separates it from what follows with
+                    // whitespace; categorized pages otherwise draw a rule between every
+                    // pair of sections, so match that here between the title and the
+                    // first category.
+                    if !categories.is_empty() {
+                        page.add_child(render_separator(appearance));
+                    }
                 }
                 let num_categories = categories.len();
                 for (i, category) in categories.into_iter().enumerate() {
                     if !category.title.is_empty() {
-                        if let Some(subtitle) = category.subtitle {
-                            page.add_child(render_sub_header_with_description(
-                                appearance,
-                                category.title,
-                                subtitle,
-                            ));
+                        let header = if let Some(subtitle) = category.subtitle {
+                            render_sub_header_with_description(appearance, category.title, subtitle)
                         } else {
-                            page.add_child(render_sub_header(appearance, category.title, None));
-                        }
+                            render_sub_header(appearance, category.title, None)
+                        };
+                        page.add_child(render_header_with_trailing_element(
+                            header,
+                            category.trailing_element,
+                            view,
+                            appearance,
+                            app,
+                        ));
                     }
                     for widget in &category.widgets {
                         let highlighted =
@@ -1720,12 +2011,11 @@ impl<V: warpui::View> PageType<V> {
     }
 
     pub fn render(&self, view: &V, app: &AppContext) -> Box<dyn Element> {
-        if let (Some(vertical_scroll_state), Some(horizontal_scroll_state)) =
-            self.get_scroll_states()
-        {
-            self.wrap_dual_scrollable(view, horizontal_scroll_state, vertical_scroll_state, app)
-        } else {
-            self.render_page(view, app)
+        match self.get_scroll_states() {
+            (Some(vertical_scroll_state), Some(horizontal_scroll_state)) => {
+                self.wrap_dual_scrollable(view, horizontal_scroll_state, vertical_scroll_state, app)
+            }
+            _ => self.render_page(view, app),
         }
     }
 }
@@ -1740,25 +2030,57 @@ pub(super) enum FilteredPageType<'a, V: warpui::View> {
     },
     Uncategorized {
         widgets: Vec<&'a dyn SettingsWidget<View = V>>,
-        title: Option<&'static str>,
+        title: Option<&'a PageTitle<V>>,
         vertical_scroll_state: ClippedScrollStateHandle,
         horizontal_scroll_state: ClippedScrollStateHandle,
         highlighted_widget_id: Option<&'static str>,
     },
     Categorized {
         categories: Vec<FilteredCategory<'a, V>>,
-        title: Option<&'static str>,
+        title: Option<&'a PageTitle<V>>,
         vertical_scroll_state: ClippedScrollStateHandle,
         horizontal_scroll_state: ClippedScrollStateHandle,
         highlighted_widget_id: Option<&'static str>,
     },
 }
 
-/// A grouping of related [`SettingsWidget`]s that fall under the same sub-header.
-pub(super) struct Category<V: warpui::View> {
+/// A category header: title text with an optional subtitle and trailing accessory. Absent when
+/// the category draws no header row at all (e.g. Warpify's single-widget category, whose widget
+/// draws its own heading).
+pub(super) struct CategoryHeader<V: warpui::View> {
     title: &'static str,
     subtitle: Option<&'static str>,
+    trailing_element: Option<TrailingElementRenderer<V>>,
+}
+
+/// A grouping of related [`SettingsWidget`]s that fall under the same sub-header.
+pub(super) struct Category<V: warpui::View> {
+    header: Option<CategoryHeader<V>>,
     widgets: Vec<Box<dyn SettingsWidget<View = V>>>,
+}
+
+impl<V: warpui::View> CategoryHeader<V> {
+    pub(super) fn new(title: &'static str) -> Self {
+        Self {
+            title,
+            subtitle: None,
+            trailing_element: None,
+        }
+    }
+
+    pub(super) fn with_subtitle(mut self, subtitle: &'static str) -> Self {
+        self.subtitle = Some(subtitle);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn with_trailing_element(
+        mut self,
+        render: impl Fn(&V, &Appearance, &AppContext) -> Box<dyn Element> + 'static,
+    ) -> Self {
+        self.trailing_element = Some(Box::new(render));
+        self
+    }
 }
 
 impl<V: warpui::View> Category<V> {
@@ -1767,15 +2089,22 @@ impl<V: warpui::View> Category<V> {
         widgets: Vec<Box<dyn SettingsWidget<View = V>>>,
     ) -> Self {
         Self {
-            title,
-            subtitle: None,
+            header: (!title.is_empty()).then(|| CategoryHeader::new(title)),
             widgets,
         }
     }
 
-    pub(super) fn with_subtitle(mut self, subtitle: &'static str) -> Self {
-        self.subtitle = Some(subtitle);
-        self
+    /// A category whose header carries a subtitle and/or a trailing accessory (see
+    /// [`CategoryHeader`]).
+    #[allow(dead_code)]
+    pub(super) fn with_header(
+        header: CategoryHeader<V>,
+        widgets: Vec<Box<dyn SettingsWidget<View = V>>>,
+    ) -> Self {
+        Self {
+            header: Some(header),
+            widgets,
+        }
     }
 }
 
@@ -1783,7 +2112,23 @@ impl<V: warpui::View> Category<V> {
 pub(super) struct FilteredCategory<'a, V: warpui::View> {
     pub(super) title: &'static str,
     pub(super) subtitle: Option<&'static str>,
+    pub(super) trailing_element: Option<&'a TrailingElementRenderer<V>>,
     pub(super) widgets: Vec<&'a dyn SettingsWidget<View = V>>,
+}
+
+pub(super) fn categories_with_visible_content<'a, V: warpui::View>(
+    categories: Vec<FilteredCategory<'a, V>>,
+    app: &AppContext,
+) -> Vec<FilteredCategory<'a, V>> {
+    categories
+        .into_iter()
+        .filter(|category| {
+            category
+                .widgets
+                .iter()
+                .any(|widget| widget.should_render(app))
+        })
+        .collect()
 }
 
 /// Widgets are pieces of renderable settings modal content which can be associated with search
@@ -1835,6 +2180,12 @@ pub(super) trait SettingsWidget {
         app: &AppContext,
     ) -> Box<dyn Element>;
 }
+
+/// A closure that renders a compact accessory beside a page title or category header (e.g. a
+/// master switch). Unlike [`SettingsWidget`], it takes no part in search: it renders exactly
+/// when its header renders.
+pub(super) type TrailingElementRenderer<V> =
+    Box<dyn Fn(&V, &Appearance, &AppContext) -> Box<dyn Element>>;
 
 /// Builds a standardized button for resetting a setting to its default value.
 /// Callers should add an `on_click` handler and add the button to the UI below

@@ -1,44 +1,39 @@
+use std::ops::Deref;
+use std::sync::Arc;
+
 use lazy_static::lazy_static;
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::Vector2F;
-use std::{ops::Deref, sync::Arc};
 use thiserror::Error;
 use validator::ValidateEmail;
-
-use super::{
-    settings_page::{
-        MatchData, PageType, SettingsPageMeta, SettingsPageViewHandle, SettingsWidget, PAGE_PADDING,
-    },
-    SettingsSection,
+use warp_errors::report_error;
+use warpui::clipboard::ClipboardContent;
+use warpui::elements::{
+    Align, Border, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Element, Fill,
+    Flex, FormattedTextElement, HighlightedHyperlink, Icon, MainAxisSize, MouseStateHandle,
+    ParentElement, Radius, Rect, Shrinkable,
 };
-use crate::{
-    appearance::Appearance,
-    auth::AuthStateProvider,
-    editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions},
-    safe_info, send_telemetry_from_ctx,
-    server::{
-        server_api::referral::{ReferralInfo, ReferralsClient},
-        telemetry::TelemetryEvent,
-    },
-    ui_components::blended_colors,
-    view_components::ToastFlavor,
-};
+use warpui::fonts::Weight;
+use warpui::ui_components::button::ButtonVariant;
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{
-    clipboard::ClipboardContent,
-    elements::{
-        Align, Border, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Element, Fill,
-        Flex, FormattedTextElement, HighlightedHyperlink, Icon, MainAxisSize, MouseStateHandle,
-        ParentElement, Radius, Rect, Shrinkable,
-    },
-    fonts::Weight,
-    ui_components::{
-        button::ButtonVariant,
-        components::{Coords, UiComponent, UiComponentStyles},
-    },
     AppContext, Entity, EventContext, FocusContext, SingletonEntity, TypedActionView, View,
     ViewContext, ViewHandle,
 };
+
+use super::SettingsSection;
+use super::settings_page::{
+    MatchData, PAGE_PADDING, PageType, SettingsPageMeta, SettingsPageViewHandle, SettingsWidget,
+};
+use crate::appearance::Appearance;
+use crate::auth::AuthStateProvider;
+use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
+use crate::server::server_api::referral::{ReferralInfo, ReferralsClient};
+use crate::server::telemetry::TelemetryEvent;
+use crate::ui_components::blended_colors;
+use crate::view_components::ToastFlavor;
+use crate::{safe_info, send_telemetry_from_ctx};
 
 const HEADER_FONT_SIZE: f32 = 18.;
 const HEADER_MARGIN_BOTTOM: f32 = 32.;
@@ -97,8 +92,7 @@ const CLAIMED_REFERRAL_COUNT_LEFT_MARGIN: f32 = 40.;
 const CLAIMED_REFERRAL_CLIP: usize = 999;
 
 const TERMS_LINK_TEXT: &str = "Certain restrictions apply.";
-const TERMS_URL: &str =
-    "https://docs.warp.dev/support-and-community/community/refer-a-friend#referral-program-terms-and-conditions";
+const TERMS_URL: &str = "https://docs.warp.dev/support-and-community/community/refer-a-friend#referral-program-terms-and-conditions";
 const TERMS_CONTACT_TEXT: &str =
     " If you have any questions about the referral program, please contact referrals@warp.dev.";
 
@@ -345,7 +339,7 @@ impl ReferralsPageView {
                 });
             }
             Err(err) => {
-                log::error!("Error sending referral emails: {err}");
+                report_error!(err.context("Error sending referral emails"));
                 ctx.emit(ReferralsPageEvent::ShowToast {
                     message: EMAIL_FAILURE_TOAST.to_owned(),
                     flavor: ToastFlavor::Error,
@@ -625,11 +619,7 @@ impl ReferralsWidget {
         appearance: &Appearance,
     ) -> Box<dyn Element> {
         Flex::column()
-            .with_child(
-                Container::new(self.render_label("Link", appearance))
-                    .with_padding_top(PAGE_PADDING)
-                    .finish(),
-            )
+            .with_child(self.render_label("Link", appearance))
             .with_child(self.render_link_row(view, appearance))
             .with_child(self.render_label("Email", appearance))
             .with_child(self.render_email_row(view, appearance))
@@ -763,14 +753,13 @@ impl ReferralsWidget {
             )
             .with_child(self.render_rewards_list(view, appearance));
 
-        if !is_anonymous {
-            if let Some(count) = self.render_claimed_referrals_count(view, appearance) {
-                reward_status_row.add_child(
-                    Container::new(count)
-                        .with_margin_left(CLAIMED_REFERRAL_COUNT_LEFT_MARGIN)
-                        .finish(),
-                );
-            }
+        if !is_anonymous && let Some(count) = self.render_claimed_referrals_count(view, appearance)
+        {
+            reward_status_row.add_child(
+                Container::new(count)
+                    .with_margin_left(CLAIMED_REFERRAL_COUNT_LEFT_MARGIN)
+                    .finish(),
+            );
         };
 
         rewards_section.add_child(reward_status_row.finish());

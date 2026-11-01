@@ -15,11 +15,20 @@ pub enum FederateCommand {
     IssueGcpToken(IssueGcpTokenArgs),
 }
 
+impl FederateCommand {
+    pub(crate) fn as_str_for_tracing(&self) -> &'static str {
+        match self {
+            FederateCommand::IssueToken(_) => "federate issue-token",
+            FederateCommand::IssueGcpToken(_) => "federate issue-gcp-token",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 #[command(name = "issue-token")]
 pub struct IssueTokenArgs {
     /// The run ID to issue the token for.
-    #[arg(long = "run-id")]
+    #[arg(long = "run-id", env = crate::OZ_RUN_ID_ENV)]
     pub run_id: String,
 
     /// The audience claim for the identity token.
@@ -38,14 +47,16 @@ pub struct IssueTokenArgs {
     ///
     /// Supported components are:
     /// - principal (`user:my-user-id`)
-    /// - scoped_principal (`principal:my-team-id/user:my-user-id`)
+    /// - scoped_principal (`scoped_principal:my-team-id/user:my-user-id`)
     /// - email (`email:user@warp.dev`)
     /// - teams (`teams:my-team-id`)
+    /// - factory_uid (`factory_uid:my-factory-id`)
+    /// - agent_type (`agent_type:my-agent-type`)
     /// - environment (`environment:my-environment-id`)
     /// - agent_name (`agent_name:my-agent`)
     /// - skill_spec (`skill_spec:warpdotdev/repo_path_to_skill`)
     /// - run_id (`run_id:abc123`)
-    /// - host (`host:my-worker-id`)
+    /// - host (`host:my-worker-host`)
     #[arg(long = "subject-template", num_args = 1..)]
     pub subject_template: Option<Vec<String>>,
 }
@@ -54,8 +65,8 @@ pub struct IssueTokenArgs {
 #[command(name = "issue-gcp-token")]
 pub struct IssueGcpTokenArgs {
     /// The run ID to issue the token for.
-    #[arg(long = "run-id")]
-    pub run_id: String,
+    #[arg(long = "run-id", env = crate::OZ_RUN_ID_ENV)]
+    pub run_id: Option<String>,
 
     /// Requested token lifetime (e.g. "1h", "30m").
     #[arg(long = "duration", default_value = "1h")]

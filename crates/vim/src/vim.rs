@@ -1,7 +1,8 @@
 use warp_core::safe_info;
-use warpui::{keymap::Keystroke, Entity, ModelContext, ModelHandle, ViewContext};
+use warpui_core::keymap::Keystroke;
+use warpui_core::{Entity, ModelContext, ModelHandle, ViewContext};
 
-use crate::register::{valid_register_name, BLACK_HOLE_REGISTER};
+use crate::register::{BLACK_HOLE_REGISTER, valid_register_name};
 
 /// ASCII code for backspace.
 /// In Normal and Visual modes, Vim treats backspace as a leftward character motion.
@@ -51,6 +52,7 @@ pub struct VimFSA {
     register: char,
     /// Holds the last [`VimEvent`] where [`VimEventType::for_dot_repeat`] returns `Some`.
     dot_repeat_event: Option<VimEvent>,
+    continuous_replace: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -245,6 +247,8 @@ enum PendingAction {
     },
     /// the full "g" command
     G,
+    /// the full "z" command (e.g. zz)
+    Z,
     FindChar {
         direction: Direction,
         destination: FindCharDestination,
@@ -268,7 +272,16 @@ impl From<char> for PendingAction {
                 operator: VimOperator::Yank,
                 pending_operand: None,
             },
+            '>' => Self::Operation {
+                operator: VimOperator::Indent,
+                pending_operand: None,
+            },
+            '<' => Self::Operation {
+                operator: VimOperator::Dedent,
+                pending_operand: None,
+            },
             'g' => Self::G,
+            'z' => Self::Z,
             'f' => Self::FindChar {
                 direction: Direction::Forward,
                 destination: FindCharDestination::AtChar,
@@ -304,7 +317,7 @@ pub enum VimMotion {
     FindChar(FindCharMotion),
     JumpToFirstLine,
     JumpToLastLine,
-    /// Jump to a specific line number. See ":help G" in Vim.
+    /// Jump to a specific line number. See ":help gg" and ":help G" in Vim.
     JumpToLine(u32),
     /// See ":help %" in Vim.
     JumpToMatchingBracket,
@@ -344,12 +357,28 @@ pub struct VimTextObject {
     pub inclusion: TextObjectInclusion,
     pub object_type: TextObjectType,
 }
+impl VimTextObject {
+    pub fn motion_type(&self) -> MotionType {
+        match (&self.object_type, self.inclusion) {
+            (TextObjectType::Paragraph, _)
+            | (TextObjectType::Line, TextObjectInclusion::Around) => MotionType::Linewise,
+            (
+                TextObjectType::Word(_)
+                | TextObjectType::Line
+                | TextObjectType::Quote(_)
+                | TextObjectType::Block(_),
+                _,
+            ) => MotionType::Charwise,
+        }
+    }
+}
 
 impl From<char> for TextObjectType {
     fn from(c: char) -> Self {
         match c {
             'w' | 'W' => TextObjectType::Word(WordType::from(c)),
             'p' => TextObjectType::Paragraph,
+            'l' => TextObjectType::Line,
             '\'' | '"' | '`' => TextObjectType::Quote(QuoteType::from(c)),
             'b' | 'B' | '(' | ')' | '[' | ']' | '{' | '}' => {
                 TextObjectType::Block(BracketType::from(c))
@@ -478,6 +507,8 @@ pub enum TextObjectType {
     Word(WordType),
     /// Enter ":help ap" in Vim.
     Paragraph,
+    /// Enter ":help v_al" or ":help v_il" in Neovim.
+    Line,
     /// Enter ":help aquote" in Vim.
     Quote(QuoteType),
     /// Enter ":help a{" in Vim.
@@ -522,6 +553,25 @@ pub struct VimEvent {
     count: u32,
 }
 
+impl VimEvent {
+    /// Borrow the event type.
+    pub fn event_type(&self) -> &VimEventType {
+        &self.event_type
+    }
+
+    /// The repeat count for this event (always at least 1).
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// Consume the event, returning its type and count as separate values.
+    /// Prefer this over field access when the event type needs to be matched
+    /// by value (avoiding a clone of the event type).
+    pub fn into_parts(self) -> (VimEventType, u32) {
+        (self.event_type, self.count)
+    }
+}
+
 impl From<VimEventType> for VimEvent {
     fn from(event_type: VimEventType) -> Self {
         VimEvent {
@@ -536,7 +586,14 @@ impl From<VimEventType> for VimEvent {
 pub enum VimEventType {
     InsertChar(char),
     Navigate(VimMotion),
-    ReplaceChar(Option<char>),
+    ReplaceChar {
+        character: Option<char>,
+        advance: bool,
+    },
+    ReplaceText {
+        text: String,
+        already_applied: bool,
+    },
     ToggleCase,
     Search(Direction),
     CycleSearch(Direction),
@@ -586,6 +643,12 @@ pub enum VimEventType {
     GotoDefinition,
     FindReferences,
     ShowHover,
+    /// Center the current line vertically in the viewport. Triggered by `zz`.
+    CenterCursorVertically,
+    /// Move cursor and scroll viewport down by half a page. Triggered by `<C-d>`.
+    ScrollHalfPageDown,
+    /// Move cursor and scroll viewport up by half a page. Triggered by `<C-u>`.
+    ScrollHalfPageUp,
 }
 
 impl VimEventType {
@@ -596,14 +659,21 @@ impl VimEventType {
     /// text all at once.
     fn for_dot_repeat(&self) -> Option<Self> {
         match self {
-            VimEventType::ReplaceChar(_)
+            VimEventType::ReplaceChar { advance: false, .. }
             | VimEventType::ToggleCase
             | VimEventType::Paste { .. }
             | VimEventType::InsertText { .. }
             | VimEventType::JoinLine
             | VimEventType::DeleteForward => Some(self.clone()),
+            VimEventType::ReplaceText { text, .. } => Some(VimEventType::ReplaceText {
+                text: text.clone(),
+                already_applied: false,
+            }),
             VimEventType::Operation { operator, .. }
-                if *operator == VimOperator::Change || *operator == VimOperator::Delete =>
+                if *operator == VimOperator::Change
+                    || *operator == VimOperator::Delete
+                    || *operator == VimOperator::Indent
+                    || *operator == VimOperator::Dedent =>
             {
                 Some(self.clone())
             }
@@ -618,16 +688,9 @@ impl VimEventType {
                 text: String::new(),
                 position: *position,
             }),
-            VimEventType::ChangeMode {
-                new:
-                    ModeTransition {
-                        mode: VimMode::Replace,
-                        ..
-                    },
-                ..
-            } => Some(VimEventType::ReplaceChar(None)),
             VimEventType::Operation { .. }
             | VimEventType::ChangeMode { .. }
+            | VimEventType::ReplaceChar { advance: true, .. }
             | VimEventType::Navigate(_)
             | VimEventType::Search(_)
             | VimEventType::CycleSearch(_)
@@ -643,7 +706,10 @@ impl VimEventType {
             | VimEventType::Escape
             | VimEventType::GotoDefinition
             | VimEventType::FindReferences
-            | VimEventType::ShowHover => None,
+            | VimEventType::ShowHover
+            | VimEventType::CenterCursorVertically
+            | VimEventType::ScrollHalfPageDown
+            | VimEventType::ScrollHalfPageUp => None,
         }
     }
 }
@@ -662,8 +728,15 @@ pub enum VimOperator {
     Uppercase,
     Lowercase,
     ToggleComment,
+    Indent,
+    Dedent,
 }
 
+impl VimOperator {
+    pub fn includes_trailing_newline(self) -> bool {
+        !matches!(self, Self::Change | Self::Indent | Self::Dedent)
+    }
+}
 impl From<char> for VimOperator {
     fn from(c: char) -> Self {
         match c {
@@ -673,6 +746,8 @@ impl From<char> for VimOperator {
             '~' => Self::ToggleCase,
             'u' => Self::Lowercase,
             'U' => Self::Uppercase,
+            '>' => Self::Indent,
+            '<' => Self::Dedent,
             _ => panic!("invalid char for VimOperator: {c}"),
         }
     }
@@ -699,10 +774,11 @@ impl VimFSA {
             pending_operand_count: None,
             pending_visual_object: None,
             last_find_motion: None,
-            // When doing an operation that reads/writes to a register, the default (unnamed) regsiter
+            // When doing an operation that reads/writes to a register, the default (unnamed) register
             // is called ".
             register: '"',
             dot_repeat_event: None,
+            continuous_replace: false,
         }
     }
 
@@ -720,6 +796,7 @@ impl VimFSA {
         match self.mode {
             VimMode::Replace | VimMode::Visual(_) => {
                 self.mode = VimMode::Normal;
+                self.continuous_replace = false;
             }
             VimMode::Insert | VimMode::Normal => {}
         }
@@ -743,11 +820,45 @@ impl VimFSA {
             },
             VimMode::Visual(motion_type) => self.handle_visual_command(c, motion_type)?,
             VimMode::Replace => {
-                self.mode = VimMode::Normal;
-                VimEventType::ReplaceChar(Some(c))
+                let advance = self.continuous_replace;
+                if advance && let Some(text) = self.dot_repeat_text_mut() {
+                    text.push(c);
+                }
+                if !advance {
+                    self.mode = VimMode::Normal;
+                }
+                VimEventType::ReplaceChar {
+                    character: Some(c),
+                    advance,
+                }
             }
         };
         let count = self.compute_event_count(c, &event_type);
+        if matches!(
+            event_type,
+            VimEventType::ChangeMode {
+                new: ModeTransition {
+                    mode: VimMode::Replace,
+                    ..
+                },
+                ..
+            }
+        ) {
+            self.dot_repeat_event = Some(VimEvent {
+                event_type: if self.continuous_replace {
+                    VimEventType::ReplaceText {
+                        text: String::new(),
+                        already_applied: false,
+                    }
+                } else {
+                    VimEventType::ReplaceChar {
+                        character: None,
+                        advance: false,
+                    }
+                },
+                count,
+            });
+        }
 
         self.clear();
 
@@ -766,6 +877,7 @@ impl VimFSA {
                     self.clear();
                     VimEventType::Escape.into()
                 }
+                VimMode::Replace if self.continuous_replace => self.finish_replace_mode(),
                 VimMode::Replace | VimMode::Visual(_) => {
                     self.change_mode(VimMode::Normal.into()).into()
                 }
@@ -774,7 +886,7 @@ impl VimFSA {
             "backspace" => match self.mode {
                 VimMode::Insert => self.handle_insert_mode_backspace().into(),
                 VimMode::Visual(_) | VimMode::Normal => {
-                    return self.typed_character(BACKSPACE_CHAR)
+                    return self.typed_character(BACKSPACE_CHAR);
                 }
                 VimMode::Replace => self.change_mode(VimMode::Normal.into()).into(),
             },
@@ -795,6 +907,28 @@ impl VimFSA {
                 VimMode::Normal | VimMode::Visual(_) => self.typed_character('x')?,
                 VimMode::Replace => self.change_mode(VimMode::Normal.into()).into(),
             },
+            "ctrl-d" => match self.mode {
+                VimMode::Normal | VimMode::Visual(_) => {
+                    let count = self.get_action_count().unwrap_or(1);
+                    self.clear();
+                    VimEvent {
+                        event_type: VimEventType::ScrollHalfPageDown,
+                        count,
+                    }
+                }
+                _ => return None,
+            },
+            "ctrl-u" => match self.mode {
+                VimMode::Normal | VimMode::Visual(_) => {
+                    let count = self.get_action_count().unwrap_or(1);
+                    self.clear();
+                    VimEvent {
+                        event_type: VimEventType::ScrollHalfPageUp,
+                        count,
+                    }
+                }
+                _ => return None,
+            },
             _ => return None,
         };
         Some(event)
@@ -812,19 +946,19 @@ impl VimFSA {
             //
             // Replace mode is another special case where we remember the count
             // that was entered when switching into replace mode.
-            ('.', _) | (_, VimEventType::ReplaceChar(_)) => {
-                this_action_count.unwrap_or_else(|| {
+            (_, VimEventType::ReplaceChar { advance: true, .. }) => 1,
+            ('.', _) | (_, VimEventType::ReplaceChar { advance: false, .. }) => this_action_count
+                .unwrap_or_else(|| {
                     self.dot_repeat_event
                         .as_ref()
                         .map(|event| event.count)
                         .unwrap_or(1)
-                })
-            }
+                }),
             _ => this_action_count.unwrap_or(1) * self.get_operand_count().unwrap_or(1),
         }
     }
 
-    /// Exiting insert mode is simple when it had been entered without a count, you just chenge the
+    /// Exiting insert mode is simple when it had been entered without a count, you just change the
     /// mode. However, if there was a count, we need to repeat the text that was entered n - 1
     /// times.
     fn exit_insert_mode(&mut self) -> VimEvent {
@@ -853,6 +987,27 @@ impl VimFSA {
                 }
             }
             None => self.change_mode(VimMode::Normal.into()).into(),
+        }
+    }
+
+    fn finish_replace_mode(&mut self) -> VimEvent {
+        let (text, count) = self
+            .dot_repeat_event
+            .as_ref()
+            .and_then(|event| match &event.event_type {
+                VimEventType::ReplaceText { text, .. } => Some((text.clone(), event.count)),
+                _ => None,
+            })
+            .unwrap_or_else(|| (String::new(), 1));
+        self.mode = VimMode::Normal;
+        self.continuous_replace = false;
+        self.clear();
+        VimEvent {
+            event_type: VimEventType::ReplaceText {
+                text,
+                already_applied: true,
+            },
+            count,
         }
     }
 
@@ -916,8 +1071,19 @@ impl VimFSA {
                         motion_type: MotionType::Charwise,
                     },
                 ),
-                'r' => self.change_mode(VimMode::Replace.into()),
-                'g' | 'd' | 'c' | 'y' | 'f' | 'F' | 't' | 'T' | '[' | ']' | '"' => {
+                'r' => {
+                    self.continuous_replace = false;
+                    self.change_mode(VimMode::Replace.into())
+                }
+                'R' => {
+                    self.continuous_replace = true;
+                    self.change_mode(VimMode::Replace.into())
+                }
+                'g' | 'd' | 'c' | 'y' | 'z' | 'f' | 'F' | 't' | 'T' | '[' | ']' | '"' => {
+                    self.pending_action = Some(PendingAction::from(c));
+                    return None;
+                }
+                '<' | '>' => {
                     self.pending_action = Some(PendingAction::from(c));
                     return None;
                 }
@@ -1025,13 +1191,23 @@ impl VimFSA {
         action: PendingAction,
     ) -> Option<VimEventType> {
         let event = match action {
+            PendingAction::Z => match c {
+                'z' => VimEventType::CenterCursorVertically,
+                _ => {
+                    self.clear();
+                    return None;
+                }
+            },
             PendingAction::G => match c {
                 'e' | 'E' => VimEventType::Navigate(VimMotion::Word(WordMotion {
                     direction: Direction::Backward,
                     bound: WordBound::End,
                     word_type: WordType::from(c),
                 })),
-                'g' => VimEventType::Navigate(VimMotion::JumpToFirstLine),
+                'g' => match self.get_action_count() {
+                    Some(line_number) => VimEventType::Navigate(VimMotion::JumpToLine(line_number)),
+                    None => VimEventType::Navigate(VimMotion::JumpToFirstLine),
+                },
                 'd' => VimEventType::GotoDefinition,
                 'h' => VimEventType::ShowHover,
                 'r' => VimEventType::FindReferences,
@@ -1128,6 +1304,12 @@ impl VimFSA {
             }
             // Support gcc (toggle comment line)
             'c' if operator == VimOperator::ToggleComment => {
+                self.create_operation(operator, VimOperand::Line)
+            }
+            '>' if operator == VimOperator::Indent => {
+                self.create_operation(operator, VimOperand::Line)
+            }
+            '<' if operator == VimOperator::Dedent => {
                 self.create_operation(operator, VimOperand::Line)
             }
             'i' | 'a' | 'g' | 'f' | 'F' | 't' | 'T' | '[' | ']' => {
@@ -1289,7 +1471,10 @@ impl VimFSA {
                 'g' => self.create_operation(
                     operator,
                     VimOperand::Motion {
-                        motion: VimMotion::JumpToFirstLine,
+                        motion: match self.get_operand_count() {
+                            Some(line_number) => VimMotion::JumpToLine(line_number),
+                            None => VimMotion::JumpToFirstLine,
+                        },
                         motion_type: MotionType::Linewise,
                     },
                 ),
@@ -1323,8 +1508,8 @@ impl VimFSA {
                 )
             }
             PendingOperand::TextObject(inclusion) => match c {
-                'w' | 'W' | 'p' | '\'' | '"' | '`' | 'b' | 'B' | '(' | ')' | '[' | ']' | '{'
-                | '}' => self.create_operation(
+                'w' | 'W' | 'p' | 'l' | '\'' | '"' | '`' | 'b' | 'B' | '(' | ')' | '[' | ']'
+                | '{' | '}' => self.create_operation(
                     operator,
                     VimOperand::TextObject(VimTextObject {
                         inclusion,
@@ -1365,11 +1550,17 @@ impl VimFSA {
             Some(pending_action) => self.handle_visual_pending_action(c, pending_action)?,
             None => match self.pending_visual_object {
                 Some(inclusion) => match c {
-                    'w' | 'W' | 'p' | '\'' | '"' | '`' | 'b' | 'B' | '(' | ')' | '[' | ']'
-                    | '{' | '}' => {
-                        if c == 'p' {
-                            self.mode = VimMode::Visual(MotionType::Linewise);
-                        }
+                    'w' | 'W' | 'p' | 'l' | '\'' | '"' | '`' | 'b' | 'B' | '(' | ')' | '['
+                    | ']' | '{' | '}' => {
+                        self.mode = match (c, inclusion) {
+                            ('p', _) | ('l', TextObjectInclusion::Around) => {
+                                VimMode::Visual(MotionType::Linewise)
+                            }
+                            ('l', TextObjectInclusion::Inner) => {
+                                VimMode::Visual(MotionType::Charwise)
+                            }
+                            _ => self.mode,
+                        };
                         VimEventType::VisualTextObject(VimTextObject {
                             inclusion,
                             object_type: TextObjectType::from(c),
@@ -1449,6 +1640,11 @@ impl VimFSA {
                 self.mode = VimMode::Normal;
                 event_type
             }
+            '<' | '>' => {
+                let event_type = self.create_visual_operator(c, motion_type);
+                self.mode = VimMode::Normal;
+                event_type
+            }
             'c' | 'C' | 's' | 'S' => {
                 let event_type = self.create_visual_operator(c, motion_type);
                 self.mode = VimMode::Insert;
@@ -1467,7 +1663,7 @@ impl VimFSA {
                     write_register_name,
                 }
             }
-            'g' | 'f' | 'F' | 't' | 'T' | '[' | ']' | '"' => {
+            'g' | 'z' | 'f' | 'F' | 't' | 'T' | '[' | ']' | '"' => {
                 self.pending_action = Some(PendingAction::from(c));
                 return None;
             }
@@ -1502,13 +1698,23 @@ impl VimFSA {
         pending_action: PendingAction,
     ) -> Option<VimEventType> {
         let event_type = match pending_action {
+            PendingAction::Z => match c {
+                'z' => VimEventType::CenterCursorVertically,
+                _ => {
+                    self.clear();
+                    return None;
+                }
+            },
             PendingAction::G => match c {
                 'e' | 'E' => VimEventType::Navigate(VimMotion::Word(WordMotion {
                     direction: Direction::Backward,
                     bound: WordBound::End,
                     word_type: WordType::from(c),
                 })),
-                'g' => VimEventType::Navigate(VimMotion::JumpToFirstLine),
+                'g' => match self.get_action_count() {
+                    Some(line_number) => VimEventType::Navigate(VimMotion::JumpToLine(line_number)),
+                    None => VimEventType::Navigate(VimMotion::JumpToFirstLine),
+                },
                 'c' => {
                     let motion_type = match self.mode {
                         VimMode::Visual(mt) => mt,
@@ -1576,6 +1782,9 @@ impl VimFSA {
     fn change_mode(&mut self, mode_trans: ModeTransition) -> VimEventType {
         let old_mode = self.mode;
         self.mode = mode_trans.mode;
+        if self.mode != VimMode::Replace {
+            self.continuous_replace = false;
+        }
         VimEventType::ChangeMode {
             new: mode_trans,
             old: old_mode,
@@ -1602,6 +1811,7 @@ impl VimFSA {
     fn force_insert_mode(&mut self) {
         self.clear();
         self.mode = VimMode::Insert;
+        self.continuous_replace = false;
     }
 
     fn create_operation(&self, operator: VimOperator, operand: VimOperand) -> VimEventType {
@@ -1634,16 +1844,20 @@ impl VimFSA {
     fn dot_repeat_text_mut(&mut self) -> Option<&mut String> {
         match &mut self.dot_repeat_event {
             Some(VimEvent {
-                event_type: VimEventType::InsertText { ref mut text, .. },
+                event_type: VimEventType::InsertText { text, .. },
                 ..
             })
             | Some(VimEvent {
                 event_type:
                     VimEventType::Operation {
                         operator: VimOperator::Change,
-                        replacement_text: ref mut text,
+                        replacement_text: text,
                         ..
                     },
+                ..
+            })
+            | Some(VimEvent {
+                event_type: VimEventType::ReplaceText { text, .. },
                 ..
             }) => Some(text),
             _ => None,
@@ -1744,7 +1958,7 @@ pub struct VimState<'a> {
     pub showcmd: &'a str,
 }
 
-/// This struct is a wrapper around the VimFSA that turns it into a warpui::Entity. We want to keep
+/// This struct is a wrapper around the VimFSA that turns it into a warpui_core::Entity. We want to keep
 /// the VimFSA independent of our UI framework, so anything involving warpui should live here
 /// instead.
 #[derive(Default)]
@@ -1768,7 +1982,7 @@ impl VimModel {
     }
 
     pub fn keypress(&mut self, keystroke: &Keystroke, ctx: &mut ModelContext<Self>) {
-        if let Some(event) = self.fsa.keypress(keystroke.key.as_str()) {
+        if let Some(event) = self.fsa.keypress(keystroke.normalized().as_str()) {
             ctx.emit(event);
         }
     }
@@ -1845,8 +2059,22 @@ where
                 replacement_text.as_str(),
                 ctx,
             ),
-            VimEventType::ReplaceChar(Some(c)) => self.replace_char(*c, event.count, ctx),
-            VimEventType::ReplaceChar(_) => {}
+            VimEventType::ReplaceChar {
+                character: Some(c),
+                advance,
+            } => self.replace_char(*c, event.count, *advance, ctx),
+            VimEventType::ReplaceChar {
+                character: None, ..
+            } => {}
+            VimEventType::ReplaceText {
+                text,
+                already_applied,
+            } => {
+                self.replace_text(text, event.count, *already_applied, ctx);
+                if *already_applied {
+                    self.change_mode(&VimMode::Replace, &VimMode::Normal.into(), ctx);
+                }
+            }
             VimEventType::Paste {
                 direction,
                 register_name,
@@ -1885,6 +2113,9 @@ where
             VimEventType::GotoDefinition => self.goto_definition(ctx),
             VimEventType::FindReferences => self.find_references(ctx),
             VimEventType::ShowHover => self.show_hover(ctx),
+            VimEventType::CenterCursorVertically => self.center_cursor_vertically(ctx),
+            VimEventType::ScrollHalfPageDown => self.scroll_half_page_down(event.count, ctx),
+            VimEventType::ScrollHalfPageUp => self.scroll_half_page_up(event.count, ctx),
         };
     }
 }
@@ -1938,7 +2169,22 @@ pub trait VimHandler {
     /// Replace a character with another.
     /// If `char_count` is greater than the number of characters remaining in the current line,
     /// the replace operation is cancelled.
-    fn replace_char(&mut self, c: char, char_count: u32, ctx: &mut ViewContext<Self>);
+    fn replace_char(
+        &mut self,
+        c: char,
+        char_count: u32,
+        advance: bool,
+        ctx: &mut ViewContext<Self>,
+    );
+    /// Replay text entered during continuous Replace mode. `already_applied`
+    /// indicates that the first copy was applied interactively before this event.
+    fn replace_text(
+        &mut self,
+        text: &str,
+        count: u32,
+        already_applied: bool,
+        ctx: &mut ViewContext<Self>,
+    );
     /// Switch between upper/lowercase for character on cursor.
     /// Even if `char_count` is greater than the number of characters remaining in the current line,
     /// only characters in the current line are toggled.
@@ -2003,4 +2249,15 @@ pub trait VimHandler {
     fn find_references(&mut self, _ctx: &mut ViewContext<Self>) {}
     /// Show hover information for the symbol under cursor (gh).
     fn show_hover(&mut self, _ctx: &mut ViewContext<Self>) {}
+    /// Center the current line vertically in the viewport (zz).
+    fn center_cursor_vertically(&mut self, _ctx: &mut ViewContext<Self>) {}
+    /// Move the cursor down `count` half-pages and scroll the viewport (`<C-d>`).
+    fn scroll_half_page_down(&mut self, _count: u32, _ctx: &mut ViewContext<Self>) {}
+    /// Move the cursor up `count` half-pages and scroll the viewport (`<C-u>`).
+    fn scroll_half_page_up(&mut self, _count: u32, _ctx: &mut ViewContext<Self>) {}
 }
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+#[path = "vim_tests.rs"]
+mod tests;

@@ -24,7 +24,7 @@ set -g DCS_START \u1b\u50\u24
 # _warp_run_generator_command_internal, which instead end in 'e' (0x65).
 set -g DCS_JSON_MARKER 'd'
 
-set -g DCS_END \u9c
+set -g DCS_END \x1b\x5c
 
 set -g OSC_START (printf '\e]9278;')
 
@@ -43,6 +43,20 @@ end
 if test -n "$WARP_PATH_APPEND"
     set -gx --path PATH "$PATH:$WARP_PATH_APPEND"
     set -e WARP_PATH_APPEND
+end
+# Direct non-root cloud containers use a private command directory when system installation fails.
+# Restore the entrypoint-provided directory's precedence after profiles reset PATH.
+if string match -q '/*' -- "$WARP_CLOUD_AGENT_FALLBACK_BIN"
+    and not string match -q '*:*' -- "$WARP_CLOUD_AGENT_FALLBACK_BIN"
+    and test -d "$WARP_CLOUD_AGENT_FALLBACK_BIN"
+    and test (command uname -s) = Linux
+    set -l runtime_path "$WARP_CLOUD_AGENT_FALLBACK_BIN"
+    for runtime_entry in $PATH
+        if test "$runtime_entry" != "$WARP_CLOUD_AGENT_FALLBACK_BIN"
+            set -a runtime_path "$runtime_entry"
+        end
+    end
+    set -gx PATH $runtime_path
 end
 
 function warp_send_json_message
@@ -65,7 +79,28 @@ end
 
 # warp_hex_encode_string hex-encodes the given string with `od`.
 function warp_hex_encode_string 
-  echo "$argv" | od -An -v -tx1 | command tr -d ' \n'
+  printf '%s' "$argv" | od -An -v -tx1 | command tr -d ' \n'
+end
+
+# fish has no byte-safe string indexing, so `od` is still needed to reach the raw UTF-8 bytes.
+function warp_completions_hex_encode
+  set -l od_output (printf '%s' "$argv" | od -An -v -tx1)
+  string replace -a -- ' ' '' (string join '' $od_output)
+end
+
+function warp_hex_decode_string
+    if test (count $argv) -eq 0 -o -z "$argv[1]"
+        return
+    end
+    set -l hex $argv[1]
+    set -l escaped ''
+    set -l i 1
+    while test $i -le (string length -- $hex)
+        set -l pair (string sub -s $i -l 2 -- $hex)
+        set escaped "$escaped\\x$pair"
+        set i (math $i + 2)
+    end
+    printf '%b' $escaped
 end
 
 # A list of PIDs for running in-band command(s). This is used to kill running
@@ -156,19 +191,45 @@ function warp_run_generator_command
     _warp_run_generator_command_internal $argv
 end
 
+# Computes native shell completions for the given (hex-encoded) command line and emits them over the
+# completions OSC protocol.
+function warp_run_generator_command_native_completions
+    set -g _WARP_GENERATOR_COMMAND 1
+    set -l line
+    if test (count $argv) -gt 0
+        set line (warp_hex_decode_string $argv[1] 2>/dev/null)
+    end
+
+    printf '\e]9280;A\a'
+    set -l trimmed_line (string trim -- "$line")
+    if test -n "$trimmed_line"
+        for entry in (complete -C "$line")
+            set -l parts (string split -m 1 \t -- $entry)
+            # Hex-encode both fields: OSC params are semicolon-delimited and only the third is
+            # read (see decode_hex_completions_payload in ansi/mod.rs), so a literal `;`, BEL,
+            # or ESC in a match or description would otherwise corrupt the sequence.
+            printf '\e]9280;C;%s\a' (warp_completions_hex_encode $parts[1])
+            if test (count $parts) -gt 1 -a -n "$parts[2]"
+                printf '\e]9280;D?description;%s\a' (warp_completions_hex_encode $parts[2])
+            end
+        end
+    end
+    printf '\e]9280;B\a'
+end
+
 # Run before a command is executed.
 function warp_preexec --on-event fish_preexec
     set -l command (warp_escape_json "$argv")
-    warp_send_json_message "{\"hook\": \"Preexec\", \"value\": {\"command\": \"$command\"}}"
+    warp_send_json_message "{\"hook\": \"Preexec\", \"value\": {\"command\": \"$command\", \"session_id\": $WARP_SESSION_ID}}"
     warp_maybe_send_reset_grid_osc
 
     # If this preexec is called for user command, kill ongoing generator command jobs.
-    if test (! string match -q "warp_run_generator_command*" $argv[1])
+    if not string match -q "warp_run_generator_command*" -- (string trim -- $argv[1])
         for pid in $_warp_generator_pids
-            # Surpress stderr output; kill writes to stderr if any of the given
-            # PIDS are not running (which might rarely be the case due to race
-            # conditions in checking which PIDS to cancel and this kill command.
-            kill -9 $pids >/dev/null 2>/dev/null
+            # Suppress stderr output; kill writes to stderr if the given PID is not running
+            # (which might rarely be the case due to race conditions in checking which PIDs to
+            # cancel and this kill command).
+            kill -9 $pid >/dev/null 2>/dev/null
         end
         set -g _warp_generator_pids ''
     end
@@ -278,7 +339,8 @@ function warp_precmd --on-event fish_prompt --on-event fish_posterror
         set exit_code 1
     end
 
-    warp_send_json_message "{\"hook\": \"CommandFinished\", \"value\": {\"exit_code\": $exit_code, \"next_block_id\": \"precmd-$WARP_SESSION_ID-$block_id\"}}"
+    set -l next_block_id "precmd-$WARP_SESSION_ID-$block_id"
+    warp_send_json_message "{\"hook\": \"CommandFinished\", \"value\": {\"exit_code\": $exit_code, \"next_block_id\": \"$next_block_id\", \"session_id\": $WARP_SESSION_ID}}"
     warp_maybe_send_reset_grid_osc
 
     set block_id (math $block_id + 1)
@@ -286,6 +348,8 @@ function warp_precmd --on-event fish_prompt --on-event fish_posterror
     if ! test -z $_WARP_GENERATOR_COMMAND
         set -e _WARP_GENERATOR_COMMAND
         set -l escaped_json "{\"hook\": \"Precmd\", \"value\": {
+        \"exit_code\": $exit_code,
+        \"next_block_id\": \"$next_block_id\",
         \"pwd\": \"\",
         \"ps1\": \"\",
         \"git_head\": \"\",
@@ -347,37 +411,63 @@ function warp_precmd --on-event fish_prompt --on-event fish_posterror
           set escaped_conda_env (warp_escape_json "$CONDA_DEFAULT_ENV")
       end
       
-        # Get Node.js version if node is available and we're in a Node.js project
-        if command -v node > /dev/null 2>&1
+        # Get the Node.js version, but only when the Node.js Version chip is enabled.
+        # Warp sets WARP_PROMPT_NODE_VERSION_ENABLED to "0" when the chip is not in the
+        # prompt (defaulting to enabled when unset), so we avoid spawning `node` on
+        # every prompt when the chip is not shown.
+        if test "$WARP_PROMPT_NODE_VERSION_ENABLED" != "0"; and command -v node > /dev/null 2>&1
             # Check for package.json in current directory and parent directories
             set current_dir (pwd)
             set found_package_json false
             set package_json_dir ""
-            while test "$current_dir" != "/"
+            while test -n "$current_dir"
                 if test -f "$current_dir/package.json"
                     set found_package_json true
                     set package_json_dir "$current_dir"
                     break
                 end
-                set current_dir (dirname "$current_dir")
+                if test "$current_dir" = "/"
+                    break
+                end
+                # Strip the last path segment without spawning `dirname`.
+                set current_dir (string replace -r '/[^/]*$' '' -- "$current_dir")
+                if test -z "$current_dir"
+                    set current_dir "/"
+                end
             end
             
             # Only show node version if package.json is within a git repository
             if test "$found_package_json" = true
                 set git_dir "$package_json_dir"
                 set in_git_repo false
-                while test "$git_dir" != "/"
+                while test -n "$git_dir"
                     if test -d "$git_dir/.git"
                         set in_git_repo true
                         break
                     end
-                    set git_dir (dirname "$git_dir")
+                    if test "$git_dir" = "/"
+                        break
+                    end
+                    set git_dir (string replace -r '/[^/]*$' '' -- "$git_dir")
+                    if test -z "$git_dir"
+                        set git_dir "/"
+                    end
                 end
                 
                 if test "$in_git_repo" = true
-                    set node_version (node --version 2>/dev/null)
-                    if test -n "$node_version"
-                        set escaped_node_version (warp_escape_json "$node_version")
+                    # Cache the resolved version keyed on PWD + PATH so we only spawn
+                    # `node --version` when the directory or PATH changes (PATH changes
+                    # on `nvm use`). Use global cache vars so they persist across calls.
+                    set -l node_cache_key "$PWD:$PATH"
+                    if test "$node_cache_key" = "$_WARP_NODE_VERSION_CACHE_KEY"
+                        set escaped_node_version "$_WARP_NODE_VERSION_CACHE_VALUE"
+                    else
+                        set -l node_version (node --version 2>/dev/null)
+                        if test -n "$node_version"
+                            set escaped_node_version (warp_escape_json "$node_version")
+                        end
+                        set -g _WARP_NODE_VERSION_CACHE_KEY "$node_cache_key"
+                        set -g _WARP_NODE_VERSION_CACHE_VALUE "$escaped_node_version"
                     end
                 end
             end
@@ -401,7 +491,7 @@ function warp_precmd --on-event fish_prompt --on-event fish_posterror
     warp_update_prompt_vars
     # This is used solely for prompt previews, when we're using prompt markers with combined grid.
     # We need to use this since fish does not have a way to ignore printable characters for cursor
-    # positioning (unlike zsh/bash), so we need a separate mechansim to send the prompt to Warp
+    # positioning (unlike zsh/bash), so we need a separate mechanism to send the prompt to Warp
     # in the case of Warp prompt (for previewing the PS1). We send an escaped version of the raw prompt
     # bytes via a hex string (in a JSON payload) to Warp.
     # Note that we are CALLING the `warp_original_fish_prompt` function on the next line and assigning the
@@ -414,6 +504,8 @@ function warp_precmd --on-event fish_prompt --on-event fish_posterror
     if test "$WARP_HONOR_PS1" = "1"
       # Don't send lprompt or rprompt in this case - we'll use prompt markers for both directly!
       set escaped_json "{\"hook\": \"Precmd\", \"value\": {
+      \"exit_code\": $exit_code,
+      \"next_block_id\": \"$next_block_id\",
       \"pwd\": \"$escaped_pwd\",
       \"ps1\": \"\",
       \"rprompt\": \"\",
@@ -427,6 +519,8 @@ function warp_precmd --on-event fish_prompt --on-event fish_posterror
     else
       # We send an lprompt to use for prompt preview purposes only (we still use prompt markers for active prompts).
       set escaped_json "{\"hook\": \"Precmd\", \"value\": {
+      \"exit_code\": $exit_code,
+      \"next_block_id\": \"$next_block_id\",
       \"pwd\": \"$escaped_pwd\",
       \"ps1\": \"$escaped_prompt\",
       \"rprompt\": \"\",
@@ -471,6 +565,121 @@ function warp_escape_json
     string join \n $argv | command sed -E 's/(["\\\\])/\\\\\\1/g; s/'\b'/\\\\b/g; s/'\t'/\\\\t/g; s/'\f'/\\\\f/g; s/'\r'/\\\\r/g; $!s/$/\\\\n/' | command tr -d '\n'
 end
 
+# Reports the widget `^R` is bound to, if the user has rebound it away from fish's own
+# history search. Returns non-zero when `^R` is still on a fish default.
+function warp_external_ctrl_r_widget
+  # fish >= 4.0 renamed key specifications, so `bind` echoes back `ctrl-r` where earlier
+  # versions echo `\cr`.
+  set -l widget ""
+  for binding in (bind \cr 2>/dev/null)
+    if string match --quiet -- 'bind --preset *' "$binding"
+      continue
+    end
+    # Strip `bind`'s options and key, leaving just the widget/command.
+    set widget (string replace --regex -- '^bind ((-M|--mode) \S+ +|--user +|--preset +)*\S+ +' '' "$binding")
+  end
+  test -n "$widget"; or return 1
+  echo "$widget"
+end
+
+
+# Runs the shell's own ctrl-r history tool as a foreground command.
+function warp_run_external_ctrl_r_widget
+  set -l result ""
+  switch "$_WARP_EXTERNAL_CTRL_R_WIDGET"
+    case 'fzf-history-widget' '_fzf_search_history'
+      test -z "$fish_private_mode"; and builtin history merge
+      $_WARP_EXTERNAL_CTRL_R_WIDGET
+      set result (commandline | string collect)
+      commandline -r ''
+    case '_atuin_search'
+      # atuin writes its TUI to stdout and the selection to fd 3, so the two are swapped here to
+      # leave the UI on the terminal and capture only the selection.
+      set -l output (ATUIN_SHELL_FISH=t ATUIN_LOG=error atuin search -i 3>&1 1>&2 2>&3 | string collect)
+      # atuin prefixes the selection with __atuin_accept__: when `enter_accept` is on and the
+      # user pressed enter. Warp always inserts without executing, so the prefix is dropped.
+      set result (string replace "__atuin_accept__:" "" -- "$output" | string collect)
+  end
+  set -l warp_escaped_selection (warp_escape_json "$result")
+  warp_send_json_message "{ \"hook\": \"ExternalShellWidgetSelection\", \"value\": { \"buffer\": \"$warp_escaped_selection\", \"session_id\": $WARP_SESSION_ID } }"
+end
+
+function warp_ctrl_t_widget_result
+  test "$argv[1]" = "$argv[2]"; or string collect -- "$argv[2]"
+end
+
+# Runs fzf's ctrl-t file-search widget as a foreground command.
+function warp_run_external_ctrl_t_widget
+  set -l result ""
+  set -l warp_ctrl_t_parts (string split -m 1 -- ':' "$argv[1]")
+  set -l char_cursor $warp_ctrl_t_parts[1]
+  set -l original_line (warp_hex_decode_string $warp_ctrl_t_parts[2] | string collect --no-trim-newlines --allow-empty)
+  commandline -r -- $original_line
+  commandline -C -- $char_cursor
+  switch "$_WARP_EXTERNAL_CTRL_R_WIDGET"
+    case 'fzf-history-widget'
+      fzf-file-widget
+    case '_fzf_search_history'
+      _fzf_search_directory
+  end
+  set -l cl_readback (commandline | string collect)
+  set result (warp_ctrl_t_widget_result "$original_line" "$cl_readback")
+  commandline -r ''
+  set -l warp_escaped_selection (warp_escape_json "$result")
+  warp_send_json_message "{ \"hook\": \"ExternalShellWidgetSelection\", \"value\": { \"buffer\": \"$warp_escaped_selection\", \"session_id\": $WARP_SESSION_ID } }"
+end
+
+function warp_run_external_alt_c_widget
+  set -l warp_alt_c_parts (string split -m 1 -- ':' "$argv[1]")
+  set -l char_cursor $warp_alt_c_parts[1]
+  set -l original_line (warp_hex_decode_string $warp_alt_c_parts[2] | string collect --no-trim-newlines --allow-empty)
+  commandline -r -- $original_line
+  commandline -C -- $char_cursor
+  switch "$_WARP_EXTERNAL_CTRL_R_WIDGET"
+    case 'fzf-history-widget'
+      fzf-cd-widget
+    case '_fzf_search_history'
+      set -l fd_cmd (command -v fdfind || command -v fd || echo fd)
+      set -l result ($fd_cmd --type d --color=always $fzf_fd_opts 2>/dev/null |
+        _fzf_wrapper --ansi --no-multi --query=(commandline --current-token) $fzf_directory_opts)
+      and cd -- $result
+  end
+  commandline -r ''
+end
+
+# Exclude the external handoff helpers from the user's history.
+#
+# fish only supports a single fish_should_add_to_history function (unlike zsh's array of
+# zshaddhistory hooks or bash's PROMPT_COMMAND-style stacking), so compose with any
+# user-defined one -- e.g. from a plugin sourced in config.fish before this bootstrap script
+# runs -- rather than clobbering it, following the same backup pattern warp_update_prompt_vars
+# uses for fish_prompt.
+#
+# warp_original_fish_should_add_to_history must exist and be safe to call *before* we install our
+# own wrapper below. This bootstrap script can run more than once in the same fish process (a
+# shell reload, or a nested fish subshell), and a user or plugin can define or replace
+# fish_should_add_to_history at any point, including between two of our sourcings -- so on every
+# run, re-derive the backup from whatever fish_should_add_to_history currently is, unless that's
+# already our own wrapper from a previous run (identified by the warp_run_external_ctrl_r_widget
+# sentinel in its body), in which case the existing backup -- the last real hook we captured, or
+# the accept-everything default if none ever existed -- is left alone. Backing up our own wrapper
+# as if it were the original would make every history check call itself.
+if functions -q fish_should_add_to_history
+  and not functions fish_should_add_to_history | string match --quiet -- '*warp_run_external_ctrl_r_widget*'
+  functions -q warp_original_fish_should_add_to_history; and functions -e warp_original_fish_should_add_to_history
+  functions -c fish_should_add_to_history warp_original_fish_should_add_to_history
+else if not functions -q warp_original_fish_should_add_to_history
+  function warp_original_fish_should_add_to_history
+    return 0
+  end
+end
+function fish_should_add_to_history
+  string match --quiet -- '*warp_run_external_ctrl_r_widget*' $argv[1]; and return 1
+  string match --quiet -- '*warp_run_external_ctrl_t_widget*' $argv[1]; and return 1
+  string match --quiet -- '*warp_run_external_alt_c_widget*' $argv[1]; and return 1
+  warp_original_fish_should_add_to_history $argv
+end
+
 function warp_bootstrapped
   set -l histfile_directory
   set histfile_directory "$XDG_DATA_HOME"
@@ -483,6 +692,23 @@ function warp_bootstrapped
   if [ "$fish_key_bindings" = "fish_vi_key_bindings" ]
       set vi_mode_enabled "1"
   end
+
+  set -l shell_plugins
+  set -g _WARP_EXTERNAL_CTRL_R_WIDGET ""
+  set -l warp_ctrl_r_widget (warp_external_ctrl_r_widget)
+  switch "$warp_ctrl_r_widget"
+    case 'fzf-history-widget' '_fzf_search_history'
+      if functions -q $warp_ctrl_r_widget
+        set -g _WARP_EXTERNAL_CTRL_R_WIDGET "$warp_ctrl_r_widget"
+        set -a shell_plugins fzf
+      end
+    case '_atuin_search'
+      if functions -q $warp_ctrl_r_widget
+        set -g _WARP_EXTERNAL_CTRL_R_WIDGET "$warp_ctrl_r_widget"
+        set -a shell_plugins atuin
+      end
+  end
+  set -l escaped_shell_plugins (warp_escape_json $shell_plugins)
 
   set -l kernel_name (uname)
   if test -n "$kernel_name"
@@ -513,7 +739,7 @@ function warp_bootstrapped
   # part of its builtins (e.g. "for", "while", etc.).
   set -l escaped_editor (warp_escape_json "$EDITOR")
   set -l escaped_shell_path (warp_escape_json (status fish-path))
-  set -l escaped_json "{\"hook\": \"Bootstrapped\", \"value\": {\"histfile\": \"$escaped_histfile\", \"shell\": \"fish\", \"home_dir\": \"$HOME\", \"path\": \"$PATH\", \"editor\": \"$escaped_editor\", \"abbreviations\": \"$escaped_abbr\", \"aliases\": \"$escaped_aliases\", \"function_names\": \"$function_names\", \"env_var_names\": \"$env_var_names\", \"builtins\": \"$escaped_builtins\", \"keywords\": \"\", \"shell_version\": \"$FISH_VERSION\", \"vi_mode_enabled\": \"$vi_mode_enabled\", \"os_category\": \"$os_category\", \"linux_distribution\": \"$linux_distribution\", \"wsl_name\": \"$WSL_DISTRO_NAME\", \"shell_path\": \"$escaped_shell_path\"}}"
+  set -l escaped_json "{\"hook\": \"Bootstrapped\", \"value\": {\"histfile\": \"$escaped_histfile\", \"session_id\": $WARP_SESSION_ID, \"shell\": \"fish\", \"home_dir\": \"$HOME\", \"path\": \"$PATH\", \"editor\": \"$escaped_editor\", \"abbreviations\": \"$escaped_abbr\", \"aliases\": \"$escaped_aliases\", \"function_names\": \"$function_names\", \"env_var_names\": \"$env_var_names\", \"builtins\": \"$escaped_builtins\", \"keywords\": \"\", \"shell_version\": \"$FISH_VERSION\", \"shell_plugins\": \"$escaped_shell_plugins\", \"vi_mode_enabled\": \"$vi_mode_enabled\", \"os_category\": \"$os_category\", \"linux_distribution\": \"$linux_distribution\", \"wsl_name\": \"$WSL_DISTRO_NAME\", \"shell_path\": \"$escaped_shell_path\"}}"
   warp_send_json_message $escaped_json
 end
 
@@ -529,18 +755,18 @@ end
 # Binding to ESC-1 caused bootstrap failures with vi keybindings.
 function warp_report_input
     set -l escaped_input (warp_escape_json (commandline))
-    warp_send_json_message "{ \"hook\": \"InputBuffer\", \"value\": { \"buffer\": \"$escaped_input\" } }"
+    warp_send_json_message "{ \"hook\": \"InputBuffer\", \"value\": { \"buffer\": \"$escaped_input\", \"session_id\": $WARP_SESSION_ID } }"
     # This prevents fish from rendering typeahead as background output once we've collected it.
     commandline ''
 end
 
 function clear
-    warp_send_json_message "{\"hook\": \"Clear\", \"value\": {}}"
+    warp_send_json_message "{\"hook\": \"Clear\", \"value\": {\"session_id\": $WARP_SESSION_ID}}"
 end
 
 function warp_finish_update
   set -l update_id "$argv[1]"
-  warp_send_json_message "{\"hook\": \"FinishUpdate\", \"value\": { \"update_id\": \"$update_id\"}}"
+  warp_send_json_message "{\"hook\": \"FinishUpdate\", \"value\": { \"update_id\": \"$update_id\", \"session_id\": $WARP_SESSION_ID}}"
 end
 
 
@@ -598,10 +824,57 @@ if test "$WARP_IS_LOCAL_SHELL_SESSION" = "1"
     function warp_ssh_helper
         set -l init_shell_zsh (warp_init_shell "zsh")
         set -l init_shell_bash (warp_init_shell "bash")
+        set -l remote_session_id (command od -An -N8 -tu8 /dev/urandom 2>/dev/null | command tr -d ' \n')
+        if test -z "$remote_session_id"; or test "$remote_session_id" = "0"
+            # If we cannot generate a non-zero random token, run plain SSH instead.
+            command ssh $argv
+            return
+        end
+
+        # If the user's SSH config sets a RemoteCommand for this destination,
+        # OpenSSH refuses to also run our bootstrap as a command-line remote
+        # command, aborting with "Cannot execute command-line and remote
+        # command." Warpification is structurally impossible there, so fall back
+        # to plain SSH. `ssh -G` prints `remotecommand none` when unset.
+        set -l user_remote_command (command ssh -G $argv 2>/dev/null | command sed -n 's/^remotecommand //p')
+        if test -n "$user_remote_command"; and test "$user_remote_command" != "none"
+            command ssh $argv
+            return
+        end
+
         # Hex-encode the ZSH environment script we use to bootstrap remote zsh b/c it contains control characters
         # We decode on the SSH server using xxd if its available, otherwise fall back to a for-loop over each byte
         # and use printf to convert back to plaintext
-        set -l zsh_env_script (printf '%s' 'unsetopt ZLE; unset RCS; unset GLOBAL_RCS; WARP_SESSION_ID="$(command -p date +%s)$RANDOM"; WARP_USING_WINDOWS_CON_PTY=@@USING_CON_PTY_BOOLEAN@@; WARP_HONOR_PS1='$WARP_HONOR_PS1'; _hostname=$(command -pv hostname >/dev/null 2>&1 && command -p hostname 2>/dev/null || uname -n); _user=$(command -pv whoami >/dev/null 2>&1 && command -p whoami 2>/dev/null || echo $USER); _msg=$(printf "{\"hook\": \"InitShell\", \"value\": {\"session_id\": $WARP_SESSION_ID, \"shell\": \"zsh\", \"user\": \"%s\", \"hostname\": \"%s\"}}" "$_user" "$_hostname" | command -p od -An -v -tx1 | command -p tr -d " \n"); printf '"'"'\x1b\x50\x24\x64%s\x9c'"'"' $_msg; unset _hostname _user _msg' | command od -An -v -tx1 | command tr -d ' \n')
+        set -l zsh_env_script (printf '%s' 'unsetopt ZLE RCS GLOBAL_RCS; WARP_SESSION_ID='$remote_session_id'; WARP_USING_WINDOWS_CON_PTY=@@USING_CON_PTY_BOOLEAN@@; WARP_HONOR_PS1='$WARP_HONOR_PS1'; _hostname=$(command -pv hostname >/dev/null 2>&1 && command -p hostname 2>/dev/null || uname -n); _user=$(command -pv whoami >/dev/null 2>&1 && command -p whoami 2>/dev/null || echo $USER); _msg=$(printf "{\"hook\": \"InitShell\", \"value\": {\"session_id\": $WARP_SESSION_ID, \"shell\": \"zsh\", \"user\": \"%s\", \"hostname\": \"%s\"}}" "$_user" "$_hostname" | command -p od -An -v -tx1 | command -p tr -d " \n"); printf '"'"'\x1b\x50\x24\x64%s\x1b\x5c'"'"' $_msg; unset _hostname _user _msg' | command od -An -v -tx1 | command tr -d ' \n')
+
+        # Optionally attach to an existing ControlMaster the user already
+        # runs for this destination instead of creating our own. Resolve
+        # the user's configured ControlPath with `ssh -G` (which expands
+        # tokens like %h/%p/%r/%C into a literal path), then verify the
+        # master is alive with `ssh -O check`. Both probes are local-only
+        # commands. On any failure we fall back to creating a Warp-owned
+        # master, preserving the existing behavior.
+        set -l control_path "$SSH_SOCKET_DIR/$WARP_SESSION_ID"
+        set -l control_master_mode "yes"
+        set -l external_control_master "false"
+        if test "$WARP_SSH_REUSE_CONTROL_MASTER" = "1"
+            set -l user_control_path (command ssh -G $argv 2>/dev/null | command sed -n 's/^controlpath //p')
+            # Skip when no ControlPath is configured, and reject resolved
+            # paths containing characters we cannot safely embed in the SSH
+            # hook JSON below (e.g. an unexpanded % token, quotes, or
+            # whitespace); in those cases fall back to a Warp-owned master.
+            if test -n "$user_control_path"
+                and test "$user_control_path" != "none"
+                and string match --quiet --regex '^[A-Za-z0-9._/~@:+,-]+$' -- "$user_control_path"
+                if command ssh -O check -o ControlPath="$user_control_path" $argv >/dev/null 2>&1
+                    # A live master exists: multiplex through it and let the
+                    # client know Warp does not own it.
+                    set control_path "$user_control_path"
+                    set control_master_mode "no"
+                    set external_control_master "true"
+                end
+            end
+        end
 
         # Note that in this command, we're passing a string to the remote shell. Any variable expansions need to be
         # escaped with "''" to avoid the local shell from expanding them before they're passed to the remote shell.
@@ -609,14 +882,14 @@ if test "$WARP_IS_LOCAL_SHELL_SESSION" = "1"
         # determine what shell is the login shell on the remote machine.  We perform a preliminary check to see if
         # the remote shell is the Bourne shell to avoid asking it to parse later lines that use syntax it doesn't
         # support.
-        command ssh -o ControlMaster=yes -o ControlPath=$SSH_SOCKET_DIR/$WARP_SESSION_ID \
+        command ssh -o ControlMaster=$control_master_mode -o ControlPath="$control_path" \
         -t $argv \
 "
 export TERM_PROGRAM='WarpTerminal'
 test -n '$WARP_CLIENT_VERSION' && export WARP_CLIENT_VERSION='$WARP_CLIENT_VERSION'
 # Only forward the protocol version if it was set locally (i.e. the HOANotifications feature flag is on).
 test -n '$WARP_CLI_AGENT_PROTOCOL_VERSION' && export WARP_CLI_AGENT_PROTOCOL_VERSION='$WARP_CLI_AGENT_PROTOCOL_VERSION'
-hook="'$(printf "{\"hook\": \"SSH\", \"value\": {\"socket_path\": \"'$SSH_SOCKET_DIR/$WARP_SESSION_ID'\", \"remote_shell\": \"%s\"}}" "${SHELL##*/}" | command od -An -v -tx1 | command tr -d " \n")'"
+hook="'$(printf "{\"hook\": \"SSH\", \"value\": {\"socket_path\": \"'$control_path'\", \"remote_shell\": \"%s\", \"session_id\": '"$WARP_SESSION_ID"', \"remote_session_id\": '"$remote_session_id"', \"external_control_master\": '"$external_control_master"'}}" "${SHELL##*/}" | command od -An -v -tx1 | command tr -d " \n")'"
 printf '$DCS_START$DCS_JSON_MARKER%s$DCS_END' "'$hook'"
 
 if test "'"${SHELL##*/}" != "bash" -a "${SHELL##*/}" != "zsh"'"; then
@@ -651,14 +924,14 @@ bash)
       stty raw
       HISTCONTROL=ignorespace
       HISTIGNORE=" *"
-      WARP_SESSION_ID="$(command -p date +%s)$RANDOM"
+      WARP_SESSION_ID='$remote_session_id'
       WARP_HONOR_PS1="'$WARP_HONOR_PS1'"
       _hostname=$(command -pv hostname >/dev/null 2>&1 && command -p hostname 2>/dev/null || uname -n)
       _user=$(command -pv whoami >/dev/null 2>&1 && command -p whoami 2>/dev/null || echo $USER)
       _msg=$(printf "{\"hook\": \"InitShell\", \"value\": {\"session_id\": $WARP_SESSION_ID, \"shell\": \"bash\", \"user\": \"%s\", \"hostname\": \"%s\"}}" "$_user" "$_hostname" | command -p od -An -v -tx1 | command -p tr -d " \n")'"
       WARP_USING_WINDOWS_CON_PTY=@@USING_CON_PTY_BOOLEAN@@
       if [[ "'$OS'" == Windows_NT ]]; then WARP_IN_MSYS2=true; else WARP_IN_MSYS2=false; fi
-      printf '\''"'\eP$d%s\x9c'"'\'' \""'$_msg'"\"'
+      printf '\''"'\x1b\x50\x24\x64%s\x1b\x5c'"'\'' \""'$_msg'"\"'
       unset _hostname _user _msg
     )
     ;;
@@ -683,7 +956,7 @@ esac
 
     function ssh
         if is_interactive_ssh_session $argv
-            warp_send_json_message '{"hook": "PreInteractiveSSHSession", "value": {}}'
+            warp_send_json_message "{\"hook\": \"PreInteractiveSSHSession\", \"value\": {\"session_id\": $WARP_SESSION_ID}}"
 
             if [ "$WARP_USE_SSH_WRAPPER" = "1" ]
                 if test $WARP_SHELL_DEBUG_MODE

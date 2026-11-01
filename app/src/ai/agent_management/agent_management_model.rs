@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 
 use warp_core::features::FeatureFlag;
-use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity, WindowId};
+use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity, ViewHandle, WindowId};
 
-use crate::settings::AISettings;
-
+use crate::BlocklistAIHistoryModel;
 use crate::ai::active_agent_views_model::{ActiveAgentViewsEvent, ActiveAgentViewsModel};
 use crate::ai::agent::conversation::{AIConversationId, ConversationStatus};
 use crate::ai::agent_management::notifications::{
@@ -12,16 +11,13 @@ use crate::ai::agent_management::notifications::{
     NotificationSourceAgent,
 };
 use crate::ai::artifacts::Artifact;
-use crate::ai::blocklist::BlocklistAIHistoryEvent;
-use crate::server::telemetry::TelemetryEvent;
+use crate::ai::blocklist::{BlocklistAIHistoryEvent, ConversationStatusUpdate, QueuedQueryModel};
 use crate::terminal::cli_agent_sessions::{
     CLIAgentSessionStatus, CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
 };
-use crate::terminal::CLIAgent;
+use crate::terminal::{CLIAgent, TerminalView};
 use crate::workspace::util::is_terminal_view_in_same_tab;
 use crate::workspace::{Workspace, WorkspaceRegistry};
-use crate::BlocklistAIHistoryModel;
-use warp_core::send_telemetry_from_ctx;
 
 /// Singleton model responsible for triggering in-app notifications on blocking conversation
 /// status updates and tracking/storing these notifications for the notifications mailbox.
@@ -43,17 +39,17 @@ impl SingletonEntity for AgentNotificationsModel {}
 impl AgentNotificationsModel {
     pub(crate) fn new(ctx: &mut ModelContext<Self>) -> Self {
         let history_model = BlocklistAIHistoryModel::handle(ctx);
-        ctx.subscribe_to_model(&history_model, move |me, event, ctx| {
+        ctx.subscribe_to_model(&history_model, move |me, _, event, ctx| {
             me.handle_history_event(event, ctx);
         });
 
         let cli_sessions_model = CLIAgentSessionsModel::handle(ctx);
-        ctx.subscribe_to_model(&cli_sessions_model, |me, event, ctx| {
+        ctx.subscribe_to_model(&cli_sessions_model, |me, _, event, ctx| {
             me.handle_cli_agent_session_event(event, ctx);
         });
 
         let active_views_model = ActiveAgentViewsModel::handle(ctx);
-        ctx.subscribe_to_model(&active_views_model, |me, event, ctx| {
+        ctx.subscribe_to_model(&active_views_model, |me, _, event, ctx| {
             me.handle_active_agent_views_changed(event, ctx);
         });
 
@@ -149,6 +145,7 @@ impl AgentNotificationsModel {
                 agent,
                 status,
                 session_context,
+                ..
             } => match status {
                 // When the agent resumes its work we can assume that the previous notification is stale.
                 CLIAgentSessionStatus::InProgress => {
@@ -165,31 +162,90 @@ impl AgentNotificationsModel {
                         CLIAgent::Codex => "Notification from Codex",
                         _ => "Task completed.",
                     };
+                    let metadata = TerminalViewMetadata::lookup(*terminal_view_id, ctx);
                     self.add_notification(
                         title,
                         message.to_owned(),
                         NotificationCategory::Complete,
-                        NotificationSourceAgent::CLI(*agent),
+                        NotificationSourceAgent::CLI {
+                            agent: *agent,
+                            is_ambient: metadata.is_ambient,
+                        },
                         NotificationOrigin::CLISession(*terminal_view_id),
                         *terminal_view_id,
                         vec![],
+                        metadata.branch,
                         ctx,
                     );
                 }
-                CLIAgentSessionStatus::Blocked { message } => {
+                CLIAgentSessionStatus::Failed {
+                    error_type,
+                    message,
+                } => {
+                    let title = session_context
+                        .display_title()
+                        .unwrap_or_else(|| format!("{} failed", agent.display_name()));
+                    let body = match (message.as_deref(), error_type.as_deref()) {
+                        (Some(msg), Some(kind)) => format!("{kind}: {msg}"),
+                        (Some(msg), None) => msg.to_owned(),
+                        (None, Some(kind)) => kind.to_owned(),
+                        (None, None) => "The agent encountered an error.".to_owned(),
+                    };
+                    let metadata = TerminalViewMetadata::lookup(*terminal_view_id, ctx);
+                    self.add_notification(
+                        title,
+                        body,
+                        NotificationCategory::Error,
+                        NotificationSourceAgent::CLI {
+                            agent: *agent,
+                            is_ambient: metadata.is_ambient,
+                        },
+                        NotificationOrigin::CLISession(*terminal_view_id),
+                        *terminal_view_id,
+                        vec![],
+                        metadata.branch,
+                        ctx,
+                    );
+                }
+                CLIAgentSessionStatus::Blocked { message, .. } => {
                     let title = session_context
                         .display_title()
                         .unwrap_or_else(|| format!("{} needs attention", agent.display_name()));
+                    let metadata = TerminalViewMetadata::lookup(*terminal_view_id, ctx);
                     self.add_notification(
                         title,
                         message
                             .clone()
                             .unwrap_or_else(|| "Waiting for input.".to_owned()),
                         NotificationCategory::Request,
-                        NotificationSourceAgent::CLI(*agent),
+                        NotificationSourceAgent::CLI {
+                            agent: *agent,
+                            is_ambient: metadata.is_ambient,
+                        },
                         NotificationOrigin::CLISession(*terminal_view_id),
                         *terminal_view_id,
                         vec![],
+                        metadata.branch,
+                        ctx,
+                    );
+                }
+                CLIAgentSessionStatus::Cancelled => {
+                    let title = session_context
+                        .display_title()
+                        .unwrap_or_else(|| format!("{} cancelled", agent.display_name()));
+                    let metadata = TerminalViewMetadata::lookup(*terminal_view_id, ctx);
+                    self.add_notification(
+                        title,
+                        "Cancelled by user.".to_owned(),
+                        NotificationCategory::Complete,
+                        NotificationSourceAgent::CLI {
+                            agent: *agent,
+                            is_ambient: metadata.is_ambient,
+                        },
+                        NotificationOrigin::CLISession(*terminal_view_id),
+                        *terminal_view_id,
+                        vec![],
+                        metadata.branch,
                         ctx,
                     );
                 }
@@ -237,10 +293,11 @@ impl AgentNotificationsModel {
         }
 
         let BlocklistAIHistoryEvent::UpdatedConversationStatus {
-            terminal_view_id,
+            terminal_surface_id,
             conversation_id,
             // We shouldn't trigger toasts when restoring conversations on startup.
-            is_restored: false,
+            update: ConversationStatusUpdate::Changed { .. },
+            ..
         } = event
         else {
             return;
@@ -262,7 +319,7 @@ impl AgentNotificationsModel {
                 &status,
                 *conversation_id,
                 latest_query,
-                *terminal_view_id,
+                *terminal_surface_id,
                 ctx,
             );
             // The new mailbox path handled the event — skip the legacy toast path below.
@@ -273,7 +330,7 @@ impl AgentNotificationsModel {
             return;
         }
 
-        if is_terminal_view_visible(*terminal_view_id, ctx) {
+        if is_terminal_view_visible(*terminal_surface_id, ctx) {
             return;
         }
 
@@ -286,7 +343,7 @@ impl AgentNotificationsModel {
         ctx.emit(AgentManagementEvent::ConversationNeedsAttention {
             window_id,
             tab_index,
-            terminal_view_id: *terminal_view_id,
+            terminal_view_id: *terminal_surface_id,
             conversation_id: *conversation_id,
         });
     }
@@ -310,22 +367,36 @@ impl AgentNotificationsModel {
         }
 
         let title = latest_query.unwrap_or_else(|| "Agent task".to_owned());
+        let metadata = TerminalViewMetadata::lookup(terminal_view_id, ctx);
+        let oz_agent = NotificationSourceAgent::Oz {
+            is_ambient: metadata.is_ambient,
+        };
 
         match status {
-            // When the agent resumes its work, clear stale notifications.
-            ConversationStatus::InProgress => {
+            // When the agent resumes its work (or is automatically recovering from a
+            // transient failure), clear stale notifications.
+            ConversationStatus::InProgress | ConversationStatus::TransientError => {
                 self.remove_notification_by_source(origin, ctx);
             }
             ConversationStatus::Success => {
+                // Suppress the completion notification when a queued follow-up prompt will
+                // auto-send as soon as this conversation finishes. The conversation isn't
+                // really in a stopped state, so the notification would be noisy. Pending
+                // artifacts are left intact so they roll into the notification fired when the
+                // conversation eventually finishes with an empty queue.
+                if QueuedQueryModel::as_ref(ctx).has_autofireable_prompt(conversation_id) {
+                    return;
+                }
                 let artifacts = self.flush_pending_artifacts(conversation_id);
                 self.add_notification(
                     title,
                     "Task completed.".to_owned(),
                     NotificationCategory::Complete,
-                    NotificationSourceAgent::Oz,
+                    oz_agent,
                     origin,
                     terminal_view_id,
                     artifacts,
+                    metadata.branch,
                     ctx,
                 );
             }
@@ -335,10 +406,11 @@ impl AgentNotificationsModel {
                     title,
                     "Task was cancelled.".to_owned(),
                     NotificationCategory::Complete,
-                    NotificationSourceAgent::Oz,
+                    oz_agent,
                     origin,
                     terminal_view_id,
                     artifacts,
+                    metadata.branch,
                     ctx,
                 );
             }
@@ -347,10 +419,11 @@ impl AgentNotificationsModel {
                     title,
                     blocked_action.clone(),
                     NotificationCategory::Request,
-                    NotificationSourceAgent::Oz,
+                    oz_agent,
                     origin,
                     terminal_view_id,
                     vec![],
+                    metadata.branch,
                     ctx,
                 );
             }
@@ -360,12 +433,19 @@ impl AgentNotificationsModel {
                     title,
                     "Something went wrong.".to_owned(),
                     NotificationCategory::Error,
-                    NotificationSourceAgent::Oz,
+                    oz_agent,
                     origin,
                     terminal_view_id,
                     artifacts,
+                    metadata.branch,
                     ctx,
                 );
+            }
+            // Yielded conversations are still active; mirror the
+            // InProgress arm and clear any stale notification for this
+            // origin.
+            ConversationStatus::WaitingForEvents => {
+                self.remove_notification_by_source(origin, ctx);
             }
         }
     }
@@ -401,14 +481,10 @@ impl AgentNotificationsModel {
         origin: NotificationOrigin,
         terminal_view_id: EntityId,
         artifacts: Vec<Artifact>,
+        branch: Option<String>,
         ctx: &mut ModelContext<Self>,
     ) {
-        if !*AISettings::as_ref(ctx).show_agent_notifications {
-            return;
-        }
-
         let is_visible = is_terminal_view_visible(terminal_view_id, ctx);
-        let branch = resolve_git_branch_for_terminal_view(terminal_view_id, ctx);
         let item = NotificationItem::new(
             title,
             message,
@@ -419,12 +495,6 @@ impl AgentNotificationsModel {
             terminal_view_id,
             artifacts,
             branch,
-        );
-        send_telemetry_from_ctx!(
-            TelemetryEvent::AgentNotificationShown {
-                agent_variant: agent.into(),
-            },
-            ctx
         );
 
         let id = item.id;
@@ -453,13 +523,22 @@ pub enum AgentManagementEvent {
 impl ConversationStatus {
     /// Returns true if the updating the conversation with this status should trigger some
     /// notification to the user.
+    ///
+    /// Exhaustive match so a new `ConversationStatus` variant forces a
+    /// deliberate decision about whether it should fire a notification.
     pub fn should_trigger_notification(&self) -> bool {
-        matches!(
-            self,
+        match self {
             ConversationStatus::Success
-                | ConversationStatus::Blocked { .. }
-                | ConversationStatus::Error
-        )
+            | ConversationStatus::Blocked { .. }
+            | ConversationStatus::Error => true,
+            // Streaming hasn't reached a notable state; a recovering or
+            // yielded conversation is still active; user-cancellations are
+            // self-evident.
+            ConversationStatus::InProgress
+            | ConversationStatus::TransientError
+            | ConversationStatus::WaitingForEvents
+            | ConversationStatus::Cancelled => false,
+        }
     }
 }
 
@@ -502,18 +581,42 @@ fn window_and_tab_idx_id_for_conversation(
         })
 }
 
-fn resolve_git_branch_for_terminal_view(
+/// Per-notification metadata derived from a single [`TerminalView`] lookup. Both fields
+/// are read on the same emit path, so we resolve the view once and pass the projection
+/// down rather than walking the workspace tree for each.
+struct TerminalViewMetadata {
+    is_ambient: bool,
+    branch: Option<String>,
+}
+
+impl TerminalViewMetadata {
+    fn lookup(terminal_view_id: EntityId, app: &AppContext) -> Self {
+        let Some(terminal_view) = find_terminal_view_by_id(terminal_view_id, app) else {
+            return Self {
+                is_ambient: false,
+                branch: None,
+            };
+        };
+        let view = terminal_view.as_ref(app);
+        Self {
+            is_ambient: view.is_ambient_agent_session(app),
+            branch: view.current_git_branch(app),
+        }
+    }
+}
+
+fn find_terminal_view_by_id(
     terminal_view_id: EntityId,
     app: &AppContext,
-) -> Option<String> {
+) -> Option<ViewHandle<TerminalView>> {
     for (_, workspace_handle) in WorkspaceRegistry::as_ref(app).all_workspaces(app) {
         for pane_group in workspace_handle.as_ref(app).tab_views() {
             let pane_group = pane_group.as_ref(app);
             for pane_id in pane_group.terminal_pane_ids() {
-                if let Some(terminal_view) = pane_group.terminal_view_from_pane_id(pane_id, app) {
-                    if terminal_view.id() == terminal_view_id {
-                        return terminal_view.as_ref(app).current_git_branch(app);
-                    }
+                if let Some(terminal_view) = pane_group.terminal_view_from_pane_id(pane_id, app)
+                    && terminal_view.id() == terminal_view_id
+                {
+                    return Some(terminal_view);
                 }
             }
         }

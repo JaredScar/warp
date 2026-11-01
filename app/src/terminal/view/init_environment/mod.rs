@@ -1,15 +1,5 @@
 pub mod mode_selector;
 
-use crate::ai::agent::icons::yellow_stop_icon;
-use crate::ai::blocklist::block::keyboard_navigable_buttons::{
-    simple_navigation_button, KeyboardNavigableButtons,
-};
-use crate::ai::blocklist::inline_action::inline_action_header::{
-    HeaderConfig, INLINE_ACTION_HEADER_VERTICAL_PADDING,
-};
-use crate::ai::blocklist::inline_action::inline_action_icons::cancelled_icon;
-use crate::ai::blocklist::inline_action::requested_action::RenderableAction;
-use crate::appearance::Appearance;
 use warpui::elements::{
     ChildView, Container, CornerRadius, CrossAxisAlignment, Flex, MouseStateHandle, ParentElement,
     Radius, Text,
@@ -17,6 +7,17 @@ use warpui::elements::{
 use warpui::{
     AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
 };
+
+use crate::ai::agent::icons::yellow_stop_icon;
+use crate::ai::blocklist::block::keyboard_navigable_buttons::{
+    KeyboardNavigableButtons, simple_navigation_button,
+};
+use crate::ai::blocklist::inline_action::inline_action_header::{
+    HeaderConfig, INLINE_ACTION_HEADER_VERTICAL_PADDING,
+};
+use crate::ai::blocklist::inline_action::inline_action_icons::cancelled_icon;
+use crate::ai::blocklist::inline_action::requested_action::RenderableAction;
+use crate::appearance::Appearance;
 
 const EXPLANATION_TEXT: &str = "Would you like to create an environment for this project so you can run cloud agents in it? The agent will guide you through choosing GitHub repos, configuring a Docker image, and specifying startup commands.";
 const NO_REPOS_HELP_TEXT: &str = "If you want to create an environment with repos, rerun this command and pass in file paths or GitHub links as arguments, e.g. \"/create-environment <filepath> <GitHub URL>\".";

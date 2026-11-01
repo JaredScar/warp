@@ -1,5 +1,8 @@
+pub mod iap;
+
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, future};
 
@@ -9,18 +12,19 @@ use async_stream::stream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::HeaderValue;
+pub use http::header::AUTHORIZATION;
 use http::header::HeaderName;
-pub use http::{HeaderMap, StatusCode, header::AUTHORIZATION};
+pub use http::{HeaderMap, StatusCode};
 use reqwest::IntoUrl;
 use reqwest_eventsource::RequestBuilderExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use warp_core::{
-    channel::{Channel, ChannelState},
-    execution_mode,
-    operating_system_info::OperatingSystemInfo,
-    report_error,
-};
+use warp_core::channel::{Channel, ChannelState};
+use warp_core::execution_mode;
+use warp_core::operating_system_info::OperatingSystemInfo;
+use warp_errors::report_error;
+
+use crate::iap::{IapTokenProvider, proxy_auth_header};
 
 pub mod headers {
     /// Custom Warp header indicating the version of the Warp app.
@@ -42,6 +46,12 @@ pub mod headers {
     /// Custom Warp header indicating the client role. We don't use the User-Agent header
     /// because it can't be set from WASM.
     pub(crate) const WARP_CLIENT_ID: &str = "X-Warp-Client-ID";
+
+    /// Custom Warp header carrying the client's current OTEL span context in W3C
+    /// `traceparent` wire format. It is deliberately distinct from the standard
+    /// `traceparent` header so the server links its request span to the client
+    /// span rather than reparenting the server span under the client trace.
+    pub(crate) const TRACE_LINK_HEADER: &str = "X-Warp-Traceparent";
 }
 
 /// The environment variable containing extra HTTP headers to attach to requests.
@@ -54,6 +64,9 @@ const EXTRA_HTTP_HEADERS_ENV_VAR: &str = "WARP_EXTRA_HTTP_HEADERS";
 /// run outside of a Tokio context.
 pub struct Client {
     wrapped: reqwest::Client,
+    include_warp_headers: bool,
+    #[cfg(target_family = "wasm")]
+    omit_credentials: bool,
 
     /// A callback that is executed before every request is sent with a cloned
     /// version of the outbound request.  If for some reason the request cannot be
@@ -62,6 +75,11 @@ pub struct Client {
 
     /// A callback that is executed on after each response is received.
     after_response_received: Option<ResponseHookFn>,
+
+    /// If set, provides IAP bearer tokens to attach as `Proxy-Authorization`
+    /// headers on outbound requests to the Warp staging server. Wired in by
+    /// the app layer on IAP-enabled builds (staging).
+    iap_token_provider: Option<Arc<dyn IapTokenProvider>>,
 }
 
 /// Type for 'hook' functions to be executed prior to sending a request. A reference to the
@@ -140,14 +158,23 @@ impl Client {
         Self::from_client_builder(builder).expect("should not fail to create client")
     }
 
+    /// Creates a pooled client without automatic Warp headers, IAP tokens, or browser credentials.
+    pub fn new_external() -> Self {
+        let mut client = Self::new();
+        client.include_warp_headers = false;
+        #[cfg(target_family = "wasm")]
+        {
+            client.omit_credentials = true;
+        }
+        client
+    }
+
     #[cfg(feature = "test-util")]
     pub fn new_for_test() -> Self {
         let client_builder = reqwest::ClientBuilder::new()
             // Don't load any SSL/TLS certificates, as doing so can be slow and we should
             // never be making real requests in tests.
-            .tls_built_in_native_certs(false)
-            .tls_built_in_root_certs(false)
-            .tls_built_in_webpki_certs(false)
+            .tls_certs_only([])
             // Disable proxy usage in tests, as loading system proxy configuration can be
             // slow.
             .no_proxy();
@@ -157,8 +184,12 @@ impl Client {
     pub fn from_client_builder(client_builder: reqwest::ClientBuilder) -> reqwest::Result<Self> {
         client_builder.build().map(|client| Self {
             wrapped: client,
+            include_warp_headers: true,
+            #[cfg(target_family = "wasm")]
+            omit_credentials: false,
             before_request_sent: None,
             after_response_received: None,
+            iap_token_provider: None,
         })
     }
 
@@ -170,11 +201,22 @@ impl Client {
         self.after_response_received = Some(hook_fn);
     }
 
+    pub fn set_iap_token_provider(&mut self, provider: Arc<dyn IapTokenProvider>) {
+        self.iap_token_provider = Some(provider);
+    }
+
     fn builder(
         &self,
         wrapped: reqwest::RequestBuilder,
         include_warp_headers: bool,
+        iap_token: Option<String>,
     ) -> RequestBuilder<'_> {
+        #[cfg(target_family = "wasm")]
+        let wrapped = if self.omit_credentials {
+            wrapped.fetch_credentials_omit()
+        } else {
+            wrapped
+        };
         let mut builder = RequestBuilder {
             wrapped,
             client: self,
@@ -182,46 +224,57 @@ impl Client {
             prevent_sleep_reason: None,
         };
 
-        if include_warp_headers {
+        if include_warp_headers && self.include_warp_headers {
             builder = Self::add_warp_http_headers(builder);
+        }
+
+        if let Some(token) = iap_token {
+            let (name, value) = proxy_auth_header(&token);
+            builder = builder.header(name, value);
         }
 
         builder
     }
 
     pub fn get<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
-        self.builder(
-            self.wrapped.get(url.clone()),
-            Self::include_warp_http_headers(url),
-        )
+        let include_warp_headers = Self::include_warp_http_headers(url.clone());
+        let iap_token = self.iap_token_for(url.clone());
+        self.builder(self.wrapped.get(url), include_warp_headers, iap_token)
     }
 
     pub fn post<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
-        self.builder(
-            self.wrapped.post(url.clone()),
-            Self::include_warp_http_headers(url),
-        )
-    }
-
-    pub fn patch<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
-        self.builder(
-            self.wrapped.patch(url.clone()),
-            Self::include_warp_http_headers(url),
-        )
+        let include_warp_headers = Self::include_warp_http_headers(url.clone());
+        let iap_token = self.iap_token_for(url.clone());
+        self.builder(self.wrapped.post(url), include_warp_headers, iap_token)
     }
 
     pub fn put<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
-        self.builder(
-            self.wrapped.put(url.clone()),
-            Self::include_warp_http_headers(url),
-        )
+        let include_warp_headers = Self::include_warp_http_headers(url.clone());
+        let iap_token = self.iap_token_for(url.clone());
+        self.builder(self.wrapped.put(url), include_warp_headers, iap_token)
+    }
+
+    pub fn patch<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
+        let include_warp_headers = Self::include_warp_http_headers(url.clone());
+        let iap_token = self.iap_token_for(url.clone());
+        self.builder(self.wrapped.patch(url), include_warp_headers, iap_token)
     }
 
     pub fn delete<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
-        self.builder(
-            self.wrapped.delete(url.clone()),
-            Self::include_warp_http_headers(url),
-        )
+        let include_warp_headers = Self::include_warp_http_headers(url.clone());
+        let iap_token = self.iap_token_for(url.clone());
+        self.builder(self.wrapped.delete(url), include_warp_headers, iap_token)
+    }
+
+    /// Returns the IAP bearer token to attach to a request targeting
+    /// `url`, scoped to the Warp server's origin.
+    fn iap_token_for<U: IntoUrl>(&self, url: U) -> Option<String> {
+        let provider = self.iap_token_provider.as_ref()?;
+        let url = url.into_url().ok()?;
+        if !is_warp_server_origin(&url) {
+            return None;
+        }
+        provider.cached_token()
     }
 
     /// Helper method to determine if the request should include warp-specific headers. The only case
@@ -322,10 +375,22 @@ impl Client {
             }
         }
 
+        // Forward the current trace context so the server can attach a span link
+        // back to this client (cloud-agent) span. Only present when a valid OTEL
+        // span context exists; omitted otherwise (e.g. non-cloud-agent or wasm).
+        if let Some(trace_link) = current_trace_link_header() {
+            builder = builder.header(headers::TRACE_LINK_HEADER, trace_link);
+        }
+
         builder
     }
 
     pub async fn execute(&self, request: Request) -> reqwest::Result<Response> {
+        self.execute_inner(request).await
+    }
+
+    /// Core request execution logic shared by all platforms.
+    async fn execute_inner(&self, request: Request) -> reqwest::Result<Response> {
         let Request {
             wrapped: request,
             serialized_payload,
@@ -356,6 +421,48 @@ impl Client {
 
         Ok(Response(result))
     }
+}
+
+fn is_warp_server_origin(url: &reqwest::Url) -> bool {
+    [
+        ChannelState::server_root_url(),
+        ChannelState::rtc_http_url(),
+    ]
+    .iter()
+    .filter_map(|candidate| reqwest::Url::parse(candidate.as_ref()).ok())
+    .any(|candidate| candidate.origin() == url.origin())
+}
+
+/// Returns the current OTEL span context formatted as a W3C `traceparent` value
+/// (`00-<trace-id>-<span-id>-<flags>`) for the [`headers::TRACE_LINK_HEADER`]
+/// header, or `None` when there is no valid active span context.
+///
+/// A valid span context only exists in processes where the OpenTelemetry
+/// subscriber is installed — i.e. cloud-agent processes (see
+/// `app/src/tracing/native.rs`). Everywhere else, and on wasm, this returns
+/// `None` so the header is omitted rather than sent empty or malformed.
+#[cfg(not(target_family = "wasm"))]
+fn current_trace_link_header() -> Option<String> {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    let context = tracing::Span::current().context();
+    let span = context.span();
+    let span_context = span.span_context();
+    if !span_context.is_valid() {
+        return None;
+    }
+    Some(format!(
+        "00-{}-{}-{:02x}",
+        span_context.trace_id(),
+        span_context.span_id(),
+        span_context.trace_flags().to_u8(),
+    ))
+}
+
+#[cfg(target_family = "wasm")]
+fn current_trace_link_header() -> Option<String> {
+    None
 }
 
 impl<'a> RequestBuilder<'a> {
@@ -555,6 +662,16 @@ impl<'a> RequestBuilder<'a> {
         }
     }
 
+    /// Attach a `multipart/form-data` body.
+    /// Not available on wasm because reqwest's multipart builder API is native-only.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn multipart(self, form: reqwest::multipart::Form) -> RequestBuilder<'a> {
+        Self {
+            wrapped: self.wrapped.multipart(form),
+            ..self
+        }
+    }
+
     /// Prevents the system from sleeping due to idle while this request is in progress.
     ///
     /// The provided reason will be used in user-visible logging, so make sure it is
@@ -567,12 +684,14 @@ impl<'a> RequestBuilder<'a> {
     }
 }
 
-/// An error returned from `Response::error_for_status` that includes response headers.
-/// This allows callers to inspect headers (like X-Warp-Error-Code) when handling errors.
+/// An error returned from `Response::error_for_status` that includes response metadata.
+/// This allows callers to inspect headers (like X-Warp-Error-Code) and the response body when
+/// handling errors.
 #[derive(Debug)]
 pub struct ResponseError {
     pub source: reqwest::Error,
-    pub headers: HeaderMap,
+    pub headers: Box<HeaderMap>,
+    pub body: Option<String>,
 }
 
 impl std::fmt::Display for ResponseError {
@@ -619,7 +738,28 @@ impl Response {
         let headers = self.0.headers().clone();
         match self.0.error_for_status() {
             Ok(response) => Ok(Self(response)),
-            Err(source) => Err(ResponseError { source, headers }),
+            Err(source) => Err(ResponseError {
+                source,
+                headers: Box::new(headers),
+                body: None,
+            }),
+        }
+    }
+
+    /// Checks the response status and returns an error if it's not successful.
+    /// Unlike `error_for_status`, this also reads and preserves the response body on errors.
+    pub async fn error_for_status_with_body(self) -> Result<Self, ResponseError> {
+        let headers = self.0.headers().clone();
+        match self.0.error_for_status_ref() {
+            Ok(_) => Ok(self),
+            Err(source) => {
+                let body = self.text().await.ok();
+                Err(ResponseError {
+                    source,
+                    headers: Box::new(headers),
+                    body,
+                })
+            }
         }
     }
 
@@ -629,7 +769,11 @@ impl Response {
         let headers = self.0.headers().clone();
         match self.0.error_for_status_ref() {
             Ok(response) => Ok(response),
-            Err(source) => Err(ResponseError { source, headers }),
+            Err(source) => Err(ResponseError {
+                source,
+                headers: Box::new(headers),
+                body: None,
+            }),
         }
     }
 
@@ -659,18 +803,20 @@ impl<'c> oauth2::AsyncHttpClient<'c> for Client {
     type Future = Pin<Box<dyn Future<Output = Result<oauth2::HttpResponse, Self::Error>> + 'c>>;
     #[cfg(not(target_arch = "wasm32"))]
     type Future =
-        Pin<Box<dyn Future<Output = Result<oauth2::HttpResponse, Self::Error>> + Send + Sync + 'c>>;
+        Pin<Box<dyn Future<Output = Result<oauth2::HttpResponse, Self::Error>> + Send + 'c>>;
 
     fn call(&'c self, request: oauth2::HttpRequest) -> Self::Future {
         Box::pin(async move {
-            let include_warp_headers = Self::include_warp_http_headers(request.uri().to_string());
+            let uri = request.uri().to_string();
+            let include_warp_headers = Self::include_warp_http_headers(uri.clone());
+            let iap_token = self.iap_token_for(uri);
             let builder = reqwest::RequestBuilder::from_parts(
                 self.wrapped.clone(),
                 request.try_into().map_err(Box::new)?,
             );
 
             let response = self
-                .builder(builder, include_warp_headers)
+                .builder(builder, include_warp_headers, iap_token)
                 .send()
                 .await
                 .map_err(Box::new)?;
@@ -693,3 +839,31 @@ impl<'c> oauth2::AsyncHttpClient<'c> for Client {
         })
     }
 }
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    #[test]
+    fn server_and_rtc_origins_match() {
+        // Derive the expected origins from `ChannelState` so the assertion holds
+        // regardless of which channel config the test build resolves to.
+        let server = reqwest::Url::parse(ChannelState::server_root_url().as_ref()).unwrap();
+        assert!(is_warp_server_origin(&server.join("/graphql/v2").unwrap()));
+
+        let rtc = reqwest::Url::parse(ChannelState::rtc_http_url().as_ref()).unwrap();
+        assert!(is_warp_server_origin(
+            &rtc.join("/api/v1/agent/events/stream").unwrap()
+        ));
+    }
+
+    #[test]
+    fn third_party_origin_does_not_match() {
+        let url = reqwest::Url::parse("https://evil.example.com/graphql/v2").unwrap();
+        assert!(!is_warp_server_origin(&url));
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "lib_tests.rs"]
+mod tests;

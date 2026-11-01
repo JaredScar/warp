@@ -1,47 +1,44 @@
-use itertools::Itertools;
-use warp_editor::editor::NavigationKey;
-use warpui::{
-    elements::{
-        ConstrainedBox, Container, DispatchEventResult, Element, Fill, Flex, ParentElement,
-        ScrollStateHandle, Scrollable, ScrollableElement, ScrollbarWidth, Shrinkable, Text,
-        UniformList, UniformListState, LEFT_PADDING as SCROLLABLE_LEFT_PADDING,
-    },
-    fonts::{Properties, Weight},
-    AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext, WeakViewHandle,
-};
-
-use crate::appearance::Appearance;
-use crate::util::bindings::CustomAction;
-use crate::voltron::{VoltronFeatureViewMeta, VoltronMetadata};
-use crate::workflows::WorkflowType;
-use crate::{
-    cloud_object::model::persistence::CloudModel, workspaces::user_workspaces::UserWorkspaces,
-};
-use crate::{editor::Event as EditorEvent, send_telemetry_from_ctx};
-use crate::{server::telemetry::TelemetryEvent, user_config::WarpConfig};
-use crate::{
-    themes::theme::{self, Blend, WarpTheme},
-    user_config::WarpConfigUpdateEvent,
-};
-use fuzzy_match::{match_indices_case_insensitive, FuzzyMatchResult};
 use std::collections::HashMap;
 use std::ops::Deref;
 #[cfg(feature = "local_fs")]
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use fuzzy_match::{FuzzyMatchResult, match_indices_case_insensitive};
+use itertools::Itertools;
 use warp_core::ui::builder::UiBuilder;
 use warp_core::ui::theme::color::internal_colors;
+use warp_editor::editor::NavigationKey;
 use warp_workflows::workflows as global_workflows;
 use warpui::accessibility::{AccessibilityContent, WarpA11yRole};
 use warpui::color::ColorU;
 use warpui::elements::{
-    Align, CrossAxisAlignment, EventHandler, Highlight, Hoverable, MainAxisSize, MouseStateHandle,
+    Align, ConstrainedBox, Container, CrossAxisAlignment, DispatchEventResult, Element,
+    EventHandler, Fill, Flex, Highlight, Hoverable, LEFT_PADDING as SCROLLABLE_LEFT_PADDING,
+    MainAxisSize, MouseStateHandle, ParentElement, ScrollStateHandle, Scrollable,
+    ScrollableElement, ScrollbarWidth, Shrinkable, Text, UniformList, UniformListState,
 };
+use warpui::fonts::{Properties, Weight};
 use warpui::keymap::FixedBinding;
 use warpui::text_layout::TextStyle;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
+use warpui::{
+    AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext, WeakViewHandle,
+};
 
-use super::{workflow::Workflow, WorkflowSource};
+use super::WorkflowSource;
+use super::workflow::Workflow;
+use crate::appearance::Appearance;
+use crate::cloud_object::model::persistence::CloudModel;
+use crate::editor::Event as EditorEvent;
+use crate::send_telemetry_from_ctx;
+use crate::server::telemetry::TelemetryEvent;
+use crate::themes::theme::{self, Blend, WarpTheme};
+use crate::user_config::{WarpConfig, WarpConfigUpdateEvent};
+use crate::util::bindings::CustomAction;
+use crate::voltron::{VoltronFeatureViewMeta, VoltronMetadata};
+use crate::workflows::WorkflowType;
+use crate::workspaces::user_workspaces::UserWorkspaces;
 
 const SCROLLBAR_WIDTH: ScrollbarWidth = ScrollbarWidth::Auto;
 const DESCRIPTION_MARGIN: f32 = 24.;
@@ -498,7 +495,7 @@ impl CategoriesView {
         let user_workspaces = UserWorkspaces::as_ref(ctx);
         let cloud_model = CloudModel::as_ref(ctx);
 
-        for space in user_workspaces.all_user_spaces(ctx) {
+        for space in user_workspaces.spaces_for_window(ctx.window_id(), ctx) {
             let workflows_in_space = cloud_model.active_workflows_in_space(space, ctx);
             let new_workflows_in_space = Self::categorize_workflows(
                 // Don't include AI workflows in Voltron.
@@ -516,7 +513,7 @@ impl CategoriesView {
         ctx.notify();
     }
 
-    /// Given an iterator of a Vector workflows, constructs a `Vector` of `Worklow` and
+    /// Given an iterator of a Vector workflows, constructs a `Vector` of `Workflow` and
     /// `WorkflowSource` pairs.
     fn create_workflow_source_pair<'a>(
         workflows: impl IntoIterator<Item = &'a Vec<Arc<WorkflowType>>>,
@@ -571,8 +568,9 @@ impl CategoriesView {
                 })
                 .unwrap_or_default(),
             WorkflowViewType::Team => {
-                // TODO: this only assumes one team
-                let team_uid = UserWorkspaces::as_ref(ctx).current_team_uid();
+                let team_uid = UserWorkspaces::as_ref(ctx)
+                    .team_for_view(ctx)
+                    .map(|team| team.uid);
                 if let Some(team_uid) = team_uid {
                     self.workflows_by_source
                         .get(&WorkflowSource::Team { team_uid })
@@ -1298,5 +1296,5 @@ impl VoltronFeatureViewMeta for CategoriesView {
 }
 
 #[cfg(test)]
-#[path = "categories_test.rs"]
+#[path = "categories_tests.rs"]
 mod tests;

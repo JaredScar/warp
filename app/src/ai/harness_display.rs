@@ -6,19 +6,22 @@
 
 use pathfinder_color::ColorU;
 use warp_cli::agent::Harness;
+use warp_core::ui::theme::color::internal_colors;
+use warp_core::ui::theme::{Fill as WarpThemeFill, WarpTheme};
 
 use crate::ai::agent::conversation::AIAgentHarness;
 use crate::ai::blocklist::CLAUDE_ORANGE;
-use crate::terminal::cli_agent::{GEMINI_BLUE, OPENAI_COLOR};
+use crate::terminal::cli_agent::{GEMINI_BLUE, OPENAI_COLOR, OPENCODE_COLOR};
 use crate::ui_components::icons::Icon;
 
 /// User-visible display name for a [`Harness`].
 pub fn display_name(harness: Harness) -> &'static str {
     match harness {
-        Harness::Oz => "Warp",
+        Harness::Oz => "Warp Agent",
         Harness::Claude => "Claude Code",
         Harness::OpenCode => "OpenCode",
         Harness::Gemini => "Gemini CLI",
+        Harness::Pi => "Pi",
         Harness::Codex => "Codex",
         Harness::Unknown => "Unknown",
     }
@@ -27,11 +30,12 @@ pub fn display_name(harness: Harness) -> &'static str {
 /// Leading icon for a [`Harness`].
 pub fn icon_for(harness: Harness) -> Icon {
     match harness {
-        Harness::Oz => Icon::Warp,
+        Harness::Oz => Icon::Agent,
         Harness::Claude => Icon::ClaudeLogo,
         Harness::OpenCode => Icon::OpenCodeLogo,
         Harness::Gemini => Icon::GeminiLogo,
         Harness::Codex => Icon::OpenAILogo,
+        Harness::Pi => Icon::Agent,
         Harness::Unknown => Icon::HelpCircle,
     }
 }
@@ -45,7 +49,33 @@ pub fn brand_color(harness: Harness) -> Option<ColorU> {
         Harness::OpenCode => None,
         Harness::Gemini => Some(GEMINI_BLUE),
         Harness::Codex => Some(OPENAI_COLOR),
-        Harness::Unknown => None,
+        Harness::Pi | Harness::Unknown => None,
+    }
+}
+
+/// Circle background fill for a [`Harness`] icon rendered in a branded circle.
+/// Matches the treatment used in the vertical-tabs sidebar.
+pub fn circle_background(harness: Harness, theme: &WarpTheme) -> WarpThemeFill {
+    match harness {
+        Harness::Oz => theme.background(),
+        Harness::Claude => WarpThemeFill::Solid(CLAUDE_ORANGE),
+        Harness::Codex => WarpThemeFill::Solid(OPENAI_COLOR),
+        Harness::Gemini => WarpThemeFill::Solid(GEMINI_BLUE),
+        Harness::OpenCode => WarpThemeFill::Solid(OPENCODE_COLOR),
+        Harness::Pi | Harness::Unknown => internal_colors::fg_overlay_2(theme),
+    }
+}
+
+/// Icon fill color when rendered on the branded circle background.
+pub fn icon_fill_on_circle(harness: Harness, theme: &WarpTheme) -> WarpThemeFill {
+    match harness {
+        Harness::Oz => theme.main_text_color(theme.background()),
+        Harness::Claude | Harness::Codex | Harness::Gemini | Harness::OpenCode => {
+            WarpThemeFill::Solid(ColorU::white())
+        }
+        Harness::Pi | Harness::Unknown => {
+            theme.main_text_color(internal_colors::fg_overlay_2(theme))
+        }
     }
 }
 
@@ -57,6 +87,7 @@ impl From<AIAgentHarness> for Harness {
             AIAgentHarness::Oz => Harness::Oz,
             AIAgentHarness::ClaudeCode => Harness::Claude,
             AIAgentHarness::Gemini => Harness::Gemini,
+            AIAgentHarness::Pi => Harness::Pi,
             AIAgentHarness::Codex => Harness::Codex,
             AIAgentHarness::Unknown => Harness::Unknown,
         }

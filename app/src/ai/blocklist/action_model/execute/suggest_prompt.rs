@@ -1,18 +1,16 @@
-use futures::{channel::oneshot, future::BoxFuture, FutureExt};
+use futures::FutureExt;
+use futures::channel::oneshot;
+use futures::future::BoxFuture;
 use warp_core::features::FeatureFlag;
 use warpui::{Entity, ModelContext};
 
-use crate::{
-    ai::{
-        agent::{
-            conversation::AIConversationId, AIAgentAction, AIAgentActionId, AIAgentActionType,
-            SuggestPromptRequest, SuggestPromptResult,
-        },
-        blocklist::action_model::execute::{
-            ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput,
-        },
-    },
-    AIAgentActionResultType,
+use crate::AIAgentActionResultType;
+use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent::{
+    AIAgentAction, AIAgentActionId, AIAgentActionType, SuggestPromptRequest, SuggestPromptResult,
+};
+use crate::ai::blocklist::action_model::execute::{
+    ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput,
 };
 
 pub struct PromptSuggestionExecutor {
@@ -44,7 +42,7 @@ impl PromptSuggestionExecutor {
         &mut self,
         input: ExecuteActionInput,
         ctx: &mut ModelContext<Self>,
-    ) -> impl Into<AnyActionExecution> {
+    ) -> impl Into<AnyActionExecution> + use<> {
         let AIAgentAction {
             action: AIAgentActionType::SuggestPrompt(request),
             ..
@@ -53,15 +51,15 @@ impl PromptSuggestionExecutor {
             return ActionExecution::InvalidAction;
         };
 
-        if FeatureFlag::PromptSuggestionsViaMAA.is_enabled() {
-            if let SuggestPromptRequest::PromptSuggestion { prompt, label } = request {
-                ctx.emit(PromptSuggestionExecutorEvent::NewPromptSuggestion {
-                    prompt: prompt.clone(),
-                    label: label.clone(),
-                    conversation_id: input.conversation_id,
-                    action_id: input.action.id.clone(),
-                });
-            }
+        if FeatureFlag::PromptSuggestionsViaMAA.is_enabled()
+            && let SuggestPromptRequest::PromptSuggestion { prompt, label } = request
+        {
+            ctx.emit(PromptSuggestionExecutorEvent::NewPromptSuggestion {
+                prompt: prompt.clone(),
+                label: label.clone(),
+                conversation_id: input.conversation_id,
+                action_id: input.action.id.clone(),
+            });
         }
 
         let (result_tx, result_rx) = oneshot::channel();

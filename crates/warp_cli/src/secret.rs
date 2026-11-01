@@ -1,4 +1,5 @@
-use std::{fmt, path::PathBuf};
+use std::fmt;
+use std::path::PathBuf;
 
 use clap::{Args, Subcommand, ValueEnum};
 
@@ -9,7 +10,9 @@ use crate::scope::ObjectScope;
 pub enum SecretCommand {
     /// Create a new secret.
     ///
-    /// Use `oz secret create anthropic api-key <NAME>` to create a Claude/Anthropic auth secret.
+    /// Use `oz secret create claude api-key <NAME>` to create a Claude/Anthropic auth secret,
+    /// `oz secret create codex api-key <NAME>` to create a Codex/OpenAI auth secret, or
+    /// `oz secret create docker-registry <NAME>` to create a private image credential.
     Create(CreateSecretArgs),
     /// Delete a secret.
     Delete(DeleteSecretArgs),
@@ -20,6 +23,17 @@ pub enum SecretCommand {
     Update(UpdateSecretArgs),
     /// List secrets.
     List(ListSecretsArgs),
+}
+
+impl SecretCommand {
+    pub(crate) fn as_str_for_tracing(&self) -> &'static str {
+        match self {
+            SecretCommand::Create(_) => "secret create",
+            SecretCommand::Delete(_) => "secret delete",
+            SecretCommand::Update(_) => "secret update",
+            SecretCommand::List(_) => "secret list",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -51,7 +65,13 @@ pub struct CreateSecretArgs {
 #[derive(Debug, Clone, Subcommand)]
 pub enum CreateProvider {
     /// Create a Claude/Anthropic auth secret.
+    #[command(name = "claude")]
     Anthropic(AnthropicCreateArgs),
+    /// Create a Codex/OpenAI auth secret.
+    Codex(CodexCreateArgs),
+    /// Create a private image credential secret.
+    #[command(name = "docker-registry")]
+    DockerRegistry(DockerRegistryCreateArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -113,6 +133,37 @@ pub struct BedrockApiKeyArgs {
     pub region: Option<String>,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct CodexCreateArgs {
+    #[command(subcommand)]
+    pub method: CodexMethod,
+}
+
+/// Codex credential type.
+#[derive(Debug, Clone, Subcommand)]
+pub enum CodexMethod {
+    /// Direct OpenAI API key.
+    #[command(name = "api-key")]
+    ApiKey(OpenAiApiKeyArgs),
+}
+
+/// Arguments for creating an OpenAI API key secret used by the Codex harness.
+#[derive(Debug, Clone, Args)]
+pub struct OpenAiApiKeyArgs {
+    #[clap(flatten)]
+    pub common: CommonSecretCreateArgs,
+
+    #[clap(flatten)]
+    pub value: ValueArgs,
+
+    /// Optional base URL for the OpenAI API (e.g. a regional endpoint like
+    /// `https://us.api.openai.com/v1`). When omitted in interactive mode the
+    /// CLI prompts for it; pressing Enter at the prompt skips it. When omitted
+    /// in non-interactive mode the harness uses the provider's default endpoint.
+    #[arg(long = "base-url")]
+    pub base_url: Option<String>,
+}
+
 /// Arguments for creating an Anthropic Bedrock access key secret.
 #[derive(Debug, Clone, Args)]
 pub struct BedrockAccessKeyArgs {
@@ -134,6 +185,35 @@ pub struct BedrockAccessKeyArgs {
     /// AWS region for the Bedrock endpoint. If not provided, prompts interactively.
     #[arg(long = "region")]
     pub region: Option<String>,
+}
+
+/// Arguments for creating a private image credential secret.
+#[derive(Debug, Clone, Args)]
+pub struct DockerRegistryCreateArgs {
+    #[clap(flatten)]
+    pub common: CommonSecretCreateArgs,
+
+    /// Bare registry hostname, no scheme or path (e.g. ghcr.io). If not provided, prompts
+    /// interactively.
+    #[arg(long = "host")]
+    pub host: Option<String>,
+
+    /// Registry username. If not provided, prompts interactively.
+    #[arg(long = "username")]
+    pub username: Option<String>,
+
+    /// Registry password or access token. If not provided, prompts interactively.
+    ///
+    /// Prefer `--password-file` in non-interactive/scripted contexts: passing the password
+    /// directly on the command line can leak it via shell history or process listings (e.g.
+    /// `ps`).
+    #[arg(long = "password", conflicts_with = "password_file")]
+    pub password: Option<String>,
+
+    /// File to read the registry password or access token from. Avoids exposing the value via
+    /// shell history or process listings the way `--password` can.
+    #[arg(long = "password-file")]
+    pub password_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -170,7 +250,8 @@ pub struct UpdateSecretArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct ListSecretsArgs {
-    // TODO: consider flags to filter secrets.
+    #[clap(flatten)]
+    pub scope: ObjectScope,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -190,6 +271,9 @@ pub enum SecretType {
     // Not exposed via the CLI `--type` flag; constructed internally for provider subcommands.
     #[value(skip)]
     AnthropicBedrockApiKey,
+    // Not exposed via the CLI `--type` flag; constructed internally for provider subcommands.
+    #[value(skip)]
+    OpenaiApiKey,
 }
 
 impl fmt::Display for SecretType {
@@ -198,6 +282,11 @@ impl fmt::Display for SecretType {
             SecretType::RawValue => write!(f, "raw-value"),
             SecretType::AnthropicApiKey => write!(f, "anthropic-api-key"),
             SecretType::AnthropicBedrockApiKey => write!(f, "anthropic-bedrock-api-key"),
+            SecretType::OpenaiApiKey => write!(f, "openai-api-key"),
         }
     }
 }
+
+#[cfg(test)]
+#[path = "secret_tests.rs"]
+mod tests;

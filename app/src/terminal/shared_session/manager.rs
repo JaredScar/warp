@@ -2,15 +2,13 @@ use std::collections::HashMap;
 
 use itertools::Itertools;
 use session_sharing_protocol::common::SessionId;
-
 use warpui::{
     AppContext, Entity, EntityId, ModelContext, SingletonEntity, ViewHandle, WeakViewHandle,
     WindowId,
 };
 
+use super::{SharedSessionActionSource, SharedSessionStatus};
 use crate::terminal::TerminalView;
-
-use super::SharedSessionActionSource;
 
 struct SharedSessionState {
     session_id: SessionId,
@@ -63,6 +61,37 @@ impl Manager {
         self.ended_session_ids.get(terminal_view_id).copied()
     }
 
+    /// Returns the session id that may currently be exposed as a link for the given terminal view.
+    /// Active session ids always take precedence. Ended ids are eligible only after the terminal
+    /// has actually left its active or pending sharing state.
+    pub fn session_id_for_link(
+        &self,
+        terminal_view_id: &EntityId,
+        shared_session_status: &SharedSessionStatus,
+    ) -> Option<SessionId> {
+        self.session_id(terminal_view_id)
+            .or_else(|| match shared_session_status {
+                SharedSessionStatus::NotShared | SharedSessionStatus::FinishedViewer => {
+                    self.ended_session_id(terminal_view_id)
+                }
+                SharedSessionStatus::ViewPending
+                | SharedSessionStatus::ActiveViewer { .. }
+                | SharedSessionStatus::SharePendingPreBootstrap { .. }
+                | SharedSessionStatus::SharePending
+                | SharedSessionStatus::ActiveSharer => None,
+            })
+    }
+
+    /// Returns true iff the Manager has a session id that may currently be exposed as a link.
+    pub fn has_session_link(
+        &self,
+        terminal_view_id: &EntityId,
+        shared_session_status: &SharedSessionStatus,
+    ) -> bool {
+        self.session_id_for_link(terminal_view_id, shared_session_status)
+            .is_some()
+    }
+
     /// Returns the view handle to the shared terminal view, identified by `terminal_view_id`, if it's being shared.
     pub fn shared_view_by_id(
         &self,
@@ -72,6 +101,25 @@ impl Manager {
         let weak_handle = self
             .shared
             .get(terminal_view_id)
+            .map(|state| state.view_handle.clone())?;
+
+        let view_handle = weak_handle.upgrade(ctx);
+        if view_handle.is_none() {
+            log::warn!("Failed to upgrade a terminal view in the shared session manager");
+        }
+
+        view_handle
+    }
+
+    pub fn shared_view_by_session_id(
+        &self,
+        session_id: &SessionId,
+        ctx: &AppContext,
+    ) -> Option<ViewHandle<TerminalView>> {
+        let weak_handle = self
+            .shared
+            .values()
+            .find(|state| state.session_id == *session_id)
             .map(|state| state.view_handle.clone())?;
 
         let view_handle = weak_handle.upgrade(ctx);

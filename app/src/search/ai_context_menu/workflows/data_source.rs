@@ -1,12 +1,14 @@
+use fuzzy_match::FuzzyMatchResult;
+use warpui::{AppContext, SingletonEntity};
+
 use super::search_item::WorkflowSearchItem;
-use crate::cloud_object::model::persistence::CloudModel;
 use crate::cloud_object::CloudModelType;
+use crate::cloud_object::model::persistence::CloudModel;
 use crate::search::ai_context_menu::mixer::AIContextMenuSearchableAction;
+use crate::search::ai_context_menu::safe_truncate;
 use crate::search::data_source::{Query, QueryResult};
 use crate::search::mixer::{DataSourceRunErrorWrapper, SyncDataSource};
 use crate::workspaces::user_workspaces::UserWorkspaces;
-use fuzzy_match::FuzzyMatchResult;
-use warpui::{AppContext, SingletonEntity};
 
 const MAX_RESULTS: usize = 50;
 /// Base score for zero-state results. Each item gets an additional bonus based on
@@ -65,7 +67,12 @@ impl SyncDataSource for WorkflowDataSource {
                 None
             } else {
                 Some(if content_preview.len() > 200 {
-                    format!("{}...", &content_preview[..197])
+                    // Truncate at a valid UTF-8 char boundary to avoid panicking when a
+                    // multi-byte character straddles the byte-197 cut point.
+                    let mut truncated = content_preview;
+                    safe_truncate(&mut truncated, 197);
+                    truncated.push_str("...");
+                    truncated
                 } else {
                     content_preview
                 })

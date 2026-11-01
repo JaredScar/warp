@@ -1,18 +1,15 @@
-use crate::{
-    appearance::Appearance,
-    editor::{EditorOptions, EditorView, Event as EditorEvent, TextOptions},
-};
+use warpui::elements::{Container, CornerRadius, Dismiss, MouseStateHandle, Radius};
+use warpui::fonts::Weight;
+use warpui::platform::Cursor;
+use warpui::ui_components::button::ButtonVariant;
+use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::{
-    elements::{Container, CornerRadius, Dismiss, MouseStateHandle, Radius},
-    fonts::Weight,
-    platform::Cursor,
-    ui_components::{
-        button::ButtonVariant,
-        components::{UiComponent, UiComponentStyles},
-    },
     AppContext, Element, Entity, FocusContext, SingletonEntity, TypedActionView, View, ViewContext,
     ViewHandle,
 };
+
+use crate::appearance::Appearance;
+use crate::editor::{EditorOptions, EditorView, Event as EditorEvent, TextOptions};
 
 /// This View is a text that can be hovered over. Upon clicking,
 /// the text becomes a text input that can be submitted
@@ -56,7 +53,7 @@ impl ClickableTextInput {
         let content = self
             .editor
             .read(ctx, |editor, ctx| editor.buffer_text(ctx).trim().to_owned());
-        if !content.is_empty() {
+        if !content.is_empty() && content != self.text {
             ctx.emit(ClickableTextInputEvent::Submit(content));
         }
         self.show_text_as_hoverable = true;
@@ -92,7 +89,7 @@ impl View for ClickableTextInput {
             appearance
                 .ui_builder()
                 .button(ButtonVariant::Text, self.text_button_mouse_handle.clone())
-                .with_centered_text_label(self.text.clone())
+                .with_text_label(self.text.clone())
                 .with_style(UiComponentStyles {
                     font_color: Some(appearance.theme().active_ui_text_color().into()),
                     font_weight: Some(Weight::Bold),
@@ -166,7 +163,8 @@ impl TypedActionView for ClickableTextInput {
             ClickableTextInputAction::ShowEditor => {
                 self.show_text_as_hoverable = false;
                 self.editor.update(ctx, |editor, ctx| {
-                    editor.clear_buffer(ctx);
+                    editor.system_reset_buffer_text(&self.text, ctx);
+                    editor.select_all(ctx);
                 });
                 ctx.focus(&self.editor);
                 ctx.notify();

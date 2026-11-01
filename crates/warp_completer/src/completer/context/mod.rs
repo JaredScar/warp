@@ -1,10 +1,3 @@
-cfg_if::cfg_if! {
-    if #[cfg(feature = "v2")] {
-        mod v2;
-        pub use v2::*;
-    }
-}
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -14,11 +7,11 @@ use smol_str::SmolStr;
 use typed_path::{TypedPath, TypedPathBuf};
 use warp_core::command::ExitCode;
 use warp_util::path::{EscapeChar, ShellFamily};
-use warpui::platform::OperatingSystem;
-
-use crate::{completer::TopLevelCommandCaseSensitivity, signatures::CommandRegistry};
+use warpui_core::platform::OperatingSystem;
 
 use super::engine::EngineDirEntry;
+use crate::completer::TopLevelCommandCaseSensitivity;
+use crate::signatures::CommandRegistry;
 
 /// This trait may be implemented to configure behavior of the completions engine.
 pub trait CompletionContext: Send + Sync {
@@ -51,12 +44,6 @@ pub trait CompletionContext: Send + Sync {
                 EscapeChar::Backslash
             }
         }
-    }
-
-    #[cfg(feature = "v2")]
-    /// If JS execution is supported, should return an instance of `JsExecutionContext`.
-    fn js_context(&self) -> Option<&dyn JsExecutionContext> {
-        None
     }
 
     /// Returns top-level commands to be suggested when completing on an empty buffer.
@@ -163,6 +150,11 @@ pub trait PathCompletionContext: Send + Sync {
     ///
     /// This is used to expand '~' and '$HOME' in user input.
     fn home_directory(&self) -> Option<&str>;
+
+    /// `CDPATH`/`cdpath` from the shell, colon-separated. Used to extend `cd` argument completions.
+    fn cdpath(&self) -> Option<&str> {
+        None
+    }
 
     fn shell_family(&self) -> ShellFamily;
 

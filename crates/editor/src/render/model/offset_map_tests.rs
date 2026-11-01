@@ -1,6 +1,7 @@
+use string_offset::CharOffset;
+
 use super::{OffsetMap, SelectableTextRun};
 use crate::render::model::FrameOffset;
-use string_offset::CharOffset;
 
 #[test]
 fn test_offset_map_basic() {
@@ -76,29 +77,23 @@ fn test_offset_map_placeholders() {
 fn test_end_to_end() {
     // Group imports here so they don't cause "unused import" warnings on other targets.
 
-    use warpui::{
-        App, color::ColorU, elements::Fill, fonts::Cache as FontCache, text_layout::LayoutCache,
-    };
+    use warpui_core::App;
+    use warpui_core::color::ColorU;
+    use warpui_core::elements::Fill;
+    use warpui_core::fonts::Cache as FontCache;
 
-    use crate::{
-        content::{
-            buffer::{Buffer, BufferEditAction, EditOrigin},
-            selection_model::BufferSelectionModel,
-            text::IndentBehavior,
-        },
-        render::{
-            layout::TextLayout,
-            model::{
-                BlockItem, BrokenLinkStyle, CheckBoxStyle, HorizontalRuleStyle, InlineCodeStyle,
-                PARAGRAPH_MIN_HEIGHT, ParagraphStyles, RenderLayoutOptions, RichTextStyles,
-                TableStyle, test_utils::TEST_BASELINE_OFFSET,
-            },
-        },
+    use crate::content::buffer::{Buffer, BufferEditAction, EditOrigin};
+    use crate::content::selection_model::BufferSelectionModel;
+    use crate::content::text::IndentBehavior;
+    use crate::render::layout::TextLayout;
+    use crate::render::model::test_utils::TEST_BASELINE_OFFSET;
+    use crate::render::model::{
+        BlockItem, BrokenLinkStyle, CheckBoxStyle, HorizontalRuleStyle, InlineCodeStyle,
+        PARAGRAPH_MIN_HEIGHT, ParagraphStyles, RenderLayoutOptions, RichTextStyles, TableStyle,
     };
 
     App::test((), |mut app| async move {
         let mut font_cache = FontCache::new(Box::new(warpui::platform::current::FontDB::new()));
-        let layout_cache = LayoutCache::new();
         let paragraph_styles = ParagraphStyles {
             font_family: font_cache
                 .load_system_font("Arial")
@@ -205,16 +200,11 @@ fn test_end_to_end() {
         // Now, lay out the buffer, which should produce a single `Paragraph` block.
         let layout = app.read(|ctx| {
             let delta = buffer_handle.as_ref(ctx).invalidate_layout();
-            let text_layout = TextLayout::new(
-                &layout_cache,
-                font_cache.text_layout_system(),
-                &styles,
-                1000.,
-            );
+            let text_layout = TextLayout::new(font_cache.text_layout_system(), &styles, 1000.);
             delta.layout_delta(
                 &text_layout,
                 None,
-                RenderLayoutOptions::default(),
+                &RenderLayoutOptions::default(),
                 None,
                 ctx,
             )

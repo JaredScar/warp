@@ -1,40 +1,33 @@
+use std::collections::HashMap;
+use std::collections::hash_map::{Entry, OccupiedEntry};
 #[cfg(feature = "local_fs")]
 use std::io::ErrorKind;
-use std::{
-    collections::{
-        hash_map::{Entry, OccupiedEntry},
-        HashMap,
-    },
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "local_fs")]
 use aho_corasick::{AhoCorasick, MatchKind};
 #[cfg(feature = "local_fs")]
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 #[cfg(feature = "local_fs")]
 use futures::AsyncWriteExt;
 use warp_util::path::ShellFamily;
-use warpui::{
-    platform::{file_picker::FilePickerError, FilePickerConfiguration, OperatingSystem},
-    r#async::SpawnedFutureHandle,
-    AppContext, Entity, ModelContext, SingletonEntity, WindowId,
-};
+use warpui::r#async::SpawnedFutureHandle;
+use warpui::platform::file_picker::FilePickerError;
+use warpui::platform::{FilePickerConfiguration, OperatingSystem};
+use warpui::{AppContext, Entity, ModelContext, SingletonEntity, WindowId};
 
-use crate::{
-    cloud_object::{model::persistence::CloudModel, Space},
-    safe_warn,
-    view_components::DismissibleToast,
-    workspace::{active_terminal_in_window, ToastStack},
-};
+use super::CloudObjectTypeAndId;
+use crate::cloud_object::Space;
+use crate::cloud_object::model::persistence::CloudModel;
+use crate::safe_warn;
+use crate::view_components::DismissibleToast;
+use crate::workspace::{ToastStack, active_terminal_in_window};
 #[cfg(feature = "local_fs")]
 use crate::{
     notebooks::export_notebook, server::cloud_objects::update_manager::get_duplicate_object_name,
     view_components::ToastLink, workflows::export_workflow::export_serialize,
     workspace::WorkspaceAction,
 };
-
-use super::CloudObjectTypeAndId;
 
 /// Singleton model for exporting from Warp Drive.
 pub struct ExportManager {
@@ -508,7 +501,7 @@ async fn write_object(
             }
             Err(err) => {
                 return Err(anyhow::Error::new(err)
-                    .context(format!("could not create {}", current_path.display())))
+                    .context(format!("could not create {}", current_path.display())));
             }
         }
     }

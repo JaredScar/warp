@@ -1,47 +1,39 @@
-use markdown_parser::markdown_parser::RUNNABLE_BLOCK_MARKDOWN_LANG;
 use markdown_parser::CodeBlockText;
+use markdown_parser::markdown_parser::RUNNABLE_BLOCK_MARKDOWN_LANG;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
 use warp_core::ui::builder::AnimatedButtonOptions;
 use warpui::clipboard::ClipboardContent;
-use warpui::elements::{DispatchEventResult, Stack};
-use warpui::units::Pixels;
+use warpui::elements::{
+    Align, Border, ChildAnchor, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
+    Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, EventHandler, Fill, Flex,
+    FormattedTextElement, HyperlinkUrl, Icon, MainAxisAlignment, MainAxisSize, MouseStateHandle,
+    ParentAnchor, ParentElement, Radius, SavePosition, ScrollbarWidth, Shrinkable, Stack, Text,
+    Wrap,
+};
+use warpui::keymap::Keystroke;
+use warpui::platform::Cursor;
+use warpui::ui_components::components::{UiComponent, UiComponentStyles};
+use warpui::units::{IntoPixels, Pixels};
 use warpui::{
-    elements::{
-        Align, Border, ChildAnchor, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
-        Container, CornerRadius, CrossAxisAlignment, EventHandler, Fill, Flex,
-        FormattedTextElement, HyperlinkUrl, Icon, MainAxisAlignment, MainAxisSize,
-        MouseStateHandle, ParentAnchor, ParentElement, Radius, SavePosition, ScrollbarWidth,
-        Shrinkable, Text, Wrap,
-    },
-    keymap::Keystroke,
-    platform::Cursor,
-    ui_components::components::{UiComponent, UiComponentStyles},
-    units::IntoPixels,
-    AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
-    WeakViewHandle,
+    AppContext, BlurContext, Element, Entity, FocusContext, ModelHandle, SingletonEntity,
+    TypedActionView, View, ViewContext, WeakViewHandle,
 };
-use warpui::{BlurContext, FocusContext};
 
+use super::AI_ASSISTANT_SVG_PATH;
+use super::panel::{HEADER_HEIGHT, HEXAGON_ALERT_SVG_PATH};
+use super::requests::{RequestStatus, Requests};
+use super::utils::{
+    AssistantTranscriptPart, CodeBlockIndex, FormattedTranscriptMessage, MarkdownSegment,
+    TranscriptPartSubType, code_block_position_id, markdown_segments_from_text,
+    render_prepared_response_button, render_request_limit_info, save_as_workflow_position_id,
+};
+use crate::ai::AIRequestUsageModel;
+use crate::appearance::Appearance;
+use crate::send_telemetry_from_ctx;
+use crate::server::telemetry::{SaveAsWorkflowModalSource, TelemetryEvent, WarpAIActionType};
+use crate::ui_components::blended_colors;
 use crate::workspaces::user_workspaces::UserWorkspaces;
-use crate::{
-    appearance::Appearance,
-    send_telemetry_from_ctx,
-    server::telemetry::{SaveAsWorkflowModalSource, TelemetryEvent, WarpAIActionType},
-    ui_components::blended_colors,
-};
-
-use super::panel::HEADER_HEIGHT;
-use super::{
-    panel::HEXAGON_ALERT_SVG_PATH,
-    requests::{RequestStatus, Requests},
-    utils::{
-        code_block_position_id, markdown_segments_from_text, render_prepared_response_button,
-        render_request_limit_info, save_as_workflow_position_id, AssistantTranscriptPart,
-        CodeBlockIndex, FormattedTranscriptMessage, MarkdownSegment, TranscriptPartSubType,
-    },
-    AI_ASSISTANT_SVG_PATH,
-};
 
 const TRANSCRIPT_POSITION_ID: &str = "ai_assistant::transcript";
 
@@ -825,7 +817,9 @@ impl View for Transcript {
         let theme = appearance.theme();
         let transcript = self.requests_model.as_ref(app).transcript();
         let request_status = self.requests_model.as_ref(app).request_status();
-        let num_remaining_reqs = self.requests_model.as_ref(app).num_remaining_reqs();
+        let user_workspaces = UserWorkspaces::as_ref(app);
+        let scope = user_workspaces.team_context(&self.view_handle, app);
+        let has_ai_available = AIRequestUsageModel::as_ref(app).has_any_ai_remaining(&scope, app);
 
         let mut blocks = Flex::column();
         for (index, part) in transcript.iter().enumerate() {
@@ -859,7 +853,7 @@ impl View for Transcript {
         if !transcript.is_empty() && matches!(request_status, RequestStatus::NotInFlight) {
             // Only show the prepared responses if the last response wasn't an error
             // and the user still has remaining requests.
-            if !transcript.last().is_none_or(|p| p.assistant.is_error) && num_remaining_reqs > 0 {
+            if !transcript.last().is_none_or(|p| p.assistant.is_error) && has_ai_available {
                 blocks.add_child(
                     Container::new(self.render_prepared_responses(appearance))
                         .with_margin_top(15.)
@@ -867,9 +861,9 @@ impl View for Transcript {
                 );
             }
 
-            let is_custom_llm_enabled: bool = UserWorkspaces::as_ref(app)
-                .current_team()
-                .is_some_and(|team| team.is_custom_llm_enabled());
+            let is_custom_llm_enabled = user_workspaces.is_custom_llm_enabled_for_team(
+                user_workspaces.team_for_view_handle(&self.view_handle, app),
+            );
 
             if !is_custom_llm_enabled {
                 blocks.add_child(

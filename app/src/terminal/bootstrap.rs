@@ -1,31 +1,31 @@
-use std::borrow::Cow;
-
 use itertools::Itertools;
-use lazy_static::lazy_static;
-use memo_map::MemoMap;
-use warpui::{AppContext, AssetProvider, SingletonEntity};
-
-use crate::{
-    env_vars::EnvVar,
-    terminal::{session_settings::SessionSettings, shell::ShellType},
+use warp_core::session_id::SessionId;
+use warp_terminal::bootstrap::SESSION_ID_PLACEHOLDER;
+pub use warp_terminal::bootstrap::{
+    generate_session_id, init_shell_script_for_shell, load_and_escape_script, script_for_shell,
 };
+use warpui::{AppContext, AssetProvider, SingletonEntity};
 
 #[cfg(feature = "local_fs")]
 use super::{
     model::session::{BootstrapSessionType, SessionInfo},
     warpify::settings::{PIPENV_SUBSHELL_COMMAND_REGEX, POETRY_SUBSHELL_COMMAND_REGEX},
 };
+use crate::env_vars::{EnvVar, EnvVarExt};
+use crate::terminal::session_settings::SessionSettings;
+use crate::terminal::shell::ShellType;
 
-lazy_static! {
-    /// A memoized cache of the fully-interpolated boostrap script for each
-    /// shell.  We store the full version here as an optimization so that we
-    /// don't have to regenerate it every time we spawn a shell.
-    static ref BOOTSTRAP_CACHE: MemoMap<ShellType, Vec<u8>> = Default::default();
+#[cfg(feature = "local_fs")]
+pub fn is_container_subshell(session_info: &SessionInfo) -> bool {
+    session_info.subshell_info.as_ref().is_some_and(|info| {
+        let first_token = info
+            .spawning_command
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or("");
+        first_token == "docker" || first_token == "podman"
+    })
 }
-
-/// This can sometimes appear in the beginning of files. If it gets written into the PTY, it causes
-/// errors
-const BYTE_ORDER_MARK: &str = "\u{FEFF}";
 
 /// Returns `true` if Warp should use an RC-file based bootstrap (e.g. dump the bootstrap script to
 /// a temp file and `source` it) for a newly spawned session with the given `shell_type`, and
@@ -57,6 +57,12 @@ pub fn should_use_rc_file_bootstrap_method(
 ) -> bool {
     use super::ShellLaunchData;
 
+    // Container subshells cannot access host temp files, so the RC-file
+    // method is never viable for them.
+    if is_container_subshell(session_info) {
+        return false;
+    }
+
     let session_type = &session_info.session_type;
     match session_type {
         BootstrapSessionType::Local => {
@@ -85,122 +91,6 @@ pub fn should_use_rc_file_bootstrap_method(
     }
 }
 
-/// Returns the bootstrap script that should be used when initializing a shell
-/// of the given type.
-///
-/// This supports a very basic form of interpolation:
-///
-/// ```shell
-/// #include bundled/bootstrap/zsh_body.sh
-/// ```
-///
-/// The directive above instructs this function to replace that line with the
-/// contents of the file in our asset cache with the path `bundled/bootstrap/zsh_body.sh`.
-///
-/// At the moment, this interpolation is only performed for the top-level file,
-/// and is not performed recursively, but it would be useful to add such support
-/// in the future.
-pub fn script_for_shell(shell_type: ShellType, assets: &dyn AssetProvider) -> Cow<'static, [u8]> {
-    let file = match shell_type {
-        ShellType::Bash => "bash.sh",
-        ShellType::Zsh => "zsh.sh",
-        ShellType::Fish => "fish.sh",
-        ShellType::PowerShell => "pwsh.ps1",
-    };
-
-    BOOTSTRAP_CACHE
-        .get_or_insert(&shell_type, || {
-            let file_path = format!("bundled/bootstrap/{file}");
-            let bootstrap = assets
-                .get(&file_path)
-                .unwrap_or_else(|_| panic!("failed to retrieve {file_path} from assets"));
-
-            // Interpret the file as UTF-8.  We do this in an unchecked way
-            // for performance, expecting that any issues here will be caught by
-            // unit tests.
-            let bootstrap = unsafe { String::from_utf8_unchecked(bootstrap.to_vec()) };
-
-            let additional_files = memo_map::MemoMap::new();
-
-            // Parse through the file, looking for any lines which start with
-            // "#include", and replacing that line with the contents of the file
-            // located at the path specified.
-            //
-            // We trim most leading and all trailing whitespace from lines, and
-            // drop all empty lines and lines that only contain a comment.  We
-            // keep a single leading space on each line, if one exists, to
-            // avoid interfering with histignorespace behavior.
-            //
-            // This minimizes the number of bytes we send over the pty during the
-            // bootstrap process.
-            fn trim_and_borrow_line(mut line: &str) -> Cow<'_, str> {
-                let len = line.len();
-                let trimmed_len = line.trim_start().len();
-                if trimmed_len < len {
-                    let trimmed_chars = len - trimmed_len;
-                    line = &line[trimmed_chars - 1..];
-                }
-                Cow::Borrowed(line.trim_end())
-            }
-            let mut script = bootstrap
-                .trim_start_matches(BYTE_ORDER_MARK)
-                .split('\n')
-                .map(trim_and_borrow_line)
-                .flat_map(|line| {
-                    if let Some(path) = line.strip_prefix("#include ") {
-                        additional_files
-                            .get_or_insert(path, || {
-                                let data = assets.get(path).unwrap_or_else(|_| {
-                                    panic!("failed to retrieve {path} from assets")
-                                });
-                                let data_string =
-                                    unsafe { String::from_utf8_unchecked(data.to_vec()) };
-                                data_string.replace(
-                                    "@@USING_CON_PTY_BOOLEAN@@",
-                                    &(cfg!(windows).to_string()),
-                                )
-                            })
-                            .split('\n')
-                            .map(trim_and_borrow_line)
-                            .collect_vec()
-                    } else {
-                        vec![line]
-                    }
-                })
-                // Filter out empty lines and comments, to minimize the amount
-                // of data we send over the pty during the bootstrap process.
-                .filter(|line| {
-                    let line = line.trim_start();
-                    !(line.is_empty()
-                        || line.starts_with('#')
-                        || shell_type == ShellType::PowerShell
-                            && line
-                                .starts_with("[Diagnostics.CodeAnalysis.SuppressMessageAttribute"))
-                })
-                .join("\n");
-
-            // Make sure there's a newline at the end of the bootstrap script,
-            // otherwise we'll never submit the final line to the shell.
-            script.push('\n');
-            script.into_bytes()
-        })
-        .into()
-}
-
-/// Returns the init shell script for the given `shell_type` (e.g. the script that emits the
-/// InitShell DCS hook).
-///
-/// The returned script is one line and, for shells that need it, has escaped single-quotes for the
-/// purposes of being passed as a single-quoted argument to 'eval'.
-pub fn init_shell_script_for_shell(shell_type: ShellType, assets: &dyn AssetProvider) -> String {
-    match shell_type {
-        ShellType::Zsh => load_and_escape_script("bundled/bootstrap/zsh_init_shell.sh", assets),
-        ShellType::Bash => load_and_escape_script("bundled/bootstrap/bash_init_shell.sh", assets),
-        ShellType::Fish => load_and_escape_script("bundled/bootstrap/fish_init_shell.sh", assets),
-        ShellType::PowerShell => load_script("bundled/bootstrap/pwsh_init_shell.ps1", assets),
-    }
-}
-
 /// Returns the command to be used to emit the InitShell hook for a new subshell session.
 ///
 /// If `shell_type` is `Some()`, returns a shell type-specific command (e.g. valid command for
@@ -209,15 +99,16 @@ pub fn init_shell_script_for_shell(shell_type: ShellType, assets: &dyn AssetProv
 pub fn init_subshell_command(
     shell_type: Option<ShellType>,
     vars: &[EnvVar],
+    session_id: SessionId,
     ctx: &AppContext,
 ) -> String {
     match shell_type {
         Some(shell_type) => {
             let subshell_script =
-                init_subshell_script_for_shell(shell_type, &crate::ASSETS, vars, ctx);
+                init_subshell_script_for_shell(shell_type, &crate::ASSETS, vars, session_id, ctx);
             format!(r#" [ -z $WARP_BOOTSTRAPPED ] && eval '{subshell_script}'"#)
         }
-        None => init_subshell_script_for_unknown_shell(&crate::ASSETS),
+        None => init_subshell_script_for_unknown_shell(&crate::ASSETS, session_id),
     }
 }
 
@@ -230,6 +121,7 @@ fn init_subshell_script_for_shell(
     shell_type: ShellType,
     assets: &dyn AssetProvider,
     env_vars: &[EnvVar],
+    session_id: SessionId,
     ctx: &AppContext,
 ) -> String {
     let honor_ps1 = *SessionSettings::as_ref(ctx).honor_ps1;
@@ -258,6 +150,8 @@ fn init_subshell_script_for_shell(
         // TODO(PLAT-750)
         ShellType::PowerShell => todo!(),
     };
+    let shell_init_script =
+        shell_init_script.replace(SESSION_ID_PLACEHOLDER, &session_id.as_u64().to_string());
 
     // Combine the environment setup script with the shell-specific init script
     format!("{env_setup_script} {shell_init_script}")
@@ -267,61 +161,12 @@ fn init_subshell_script_for_shell(
 ///
 /// The returned script is one line and has escaped single-quotes for the purposes of being passed
 /// as a single-quoted argument to 'eval'.
-fn init_subshell_script_for_unknown_shell(assets: &dyn AssetProvider) -> String {
+fn init_subshell_script_for_unknown_shell(
+    assets: &dyn AssetProvider,
+    session_id: SessionId,
+) -> String {
     // Load and escape the shell-specific init script
     load_and_escape_script("bundled/bootstrap/unknown_init_subshell.sh", assets)
         .replace("HOOK_NAME", "InitSubshell")
+        .replace(SESSION_ID_PLACEHOLDER, &session_id.as_u64().to_string())
 }
-
-/// Returns the raw init shell script for the given `shell_type`, without
-/// single-quote escaping. Suitable for passing as an environment variable
-/// where the caller controls the eval context (e.g. Docker sandbox init).
-///
-/// Gated on `unix` because the sole caller today is the Unix Docker
-/// sandbox spawn path (`local_tty::unix::prepare_docker_sandbox`); on
-/// Windows/wasm the function is dead code.
-#[cfg(unix)]
-pub fn raw_init_shell_script_for_shell(
-    shell_type: ShellType,
-    assets: &dyn AssetProvider,
-) -> String {
-    let file = match shell_type {
-        ShellType::Bash => "bundled/bootstrap/bash_init_shell.sh",
-        ShellType::Zsh => "bundled/bootstrap/zsh_init_shell.sh",
-        ShellType::Fish => "bundled/bootstrap/fish_init_shell.sh",
-        ShellType::PowerShell => "bundled/bootstrap/pwsh_init_shell.ps1",
-    };
-    load_script(file, assets).replace("@@USING_CON_PTY_BOOLEAN@@", &(cfg!(windows).to_string()))
-}
-
-/// Returns the script in the file at `file_path` to be passed as a single-quoted argument in the
-/// shell (e.g. as a single quoted argument to `eval`).
-///
-/// The script is transformed in two ways:
-///   * Newlines are stripped and replaced with semi-colons
-///   * Single quotes are escaped (' is replaced with '"'"')
-///   * Lines starting with '#' are removed -- this enables use of comments in scripts. Note,
-///   however, that you still cannot use a 'partial line' comment, since this logic only considers
-///   whole lines.
-fn load_and_escape_script(file_path: &str, assets: &dyn AssetProvider) -> String {
-    load_script(file_path, assets)
-        .replace('\'', r#"'"'"'"#)
-        .replace("@@USING_CON_PTY_BOOLEAN@@", &(cfg!(windows).to_string()))
-}
-
-fn load_script(file_path: &str, assets: &dyn AssetProvider) -> String {
-    let script_bytes = assets
-        .get(file_path)
-        .unwrap_or_else(|_| panic!("Failed to retrieve {file_path} from assets"));
-
-    std::str::from_utf8(&script_bytes)
-        .expect("InitShell script should be utf8 encoded.")
-        .trim_start_matches(BYTE_ORDER_MARK)
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
-        .join(";")
-}
-
-#[cfg(test)]
-#[path = "bootstrap_test.rs"]
-mod tests;

@@ -1,35 +1,58 @@
-use std::{any::Any, marker::PhantomData, rc::Rc, sync::Arc};
+#[cfg(feature = "tui")]
+mod tui;
+
+use std::any::Any;
+use std::marker::PhantomData;
+use std::rc::Rc;
+use std::sync::Arc;
 
 use futures::future::{AbortHandle, Abortable};
 use futures::{Future, FutureExt};
-use pathfinder_geometry::rect::RectF;
 use thiserror::Error;
+use warp_errors::report_error;
 
-use crate::modals::{AlertDialogWithCallbacks, ModalButton, ViewModalCallback};
-use crate::platform::{
-    file_picker::{FilePickerConfiguration, FilePickerError},
-    Cursor, SaveFilePickerConfiguration, TerminationMode,
+use super::handle::{
+    AnyViewHandle, ReadView, UpdateView, ViewAsRef, ViewHandle, ViewUpdateError, WeakViewHandle,
 };
-use crate::r#async::SpawnableOutput;
+use super::{TypedActionView, View};
+use crate::accessibility::AccessibilityContent;
+use crate::r#async::executor::{Background, Foreground};
+use crate::r#async::{BoxFuture, SpawnableOutput, SpawnedFutureHandle, SpawnedLocalStream};
+use crate::core::{Observation, Subscription, SubscriptionKey, TaskCallback};
+use crate::fonts::Cache as FontCache;
+use crate::modals::{AlertDialogWithCallbacks, ModalButton, ViewModalCallback};
+use crate::notification::{NotificationSendError, RequestPermissionsOutcome, UserNotification};
+use crate::platform::file_picker::{FilePickerConfiguration, FilePickerError};
+use crate::platform::{Cursor, SaveFilePickerConfiguration, TerminationMode};
 use crate::windowing::WindowManager;
 use crate::{
-    accessibility::AccessibilityContent,
-    core::{Observation, Subscription, SubscriptionKey, TaskCallback},
-    fonts::Cache as FontCache,
-    notification::{NotificationSendError, RequestPermissionsOutcome, UserNotification},
-    r#async::{
-        executor::{Background, Foreground},
-        SpawnedFutureHandle, SpawnedLocalStream,
-    },
-    Action, AppContext, Effect, Entity, EntityId, ModelAsRef, ModelContext, ModelHandle,
-    UpdateModel, WindowId,
+    Action, AppContext, Effect, Entity, EntityId, GetSingletonModelHandle, ModelAsRef,
+    ModelContext, ModelHandle, ReadModel, UpdateModel, WindowId,
 };
-use crate::{GetSingletonModelHandle, ReadModel};
 
-use super::{
-    handle::{AnyViewHandle, ReadView, UpdateView, ViewAsRef, ViewHandle, WeakViewHandle},
-    TypedActionView, View,
-};
+impl<'a, T: View> ViewContext<'a, T> {
+    /// The layout-position cache is only populated by the GUI presenter; in
+    /// TUI mode this method returns `None` because there is no presenter.
+    pub fn element_position_by_id<S>(&self, id: S) -> Option<pathfinder_geometry::rect::RectF>
+    where
+        S: AsRef<str>,
+    {
+        let presenter = self.app.presenter(self.window_id);
+
+        if let Some(presenter) = presenter {
+            let borrowed_presenter = presenter.borrow();
+            borrowed_presenter.position_cache().get_position(id)
+        } else {
+            None
+        }
+    }
+}
+
+/// Callback that receives the output of a resolved future spawned from a [`ViewContext`].
+type SpawnResolveCallback<T, O> = Box<dyn FnOnce(&mut T, O, &mut ViewContext<T>)>;
+
+/// Callback that runs when a future spawned from a [`ViewContext`] is aborted.
+type SpawnAbortCallback<T> = Box<dyn FnOnce(&mut T, &mut ViewContext<T>)>;
 
 /// Structure that combines view identifiers and a handle to the application
 /// context/application state.
@@ -40,7 +63,7 @@ pub struct ViewContext<'a, T: ?Sized> {
     view_type: PhantomData<T>,
 }
 
-impl<'a, T: View> ViewContext<'a, T> {
+impl<'a, T: Entity> ViewContext<'a, T> {
     pub(in crate::core) fn new(
         app: &'a mut AppContext,
         window_id: WindowId,
@@ -102,21 +125,7 @@ impl<'a, T: View> ViewContext<'a, T> {
             .check_view_or_child_focused(self.window_id, &self.view_id)
     }
 
-    pub fn element_position_by_id<S>(&self, id: S) -> Option<RectF>
-    where
-        S: AsRef<str>,
-    {
-        let presenter = self.app.presenter(self.window_id);
-
-        if let Some(presenter) = presenter {
-            let borrowed_presenter = presenter.borrow();
-            borrowed_presenter.position_cache().get_position(id)
-        } else {
-            None
-        }
-    }
-
-    pub fn focus<S: View>(&mut self, handle: &ViewHandle<S>) {
+    pub fn focus<S: Entity>(&mut self, handle: &ViewHandle<S>) {
         let handle: AnyViewHandle = handle.into();
         self.app.pending_effects.push_back(Effect::Focus {
             window_id: handle.window_id(self.app),
@@ -192,7 +201,7 @@ impl<'a, T: View> ViewContext<'a, T> {
 
     pub fn subscribe_to_view<V, F>(&mut self, handle: &ViewHandle<V>, mut callback: F)
     where
-        V: View,
+        V: Entity,
         V::Event: 'static,
         F: 'static + FnMut(&mut T, ViewHandle<V>, &V::Event, &mut ViewContext<T>),
     {
@@ -224,30 +233,30 @@ impl<'a, T: View> ViewContext<'a, T> {
         let target_entity = handle.id();
 
         // If we're currently emitting events for this entity, defer the unsubscribe.
-        if let Some(ref mut pending) = self.app.pending_unsubscribes {
-            if pending.entity_id == target_entity {
-                pending
-                    .keys
-                    .insert(SubscriptionKey::View(self.window_id, self.view_id));
+        if let Some(ref mut pending) = self.app.pending_unsubscribes
+            && pending.entity_id == target_entity
+        {
+            pending
+                .keys
+                .insert(SubscriptionKey::View(self.window_id, self.view_id));
 
-                // Remove subscriptions created earlier in this emission so subscribe-then-unsubscribe ordering is preserved.
-                if let std::collections::hash_map::Entry::Occupied(mut entry) =
-                    self.app.subscriptions.entry(target_entity)
-                {
-                    entry.get_mut().retain(|subscription| match subscription {
-                        Subscription::FromModel { .. } | Subscription::FromApp { .. } => true,
-                        Subscription::FromView {
-                            window_id, view_id, ..
-                        } => *window_id != self.window_id || *view_id != self.view_id,
-                    });
+            // Remove subscriptions created earlier in this emission so subscribe-then-unsubscribe ordering is preserved.
+            if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.app.subscriptions.entry(target_entity)
+            {
+                entry.get_mut().retain(|subscription| match subscription {
+                    Subscription::FromModel { .. } | Subscription::FromApp { .. } => true,
+                    Subscription::FromView {
+                        window_id, view_id, ..
+                    } => *window_id != self.window_id || *view_id != self.view_id,
+                });
 
-                    if entry.get().is_empty() {
-                        entry.remove();
-                    }
+                if entry.get().is_empty() {
+                    entry.remove();
                 }
-
-                return;
             }
+
+            return;
         }
 
         // Otherwise process immediately.
@@ -271,30 +280,30 @@ impl<'a, T: View> ViewContext<'a, T> {
         let target_entity = handle.id();
 
         // If we're currently emitting events for this entity, defer the unsubscribe.
-        if let Some(ref mut pending) = self.app.pending_unsubscribes {
-            if pending.entity_id == target_entity {
-                pending
-                    .keys
-                    .insert(SubscriptionKey::View(self.window_id, self.view_id));
+        if let Some(ref mut pending) = self.app.pending_unsubscribes
+            && pending.entity_id == target_entity
+        {
+            pending
+                .keys
+                .insert(SubscriptionKey::View(self.window_id, self.view_id));
 
-                // Remove subscriptions created earlier in this emission so subscribe-then-unsubscribe ordering is preserved.
-                if let std::collections::hash_map::Entry::Occupied(mut entry) =
-                    self.app.subscriptions.entry(target_entity)
-                {
-                    entry.get_mut().retain(|subscription| match subscription {
-                        Subscription::FromModel { .. } | Subscription::FromApp { .. } => true,
-                        Subscription::FromView {
-                            window_id, view_id, ..
-                        } => *window_id != self.window_id || *view_id != self.view_id,
-                    });
+            // Remove subscriptions created earlier in this emission so subscribe-then-unsubscribe ordering is preserved.
+            if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.app.subscriptions.entry(target_entity)
+            {
+                entry.get_mut().retain(|subscription| match subscription {
+                    Subscription::FromModel { .. } | Subscription::FromApp { .. } => true,
+                    Subscription::FromView {
+                        window_id, view_id, ..
+                    } => *window_id != self.window_id || *view_id != self.view_id,
+                });
 
-                    if entry.get().is_empty() {
-                        entry.remove();
-                    }
+                if entry.get().is_empty() {
+                    entry.remove();
                 }
-
-                return;
             }
+
+            return;
         }
 
         // Otherwise process immediately.
@@ -314,9 +323,9 @@ impl<'a, T: View> ViewContext<'a, T> {
     pub fn open_file_picker(
         &mut self,
         callback: impl FnOnce(Result<Vec<String>, FilePickerError>, &mut ViewContext<T>)
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
         config: FilePickerConfiguration,
     ) {
         let window_id = self.window_id;
@@ -502,7 +511,11 @@ impl<'a, T: View> ViewContext<'a, T> {
     ///
     /// TODO(vorporeal): Determine how best to eliminate this function and move
     ///     the relevant logic into `spawn()`.
-    fn spawn_local<S, F, U>(&mut self, future: S, callback: F) -> impl Future<Output = ()>
+    fn spawn_local<S, F, U>(
+        &mut self,
+        future: S,
+        callback: F,
+    ) -> impl Future<Output = ()> + use<S, F, U, T>
     where
         S: 'static + Future,
         F: 'static + FnOnce(&mut T, S::Output, &mut ViewContext<T>) -> U,
@@ -518,7 +531,7 @@ impl<'a, T: View> ViewContext<'a, T> {
                 window_id: self.window_id,
                 view_id: self.view_id,
                 callback: Box::new(move |view, output, app, window_id, view_id| {
-                    let view = view.as_any_mut().downcast_mut().expect("this downcast should never fail, as correct typing is statically enforced via the generic parameters on spawn_local");
+                    let view = view.downcast_mut().expect("this downcast should never fail, as correct typing is statically enforced via the generic parameters on spawn_local");
                     let output = *output.downcast().expect("this downcast should never fail, as correct typing is statically enforced via the generic parameters on spawn_local");
                     let result =
                         callback(view, output, &mut ViewContext::new(app, window_id, view_id));
@@ -529,7 +542,7 @@ impl<'a, T: View> ViewContext<'a, T> {
 
         async move {
             if rx.await.is_err() {
-                log::error!("sender unexpectedly dropped before receiver");
+                report_error!("sender unexpectedly dropped before receiver");
             }
         }
     }
@@ -557,12 +570,12 @@ impl<'a, T: View> ViewContext<'a, T> {
         F: 'static + FnOnce(&mut T, <S as Future>::Output, &mut ViewContext<T>) -> U,
         U: 'static,
     {
-        self.spawn_abortable::<S, _, _>(
-            future,
-            |view, output, ctx| {
+        self.spawn_abortable_boxed(
+            Box::pin(future),
+            Box::new(|view, output, ctx| {
                 callback(view, output, ctx);
-            },
-            |_, _| {},
+            }),
+            Box::new(|_, _| {}),
         )
     }
 
@@ -596,6 +609,22 @@ impl<'a, T: View> ViewContext<'a, T> {
         F: 'static + FnOnce(&mut T, <S as Future>::Output, &mut ViewContext<T>),
         A: 'static + FnOnce(&mut T, &mut ViewContext<T>),
     {
+        self.spawn_abortable_boxed(Box::pin(future), Box::new(on_resolve), Box::new(on_abort))
+    }
+
+    /// Type-erased body of [`Self::spawn`] and [`Self::spawn_abortable`].
+    ///
+    /// The public entry points box the future and the callbacks immediately, so this body is
+    /// compiled once per output type instead of once per call site.
+    fn spawn_abortable_boxed<O>(
+        &mut self,
+        future: BoxFuture<'static, O>,
+        on_resolve: SpawnResolveCallback<T, O>,
+        on_abort: SpawnAbortCallback<T>,
+    ) -> SpawnedFutureHandle
+    where
+        O: 'static + SpawnableOutput,
+    {
         let (tx, rx) = futures::channel::oneshot::channel();
 
         let (abort_handle, abort_registration) = AbortHandle::new_pair();
@@ -604,7 +633,7 @@ impl<'a, T: View> ViewContext<'a, T> {
             .spawn_boxed(Box::pin(async move {
                 let abortable = Abortable::new(future, abort_registration);
                 if tx.send(abortable.await).is_err() {
-                    log::error!("Error sending background task result to main thread",);
+                    report_error!("Error sending background task result to main thread");
                 }
             }))
             .detach();
@@ -613,7 +642,7 @@ impl<'a, T: View> ViewContext<'a, T> {
             let output = match rx_result {
                 Ok(output) => output,
                 Err(_) => {
-                    log::error!("sender unexpectedly dropped before receiver");
+                    report_error!("sender unexpectedly dropped before receiver");
                     on_abort(view, ctx);
                     return;
                 }
@@ -660,16 +689,15 @@ impl<'a, T: View> ViewContext<'a, T> {
         self.app.task_callbacks.insert(
             task_id,
             TaskCallback::ViewFromStream {
-                window_id: self.window_id,
                 view_id: self.view_id,
                 on_item: Box::new(move |view, output, app, window_id, view_id| {
-                    let view = view.as_any_mut().downcast_mut().expect("this downcast should never fail, as correct typing is statically enforced via the generic parameters on spawn_local");
+                    let view = view.downcast_mut().expect("this downcast should never fail, as correct typing is statically enforced via the generic parameters on spawn_local");
                     let output = *output.downcast().expect("this downcast should never fail, as correct typing is statically enforced via the generic parameters on spawn_local");
                     let mut ctx = ViewContext::new(app, window_id, view_id);
                     on_item(view, output, &mut ctx);
                 }),
                 on_done: Box::new(move |view, app, window_id, view_id| {
-                    let view = view.as_any_mut().downcast_mut().expect("this downcast should never fail, as correct typing is statically enforced via the generic parameters on spawn_local");
+                    let view = view.downcast_mut().expect("this downcast should never fail, as correct typing is statically enforced via the generic parameters on spawn_local");
                     let mut ctx = ViewContext::new(app, window_id, view_id);
                     on_done(view, &mut ctx);
                 }),
@@ -679,7 +707,7 @@ impl<'a, T: View> ViewContext<'a, T> {
         SpawnedLocalStream::new(
             async move {
                 if rx.await.is_err() {
-                    log::error!("sender unexpectedly dropped before receiver");
+                    report_error!("sender unexpectedly dropped before receiver");
                 }
             }
             .boxed_local(),
@@ -780,13 +808,9 @@ impl<'a, T: View> ViewContext<'a, T> {
         self.app.task_callbacks.insert(
             task_id,
             TaskCallback::ViewFromStream {
-                window_id: self.window_id,
                 view_id: self.view_id,
                 on_item: Box::new(move |view, task, app, window_id, view_id| {
-                    let view = view
-                        .as_any_mut()
-                        .downcast_mut()
-                        .expect("unexpected view type");
+                    let view = view.downcast_mut().expect("unexpected view type");
                     let task: ViewTask<T> = *task
                         .downcast()
                         .expect("task from spawner should be ViewTask<T>");
@@ -832,9 +856,11 @@ impl<V> ViewSpawner<V> {
         work: impl FnOnce(&mut V, &mut ViewContext<V>) -> R + Send + 'static,
     ) -> Result<R, ViewDropped> {
         let (tx, rx) = futures::channel::oneshot::channel();
+        let span = tracing::Span::current();
 
         self.task_sender
             .send(Box::new(move |me, ctx| {
+                let _guard = span.enter();
                 let result = work(me, ctx);
                 // If the background task has dropped the receiver, then we don't need to send
                 // the result, and there's no one to inform regardless.
@@ -868,7 +894,7 @@ impl<V> ReadModel for ViewContext<'_, V> {
     }
 }
 
-impl<V: View> UpdateModel for ViewContext<'_, V> {
+impl<V: Entity> UpdateModel for ViewContext<'_, V> {
     fn update_model<T, F, S>(&mut self, handle: &ModelHandle<T>, update: F) -> S
     where
         T: Entity,
@@ -878,42 +904,54 @@ impl<V: View> UpdateModel for ViewContext<'_, V> {
     }
 }
 
-impl<V: View> ViewAsRef for ViewContext<'_, V> {
-    fn view<T: View>(&self, handle: &ViewHandle<T>) -> &T {
+impl<V: Entity> ViewAsRef for ViewContext<'_, V> {
+    fn view<T: 'static>(&self, handle: &ViewHandle<T>) -> &T {
         self.app.view(handle)
     }
 
-    fn try_view<T: View>(&self, handle: &ViewHandle<T>) -> Option<&T> {
+    fn try_view<T: 'static>(&self, handle: &ViewHandle<T>) -> Option<&T> {
         self.app.try_view(handle)
     }
 }
 
-impl<V: View> UpdateView for ViewContext<'_, V> {
+impl<V: Entity> UpdateView for ViewContext<'_, V> {
     fn update_view<T, F, S>(&mut self, handle: &ViewHandle<T>, update: F) -> S
     where
-        T: View,
+        T: Entity,
         F: FnOnce(&mut T, &mut ViewContext<T>) -> S,
     {
         self.app.update_view(handle, update)
     }
+
+    fn try_update_view<T, F, S>(
+        &mut self,
+        handle: &ViewHandle<T>,
+        update: F,
+    ) -> Result<S, ViewUpdateError>
+    where
+        T: Entity,
+        F: FnOnce(&mut T, &mut ViewContext<T>) -> S,
+    {
+        self.app.try_update_view(handle, update)
+    }
 }
 
-impl<V: View> ReadView for ViewContext<'_, V> {
+impl<V: Entity> ReadView for ViewContext<'_, V> {
     fn read_view<T, F, S>(&self, handle: &ViewHandle<T>, read: F) -> S
     where
-        T: View,
+        T: 'static,
         F: FnOnce(&T, &AppContext) -> S,
     {
         self.app.read_view(handle, read)
     }
 }
 
-impl<V: View> GetSingletonModelHandle for ViewContext<'_, V> {
+impl<V: Entity> GetSingletonModelHandle for ViewContext<'_, V> {
     fn get_singleton_model_handle<T: crate::SingletonEntity>(&self) -> ModelHandle<T> {
         self.app.get_singleton_model_handle()
     }
 }
 
 #[cfg(test)]
-#[path = "context_test.rs"]
+#[path = "context_tests.rs"]
 mod tests;

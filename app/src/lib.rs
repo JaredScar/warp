@@ -1,7 +1,5 @@
-// Suppress warnings about rustdoc style.
 #![allow(clippy::doc_lazy_continuation)]
 
-mod actions;
 mod ai;
 mod alloc;
 mod antivirus;
@@ -28,7 +26,6 @@ mod context_chips;
 mod crash_recovery;
 #[cfg(feature = "crash_reporting")]
 mod crash_reporting;
-mod debounce;
 mod debug_dump;
 mod default_terminal;
 mod download_method;
@@ -45,6 +42,8 @@ mod gpu_state;
 mod input_classifier;
 mod interval_timer;
 mod linear;
+#[cfg(feature = "local_fs")]
+mod local_control;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod login_item;
 mod menu;
@@ -55,8 +54,6 @@ mod notification;
 mod palette;
 mod persistence;
 mod platform;
-#[cfg(feature = "plugin_host")]
-mod plugin;
 mod prefix;
 #[cfg(target_os = "macos")]
 mod preview_config_migration;
@@ -83,6 +80,14 @@ mod test_util;
 mod throttle;
 mod tips;
 mod tracing;
+#[cfg(feature = "tui")]
+mod tui;
+#[cfg(feature = "tui")]
+pub mod tui_export;
+#[cfg(feature = "tui")]
+mod tui_onboarding_markers;
+#[cfg(all(feature = "tui", any(test, feature = "test-util")))]
+mod tui_test_support;
 mod ui_components;
 mod undo_close;
 mod uri;
@@ -130,198 +135,208 @@ pub mod settings_view;
 pub mod tab_configs;
 pub mod terminal;
 pub mod themes;
-use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
-#[cfg(not(target_family = "wasm"))]
-use crate::ai::aws_credentials::AwsCredentialRefresher as _;
-use crate::ai::mcp::FileBasedMCPManager;
-use crate::ai::mcp::FileMCPWatcher;
-use crate::uri::web_intent_parser::maybe_rewrite_web_url_to_intent;
-use ::ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
-use ::ai::index::full_source_code_embedding::SyncTask;
 use ::ai::index::DEFAULT_SYNC_REQUESTS_PER_MIN;
+#[cfg(feature = "local_fs")]
+use ::ai::index::full_source_code_embedding::SnapshotStorage;
+use ::ai::index::full_source_code_embedding::SyncTask;
+use ::ai::index::full_source_code_embedding::manager::{
+    CodebaseIndexManager, CodebaseIndexManagerConfig,
+};
 use ::ai::project_context::model::ProjectContextModel;
-pub use ai::agent::{todos::AIAgentTodoList, AIAgentActionResultType, FileEdit, TodoOperation};
+pub use ai::agent::todos::AIAgentTodoList;
+pub use ai::agent::{AIAgentActionResultType, FileEdit, TodoOperation};
 use ai::agent_conversations_model::AgentConversationsModel;
 use ai::agent_management::AgentNotificationsModel;
 use ai::ambient_agents::scheduled::ScheduledAgentManager;
 use ai::blocklist::{BlocklistAIHistoryModel, BlocklistAIPermissions};
+use ai::chatgpt_subscription::ChatGPTSubscriptionModel;
 use ai::execution_profiles::editor::ExecutionProfileEditorManager;
 use ai::execution_profiles::profiles::AIExecutionProfilesModel;
+use ai::metadata_project_rules::read_project_rule_contents;
 use ai::persisted_workspace::PersistedWorkspace;
-use auth::auth_state::AuthStateProvider;
-use auth::{auth_manager::AuthManager, auth_state::AuthState};
+use auth::auth_manager::{AuthManager, AuthManagerEvent};
+use auth::auth_state::{AuthState, AuthStateProvider};
 use code::editor_management::CodeManager;
 use code::opened_files::OpenedFilesModel;
 use code_review::GlobalCodeReviewModel;
+use code_review::git_repo_model::GitRepoModels;
 use quit_warning::UnsavedStateSummary;
+#[cfg(feature = "local_fs")]
+use repo_metadata::{
+    RepoMetadataModel, repositories::DetectedRepositories, watcher::DirectoryWatcher,
+};
 use server::network_log_pane_manager::NetworkLogPaneManager;
-use server::network_logging::NetworkLogModel;
 use server::telemetry::context_provider::AppTelemetryContextProvider;
 use server::voice_transcriber::ServerVoiceTranscriber;
 #[cfg(feature = "local_fs")]
 use settings::import::model::ImportedConfigModel;
-use voice::transcriber::VoiceTranscriber;
-use warp_cli::GlobalOptions;
-use warp_cli::{agent::AgentCommand, CliCommand};
-
-#[cfg(feature = "local_fs")]
-use repo_metadata::{
-    repositories::DetectedRepositories, watcher::DirectoryWatcher, RepoMetadataModel,
-};
-#[cfg(feature = "local_fs")]
-use watcher::HomeDirectoryWatcher;
-
 use settings_view::pane_manager::SettingsPaneManager;
 use terminal::general_settings::GeneralSettings;
 use terminal::keys_settings::KeysSettings;
 #[cfg(all(not(target_family = "wasm"), feature = "local_tty"))]
 use terminal::local_shell::LocalShellState;
 pub use util::bindings::cmd_or_ctrl_shift;
+use voice::transcriber::VoiceTranscriber;
+use warp_cli::agent::AgentCommand;
+use warp_cli::{CliCommand, GlobalOptions};
+#[cfg(feature = "local_fs")]
+use watcher::HomeDirectoryWatcher;
+
+use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
+#[cfg(not(target_family = "wasm"))]
+use crate::ai::aws_credentials::AwsCredentialRefresher as _;
+#[cfg(not(target_family = "wasm"))]
+use crate::ai::geap_credentials::GeapCredentialRefresher as _;
+use crate::ai::mcp::{FileBasedMCPManager, FileMCPWatcher};
+use crate::uri::web_intent_parser::maybe_rewrite_web_url_to_intent;
+use crate::view_components::DismissibleToast;
 pub mod workflows;
 pub mod workspace;
 
-#[cfg(feature = "integration_tests")]
-pub use persistence::testing as sqlite_testing;
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::ops::Deref;
+#[cfg(feature = "local_fs")]
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use ::settings::{Setting, ToggleableSetting};
-pub use warp_core::errors::{report_error, report_if_error};
-
-#[cfg(feature = "plugin_host")]
-pub use plugin::{run_plugin_host, PLUGIN_HOST_FLAG};
-use warp_core::user_preferences::GetUserPreferences as _;
+#[cfg(feature = "local_tty")]
+use anyhow::Context;
+use anyhow::{Result, anyhow};
+use appearance::{Appearance, AppearanceManager};
+use channel::ChannelState;
+use interval_timer::IntervalTimer;
+use itertools::Itertools;
+#[cfg(feature = "integration_tests")]
+pub use persistence::testing as sqlite_testing;
+use referral_theme_status::ReferralThemeStatus;
+use server::server_api::ServerApiProvider;
+use settings::{ExtraMetaKeys, PrivacySettings};
+#[cfg(feature = "local_fs")]
+use shellexpand::tilde;
+use terminal::input;
+use terminal::session_settings::SessionSettings;
+use url::Url;
+// Re-export the debounce function to simplify imports.
+pub use warp_core::r#async::debounce;
+use warp_core::execution_mode::{AppExecutionMode, ExecutionMode};
+// Re-export the send_telemetry_from_ctx macro at the crate root level
+pub use warp_core::send_telemetry_from_app_ctx;
+pub use warp_core::send_telemetry_from_ctx;
+// Re-export the safe logging macros at the crate root level for backwards compatibility
+pub use warp_core::{safe_debug, safe_error, safe_info, safe_warn};
+use warp_errors::{report_error, report_if_error};
+#[cfg(feature = "local_fs")]
+use warp_files::FileModel;
+use warp_logging::{LogDestination, LogFrontend};
+use warp_server_client::iap::{IapManager, IapManagerEvent, IapState, ManagedIapMint};
+use warp_server_client::network_logging::NetworkLogModel;
+use warpui::integration::TestDriver;
 use warpui::modals::{AlertDialogWithCallbacks, AppModalCallback};
-use warpui::platform::app::ApproveTerminateResult;
+use warpui::platform::TerminationMode;
+use warpui::platform::app::{ApproveTerminateResult, TerminationRequestSource};
+use warpui::windowing::state::ApplicationStage;
+use warpui::{App, AppContext, Event, SingletonEntity, WindowId};
 use window_settings::WindowSettings;
 use workflows::manager::WorkflowManager;
+use workspace::sync_inputs::SyncedInputState;
 
+use self::features::FeatureFlag;
+use crate::ai::AIRequestUsageModel;
+use crate::ai::agent::conversation::AIConversationId;
+#[cfg(not(target_family = "wasm"))]
+use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::ambient_agents::github_auth_notifier::GitHubAuthNotifier;
+use crate::ai::blocklist::RecordingController;
+use crate::ai::connected_self_hosted_workers::ConnectedSelfHostedWorkersModel;
 use crate::ai::document::ai_document_model::AIDocumentModel;
 use crate::ai::facts::manager::AIFactManager;
+use crate::ai::harness_availability::HarnessAvailabilityModel;
 use crate::ai::llms::LLMPreferences;
-use crate::ai::mcp::MCPGalleryManager;
-use crate::ai::mcp::TemplatableMCPServerManager;
+use crate::ai::mcp::{MCPGalleryManager, TemplatableMCPServerManager};
 use crate::ai::outline::RepoOutlines;
 use crate::ai::restored_conversations::RestoredAgentConversations;
 use crate::ai::skills::SkillManager;
-use crate::ai::AIRequestUsageModel;
+#[cfg(not(target_family = "wasm"))]
+use crate::ai::tui_api_keys::TuiApiKeyRefresher;
+use crate::antivirus::AntivirusInfo;
+use crate::app_state::AppState;
 use crate::autoupdate::{AutoupdateState, RelaunchModel};
 use crate::changelog_model::ChangelogModel;
-use crate::cloud_object::model::actions::ObjectActions;
+use crate::cloud_object::model::actions::{ObjectAction, ObjectActions};
+use crate::cloud_object::model::persistence::CloudModel;
 use crate::cloud_object::model::view::CloudViewModel;
 use crate::code::global_buffer_model::GlobalBufferModel;
 #[cfg(feature = "local_fs")]
 use crate::code::language_server_shutdown_manager::LanguageServerShutdownManager;
 use crate::context_chips::prompt::Prompt;
 use crate::default_terminal::DefaultTerminal;
+use crate::drive::CloudObjectTypeAndId;
 use crate::drive::export::ExportManager;
 use crate::env_vars::manager::EnvVarCollectionManager;
-use crate::gpu_state::GPUState;
-use crate::network::NetworkStatus;
-use crate::notebooks::editor::keys::NotebookKeybindings;
-use crate::notebooks::manager::NotebookManager;
-use crate::notebooks::CloudNotebook;
-use crate::palette::PaletteMode;
-use crate::persistence::PersistenceWriter;
-use crate::projects::ProjectManagementModel;
-use crate::server::cloud_objects::{listener::Listener, update_manager::UpdateManager};
-use crate::server::experiments::ServerExperiments;
-use crate::server::sync_queue::{QueueItem, SyncQueue};
-use crate::session_management::{RunningSessionSummary, SessionNavigationData};
-use crate::settings::cloud_preferences_syncer::initialize_cloud_preferences_syncer;
-use crate::settings::manager::SettingsManager;
-use crate::settings::{AccessibilitySettings, ScrollSettings, SelectionSettings};
-use crate::settings_view::keybindings::KeybindingChangedNotifier;
-use crate::settings_view::DisplayCount;
-use crate::suggestions::ignored_suggestions_model::IgnoredSuggestionsModel;
-use crate::system::SystemStats;
-use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
-use crate::terminal::keys::TerminalKeybindings;
-use crate::terminal::resizable_data::ResizableData;
-use crate::terminal::view::inline_banner::ByoLlmAuthBannerSessionState;
-use crate::terminal::{AudibleBell, History};
-use crate::undo_close::UndoCloseStack;
-use crate::user_config::WarpConfig;
-use crate::vim_registers::VimRegisters;
-use crate::warp_managed_paths_watcher::{ensure_warp_watch_roots_exist, WarpManagedPathsWatcher};
-use crate::workflows::aliases::WorkflowAliases;
-use crate::workflows::local_workflows::LocalWorkflows;
-use crate::workspace::{ActiveSession, OneTimeModalModel, ToastStack};
-use crate::workspaces::team_tester::TeamTesterStatus;
-use crate::workspaces::user_profiles::UserProfiles;
-#[cfg(feature = "local_tty")]
-use anyhow::Context;
-use anyhow::{anyhow, Result};
-use appearance::{Appearance, AppearanceManager};
-use channel::ChannelState;
-use interval_timer::IntervalTimer;
-use itertools::Itertools;
-use referral_theme_status::ReferralThemeStatus;
-use rust_embed::RustEmbed;
-use server::server_api::ServerApiProvider;
-use settings::{ExtraMetaKeys, PrivacySettings};
-use std::borrow::Cow;
-use std::collections::HashSet;
-use std::ops::Deref;
-use std::sync::Arc;
-use terminal::input;
-use terminal::session_settings::SessionSettings;
-use url::Url;
-use warp_core::execution_mode::{AppExecutionMode, ExecutionMode};
-use warp_managed_secrets::ManagedSecretManager;
-use workspace::sync_inputs::SyncedInputState;
-
-use warpui::{integration::TestDriver, App, AssetProvider, Event};
-
-use self::features::FeatureFlag;
-use crate::app_state::AppState;
-use crate::cloud_object::model::actions::ObjectAction;
-use crate::cloud_object::model::persistence::CloudModel;
-use crate::drive::CloudObjectTypeAndId;
 use crate::experiments::ImprovedPaletteSearch;
 pub use crate::global_resource_handles::{GlobalResourceHandles, GlobalResourceHandlesProvider};
+use crate::gpu_state::GPUState;
+use crate::network::NetworkStatus;
+use crate::notebooks::CloudNotebook;
+use crate::notebooks::editor::keys::NotebookKeybindings;
+use crate::notebooks::manager::NotebookManager;
 use crate::notification::NotificationContext;
+use crate::palette::PaletteMode;
+use crate::persistence::PersistenceWriter;
+use crate::persistence::model::AgentConversationData;
+use crate::projects::ProjectManagementModel;
 use crate::root_view::{
-    quake_mode_window_id, quake_mode_window_is_open, OpenFromRestoredArg, OpenPath,
+    OpenFromRestoredArg, OpenPath, quake_mode_window_id, quake_mode_window_is_open,
 };
+use crate::server::cloud_objects::listener::Listener;
+use crate::server::cloud_objects::update_manager::UpdateManager;
+use crate::server::experiments::ServerExperiments;
+#[cfg(not(target_family = "wasm"))]
+use crate::server::iap_identity_minter::ManagedSecretsIapMinter;
+use crate::server::server_api::managed_secrets::AppManagedSecretManager as ManagedSecretManager;
+use crate::server::sync_queue::{QueueItem, SyncQueue};
 pub use crate::server::telemetry::{
     AgentModeEntrypoint, AgentModeEntrypointSelectionType, TelemetryEvent,
 };
 use crate::server::telemetry::{AppStartupInfo, CloseTarget, PaletteSource, TelemetryCollector};
-use crate::terminal::CustomSecretRegexUpdater;
+use crate::session_management::{RunningSessionSummary, SessionNavigationData};
+use crate::settings::cloud_preferences_syncer::{
+    CloudPreferencesSyncerEvent, initialize_cloud_preferences_syncer,
+};
+use crate::settings::manager::SettingsManager;
+use crate::settings::{AISettings, AccessibilitySettings, ScrollSettings, SelectionSettings};
+use crate::settings_view::DisplayCount;
+use crate::settings_view::keybindings::KeybindingChangedNotifier;
+use crate::suggestions::ignored_suggestions_model::IgnoredSuggestionsModel;
+use crate::system::SystemStats;
+use crate::tab::TabShortcutModifierState;
+use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+use crate::terminal::keys::TerminalKeybindings;
+use crate::terminal::resizable_data::ResizableData;
+use crate::terminal::view::inline_banner::ByoLlmAuthBannerSessionState;
+use crate::terminal::{AudibleBell, CustomSecretRegexUpdater, History};
+#[cfg(feature = "tui")]
+pub use crate::tui::{TuiLoginEvent, TuiLoginModel, TuiLoginPhase, log_out_tui};
+use crate::undo_close::UndoCloseStack;
+use crate::user_config::WarpConfig;
 use crate::util::bindings::is_binding_cross_platform;
-use crate::workspace::{PaneViewLocator, Workspace, WorkspaceAction};
+use crate::vim_registers::VimRegisters;
+use crate::warp_managed_paths_watcher::{WarpManagedPathsWatcher, ensure_warp_watch_roots_exist};
+use crate::workflows::aliases::WorkflowAliases;
+use crate::workflows::local_workflows::LocalWorkflows;
+use crate::workspace::{
+    ActiveSession, OneTimeModalModel, PaneViewLocator, ToastStack, Workspace, WorkspaceAction,
+};
+use crate::workspaces::team_tester::TeamTesterStatus;
 use crate::workspaces::update_manager::TeamUpdateManager;
-use crate::workspaces::user_workspaces::UserWorkspaces;
-use warp_logging::LogDestination;
+use crate::workspaces::user_profiles::UserProfiles;
+use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
 
-// Re-export the send_telemetry_from_ctx macro at the crate root level
-pub use warp_core::send_telemetry_from_app_ctx;
-pub use warp_core::send_telemetry_from_ctx;
-
-// Re-export the safe logging macros at the crate root level for backwards compatibility
-pub use warp_core::{safe_debug, safe_error, safe_info, safe_warn};
-
-use crate::antivirus::AntivirusInfo;
-#[cfg(feature = "local_fs")]
-use warp_files::FileModel;
-use warpui::platform::TerminationMode;
-use warpui::windowing::state::ApplicationStage;
-use warpui::{AppContext, SingletonEntity, WindowId};
-
-#[derive(Clone, Copy, RustEmbed)]
-#[folder = "assets"]
-#[include = "bundled/**"] // Should be kept in sync with BUNDLED_ASSETS_DIR.
-#[include = "async/**"] // Should be kept in sync with ASYNC_ASSETS_DIR.
-#[cfg_attr(target_family = "wasm", exclude = "async/**")]
-// Excludes take precedence.
-// Standalone CLI builds (the `oz` tarball) are headless and never render the
-// onboarding/theme imagery in `async/`, so we exclude those bytes from the
-// embedded asset set to keep the CLI binary small — mirroring the carve-out
-// already applied for the WASM target above.
-#[cfg_attr(feature = "standalone", exclude = "async/**")]
-pub struct Assets;
-
-pub static ASSETS: Assets = Assets;
+/// Our embedded application assets.
+pub static ASSETS: warp_assets::Assets = warp_assets::Assets;
+const TUI_SECURE_STORAGE_SERVICE_SUFFIX: &str = ".tui";
 
 fn determine_agent_source(
     launch_mode: &LaunchMode,
@@ -339,18 +354,39 @@ fn determine_agent_source(
         }
         // RemoteServerProxy and RemoteServerDaemon are headless server
         // processes that don't use the agent subsystem.
-        LaunchMode::RemoteServerProxy | LaunchMode::RemoteServerDaemon => None,
+        // TODO: the TUI front-end has no agent harness wired up yet; give it an
+        // appropriate `AgentSource` once that lands.
+        LaunchMode::RemoteServerProxy
+        | LaunchMode::RemoteServerDaemon { .. }
+        | LaunchMode::Tui { .. } => None,
+    }
+}
+
+#[cfg(feature = "local_fs")]
+fn daemon_codebase_index_snapshot_storage(launch_mode: &LaunchMode) -> Option<SnapshotStorage> {
+    match launch_mode {
+        LaunchMode::RemoteServerDaemon { identity_key } => {
+            let data_dir = remote_server::setup::remote_server_daemon_data_dir(identity_key);
+            let snapshot_dir = PathBuf::from(tilde(&data_dir).into_owned())
+                .join("cache")
+                .join("codebase_index_snapshots");
+            SnapshotStorage::from_dir(snapshot_dir)
+        }
+        LaunchMode::App { .. }
+        | LaunchMode::CommandLine { .. }
+        | LaunchMode::RemoteServerProxy
+        | LaunchMode::Test { .. }
+        | LaunchMode::Tui { .. } => None,
     }
 }
 
 /// Launch mode for how to start up Warp.
 #[allow(clippy::large_enum_variant)]
-pub enum LaunchMode {
+pub(crate) enum LaunchMode {
     /// Run the regular GUI application.
     App {
         args: warp_cli::AppArgs,
         /// API key for server authentication, if provided via `--api-key` or `WARP_API_KEY`.
-        /// Only used on dogfood channels.
         api_key: Option<String>,
     },
 
@@ -372,21 +408,93 @@ pub enum LaunchMode {
 
     /// Remote server proxy — bridges SSH stdio to the daemon's Unix socket.
     /// This is a short-lived process that runs for the lifetime of an SSH session.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     RemoteServerProxy,
 
     /// Remote server daemon — long-lived headless process serving remote
     /// connections via a Unix domain socket.
-    RemoteServerDaemon,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    RemoteServerDaemon {
+        /// Stable identity key used to partition the daemon's socket/PID
+        /// directory on the remote host.
+        identity_key: String,
+    },
+
+    /// Run the headless TUI front-end or a one-shot command using its settings
+    /// and secure-storage namespace.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    Tui { entrypoint: TuiEntryPoint },
+}
+
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
+enum TuiEntryPoint {
+    /// Build the root TUI view, initialize login, and start the TUI driver.
+    Interactive {
+        mount: TuiMountFn,
+        /// API key for non-interactive Warp authentication.
+        api_key: Option<String>,
+    },
+    /// Execute a CLI command after TUI-scoped app initialization, then exit.
+    CliCommand {
+        execute: Box<dyn FnOnce(&mut warpui::AppContext)>,
+    },
+}
+
+enum AuthInitialization {
+    Persisted,
+    PendingApiKey(String),
 }
 
 impl LaunchMode {
+    /// Sets command-line launch flags so standby uses sandbox initialization without a run prompt.
+    fn command_line(command: CliCommand, global_options: GlobalOptions, debug: bool) -> Self {
+        let (is_sandboxed, computer_use_override) = match &command {
+            CliCommand::Agent(AgentCommand::Run(args)) => {
+                (args.sandboxed, args.computer_use.computer_use_override())
+            }
+            CliCommand::Agent(AgentCommand::RunCloudStandby(_)) => (true, None),
+            _ => (false, None),
+        };
+        Self::CommandLine {
+            command,
+            global_options,
+            debug,
+            is_sandboxed,
+            computer_use_override,
+        }
+    }
+
     fn args(&self) -> Cow<'_, warp_cli::AppArgs> {
         match self {
             LaunchMode::App { args, .. } => Cow::Borrowed(args),
             LaunchMode::CommandLine { .. }
             | LaunchMode::Test { .. }
             | LaunchMode::RemoteServerProxy
-            | LaunchMode::RemoteServerDaemon => Cow::Owned(warp_cli::AppArgs::default()),
+            | LaunchMode::RemoteServerDaemon { .. }
+            | LaunchMode::Tui { .. } => Cow::Owned(warp_cli::AppArgs::default()),
+        }
+    }
+
+    fn api_key(&self) -> Option<String> {
+        match self {
+            LaunchMode::CommandLine { global_options, .. } => global_options.api_key.clone(),
+            LaunchMode::App { api_key, .. }
+            | LaunchMode::Tui {
+                entrypoint: TuiEntryPoint::Interactive { api_key, .. },
+            } => api_key.clone(),
+            LaunchMode::Test { .. }
+            | LaunchMode::RemoteServerProxy
+            | LaunchMode::RemoteServerDaemon { .. }
+            | LaunchMode::Tui {
+                entrypoint: TuiEntryPoint::CliCommand { .. },
+            } => None,
+        }
+    }
+
+    fn auth_initialization(&self) -> AuthInitialization {
+        match self.api_key() {
+            Some(api_key) => AuthInitialization::PendingApiKey(api_key),
+            None => AuthInitialization::Persisted,
         }
     }
 
@@ -400,7 +508,40 @@ impl LaunchMode {
             LaunchMode::App { .. }
             | LaunchMode::CommandLine { .. }
             | LaunchMode::RemoteServerProxy
-            | LaunchMode::RemoteServerDaemon => false,
+            | LaunchMode::RemoteServerDaemon { .. }
+            | LaunchMode::Tui { .. } => false,
+        }
+    }
+
+    /// The settings surface for this launch mode. The TUI front-end gets its
+    /// own settings file and local-only (non-cloud-synced) config; every other
+    /// mode uses the standard GUI settings surface.
+    fn settings_mode(&self) -> ::settings::SettingsMode {
+        match self {
+            LaunchMode::Tui { .. } => ::settings::SettingsMode::Tui,
+            LaunchMode::App { .. }
+            | LaunchMode::CommandLine { .. }
+            | LaunchMode::Test { .. }
+            | LaunchMode::RemoteServerProxy
+            | LaunchMode::RemoteServerDaemon { .. } => ::settings::SettingsMode::Gui,
+        }
+    }
+    /// The platform secure-storage service name for this launch mode.
+    ///
+    /// The TUI uses a separate namespace so it never attempts to read secrets
+    /// created by the GUI. On macOS, those items' Keychain ACLs trust the GUI's
+    /// distinct code-signing identity and would otherwise prompt for the user's
+    /// login password when the TUI accesses them.
+    fn secure_storage_service_name<'a>(&self, data_domain: &'a str) -> Cow<'a, str> {
+        match self {
+            LaunchMode::Tui { .. } => {
+                Cow::Owned(format!("{data_domain}{TUI_SECURE_STORAGE_SERVICE_SUFFIX}"))
+            }
+            LaunchMode::App { .. }
+            | LaunchMode::CommandLine { .. }
+            | LaunchMode::Test { .. }
+            | LaunchMode::RemoteServerProxy
+            | LaunchMode::RemoteServerDaemon { .. } => Cow::Borrowed(data_domain),
         }
     }
 
@@ -410,14 +551,15 @@ impl LaunchMode {
             LaunchMode::App { .. }
             | LaunchMode::CommandLine { .. }
             | LaunchMode::RemoteServerProxy
-            | LaunchMode::RemoteServerDaemon => None,
+            | LaunchMode::RemoteServerDaemon { .. }
+            | LaunchMode::Tui { .. } => None,
         }
     }
 
     /// Add an URL to open. Only supported for [`LaunchMode::App`]
     #[allow(dead_code)]
     fn add_url(&mut self, url: Url) {
-        if let LaunchMode::App { ref mut args, .. } = self {
+        if let LaunchMode::App { args, .. } = self {
             args.urls.push(url);
         }
     }
@@ -427,9 +569,11 @@ impl LaunchMode {
             LaunchMode::App { .. } => ExecutionMode::App,
             LaunchMode::CommandLine { .. } => ExecutionMode::Sdk,
             LaunchMode::Test { .. } => ExecutionMode::App,
-            // RemoteServerProxy and RemoteServerDaemon don't use execution
-            // mode, but Sdk is the closest match (headless, no GUI).
-            LaunchMode::RemoteServerProxy | LaunchMode::RemoteServerDaemon => ExecutionMode::Sdk,
+            LaunchMode::Tui { .. } => ExecutionMode::Tui,
+            // RemoteServerProxy is a thin byte bridge; Sdk is the closest match.
+            LaunchMode::RemoteServerProxy => ExecutionMode::Sdk,
+            // RemoteServerDaemon gets its own mode for distinct Sentry tagging.
+            LaunchMode::RemoteServerDaemon { .. } => ExecutionMode::RemoteServerDaemon,
         }
     }
 
@@ -439,30 +583,70 @@ impl LaunchMode {
             LaunchMode::App { .. }
             | LaunchMode::Test { .. }
             | LaunchMode::RemoteServerProxy
-            | LaunchMode::RemoteServerDaemon => false,
+            | LaunchMode::RemoteServerDaemon { .. }
+            | LaunchMode::Tui { .. } => false,
         }
     }
 
-    /// Returns `true` if Warp should run headlessly, without a visible UI.
+    /// Returns `true` if Warp renders to native GUI windows on the platform app backend.
+    fn is_gui(&self) -> bool {
+        match self {
+            LaunchMode::App { .. } | LaunchMode::Test { .. } => true,
+            LaunchMode::CommandLine { command, .. } => {
+                matches!(command, CliCommand::Agent(AgentCommand::Run(args)) if args.gui)
+            }
+            LaunchMode::RemoteServerProxy
+            | LaunchMode::RemoteServerDaemon { .. }
+            | LaunchMode::Tui { .. } => false,
+        }
+    }
+
+    /// Returns `true` if Warp runs with no user interface at all. The TUI is not headless:
+    /// it has no GUI window, but it renders to the terminal.
     fn is_headless(&self) -> bool {
         match self {
             LaunchMode::CommandLine { command, .. } => match command {
                 CliCommand::Agent(AgentCommand::Run(args)) => !args.gui,
                 _ => true,
             },
-            LaunchMode::RemoteServerProxy | LaunchMode::RemoteServerDaemon => true,
-            LaunchMode::App { .. } | LaunchMode::Test { .. } => false,
+            LaunchMode::RemoteServerProxy | LaunchMode::RemoteServerDaemon { .. } => true,
+            LaunchMode::App { .. } | LaunchMode::Test { .. } | LaunchMode::Tui { .. } => false,
         }
     }
 
-    /// Returns `true` if running in app mode or via `agent run` to permit codebase indexing.
+    /// Whether this launch mode should start the local loopback HTTP server
+    /// (`crates/http_server`), which serves app-installation detection and profiling on a
+    /// fixed port. Only GUI instances start it, since co-located windowless processes (daemon,
+    /// CLI, proxy, TUI) would otherwise contend for the fixed port.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    fn should_start_local_http_server(&self) -> bool {
+        self.is_gui()
+    }
+
+    /// Returns `true` if this process can build and sync codebase indices.
     fn supports_indexing(&self) -> bool {
         match self {
             LaunchMode::CommandLine { command, .. } => {
-                matches!(command, CliCommand::Agent(AgentCommand::Run { .. }))
+                // A pre-warmed sandbox indexes its repositories during preparation, so the
+                // claimed run inherits a warm index instead of rebuilding one.
+                matches!(
+                    command,
+                    CliCommand::Agent(
+                        AgentCommand::Run { .. } | AgentCommand::RunCloudStandby { .. }
+                    )
+                )
+            }
+            LaunchMode::RemoteServerDaemon { .. } => {
+                FeatureFlag::RemoteCodebaseIndexing.is_enabled()
             }
             LaunchMode::App { .. } | LaunchMode::Test { .. } => true,
-            LaunchMode::RemoteServerProxy | LaunchMode::RemoteServerDaemon => false,
+            LaunchMode::RemoteServerProxy => false,
+            // Codebase indexing stays off for the TUI until it has deferred
+            // persisted-index restore and multi-process-safe snapshot writes
+            // (the GUI may run concurrently against the same data dir).
+            // Project rules/skills discovery does not depend on this; see
+            // `PersistedWorkspace::new`.
+            LaunchMode::Tui { .. } => false,
         }
     }
 
@@ -474,30 +658,33 @@ impl LaunchMode {
             LaunchMode::CommandLine { .. }
             | LaunchMode::Test { .. }
             | LaunchMode::RemoteServerProxy
-            | LaunchMode::RemoteServerDaemon => false,
+            | LaunchMode::RemoteServerDaemon { .. }
+            | LaunchMode::Tui { .. } => false,
         }
     }
 
-    /// Whether Sentry / crash reporting should be initialized in `init_common`.
+    /// Whether Sentry / crash reporting should be initialized.
     #[cfg_attr(not(feature = "crash_reporting"), allow(dead_code))]
-    fn needs_crash_reporting(&self) -> bool {
+    pub(crate) fn needs_crash_reporting(&self) -> bool {
         match self {
             LaunchMode::App { .. }
             | LaunchMode::CommandLine { .. }
             | LaunchMode::Test { .. }
-            | LaunchMode::RemoteServerDaemon
-            | LaunchMode::RemoteServerProxy => true,
+            | LaunchMode::RemoteServerDaemon { .. }
+            | LaunchMode::RemoteServerProxy
+            | LaunchMode::Tui { .. } => true,
         }
     }
 
-    /// Whether profiling and tracing should be initialized in `init_common`.
-    fn needs_profiling(&self) -> bool {
+    /// Whether profiling and tracing should be initialized.
+    pub(crate) fn needs_profiling(&self) -> bool {
         match self {
             LaunchMode::App { .. }
             | LaunchMode::CommandLine { .. }
             | LaunchMode::Test { .. }
-            | LaunchMode::RemoteServerDaemon
-            | LaunchMode::RemoteServerProxy => true,
+            | LaunchMode::RemoteServerDaemon { .. }
+            | LaunchMode::RemoteServerProxy
+            | LaunchMode::Tui { .. } => true,
         }
     }
 
@@ -513,25 +700,41 @@ impl LaunchMode {
             }
             // Proxy must log to stderr because stdout is the protocol channel.
             LaunchMode::RemoteServerProxy => Some(LogDestination::Stderr),
-            LaunchMode::RemoteServerDaemon => Some(LogDestination::File),
+            LaunchMode::RemoteServerDaemon { .. } => Some(LogDestination::File),
+            // A TUI owns the terminal, so logs go to a file; stdout/stderr would
+            // corrupt the rendered output and the device-code prompt.
+            LaunchMode::Tui { .. } => Some(LogDestination::File),
             LaunchMode::App { .. } | LaunchMode::Test { .. } => None,
         }
     }
 
-    #[cfg(test)]
+    fn log_frontend(&self) -> LogFrontend {
+        match self {
+            LaunchMode::Tui { .. } => LogFrontend::Tui,
+            LaunchMode::App { .. } | LaunchMode::Test { .. } => LogFrontend::Gui,
+            LaunchMode::CommandLine { .. }
+            | LaunchMode::RemoteServerProxy
+            | LaunchMode::RemoteServerDaemon { .. } => LogFrontend::Cli,
+        }
+    }
+
+    fn as_str_for_tracing(&self) -> &'static str {
+        match self {
+            LaunchMode::App { .. } => "app",
+            LaunchMode::CommandLine { command, .. } => command.as_str_for_tracing(),
+            LaunchMode::Test { .. } => "test",
+            LaunchMode::RemoteServerDaemon { .. } => "remote_server_daemon",
+            LaunchMode::RemoteServerProxy => "remote_server_proxy",
+            LaunchMode::Tui { .. } => "tui",
+        }
+    }
+
+    #[cfg(any(test, all(feature = "tui", feature = "test-util")))]
     pub(crate) fn new_for_unit_test() -> Self {
         LaunchMode::Test {
             driver: Box::new(None),
             is_integration_test: false,
         }
-    }
-}
-
-impl AssetProvider for Assets {
-    fn get(&self, path: &str) -> Result<Cow<'_, [u8]>> {
-        <Assets as RustEmbed>::get(path)
-            .map(|f| f.data)
-            .ok_or_else(|| anyhow!("no asset exists at path {}", path))
     }
 }
 
@@ -560,21 +763,31 @@ fn apply_extra_meta_keys(event: &mut Event, extra_metas: ExtraMetaKeys) {
 }
 
 fn apply_scroll_multiplier(event: &mut Event, app: &AppContext) {
-    if let Event::ScrollWheel { delta, precise, .. } = event {
-        if !*precise {
-            let scroll_multiplier = *ScrollSettings::as_ref(app).mouse_scroll_multiplier.value();
-            *delta *= scroll_multiplier;
-        }
+    if let Event::ScrollWheel { delta, precise, .. } = event
+        && !*precise
+    {
+        let scroll_multiplier = *ScrollSettings::as_ref(app).mouse_scroll_multiplier.value();
+        *delta *= scroll_multiplier;
     }
 }
 
-/// Runs the app. If a subcommand was requested, it'll be run instead of the main application.
+/// Runs the shared Warp executable as the app or as one of its command-line modes.
+///
+/// The bundled Warp Control wrapper injects `--warpctrl`, which is dispatched
+/// before the normal Warp/Oz parser. Oz subcommands are part of that normal
+/// parser and therefore do not require a separate mode flag.
+#[::tracing::instrument(skip_all, fields(tags.cloud_agent = true))]
 pub fn run() -> Result<()> {
     // Perform any necessary platform-specific initialization.
     platform::init();
 
     // Ensure feature flags are initialized before parsing command-line arguments.
-    init_feature_flags();
+    features::init_feature_flags();
+    if let Some(args) = warp_cli::local_control::ControlArgs::from_control_mode_env() {
+        #[cfg(windows)]
+        warp_util::windows::attach_to_parent_console();
+        warp_cli::local_control::run_and_exit(args);
+    }
 
     // Parse command-line arguments.
     let args = warp_cli::Args::from_env();
@@ -584,22 +797,22 @@ pub fn run() -> Result<()> {
     // `WARP_*` env-var equivalents) so shipped builds can't be redirected away from their
     // baked-in server URLs. See `Channel::allows_server_url_overrides`.
     if ChannelState::channel().allows_server_url_overrides() {
-        if let Some(url) = args.server_root_url() {
-            if let Err(e) = ChannelState::override_server_root_url(url.to_owned()) {
-                eprintln!("Error: Invalid server root URL: {e:#}");
-            }
+        if let Some(url) = args.server_root_url()
+            && let Err(e) = ChannelState::override_server_root_url(url.to_owned())
+        {
+            eprintln!("Error: Invalid server root URL: {e:#}");
         }
 
-        if let Some(url) = args.ws_server_url() {
-            if let Err(e) = ChannelState::override_ws_server_url(url.to_owned()) {
-                eprintln!("Error: Invalid websocket server URL: {e:#}");
-            }
+        if let Some(url) = args.ws_server_url()
+            && let Err(e) = ChannelState::override_ws_server_url(url.to_owned())
+        {
+            eprintln!("Error: Invalid websocket server URL: {e:#}");
         }
 
-        if let Some(url) = args.session_sharing_server_url() {
-            if let Err(e) = ChannelState::override_session_sharing_server_url(url.to_owned()) {
-                eprintln!("Error: Invalid session sharing server URL: {e:#}");
-            }
+        if let Some(url) = args.session_sharing_server_url()
+            && let Err(e) = ChannelState::override_session_sharing_server_url(url.to_owned())
+        {
+            eprintln!("Error: Invalid session sharing server URL: {e:#}");
         }
     }
 
@@ -610,97 +823,36 @@ pub fn run() -> Result<()> {
             warp_util::windows::attach_to_parent_console();
         }
         match command {
-            #[cfg(all(feature = "local_tty", unix))]
-            warp_cli::Command::Worker(warp_cli::WorkerCommand::TerminalServer(args)) => {
-                // If we were asked to run as a terminal server (as opposed to the main
-                // GUI application), do so immediately.  Ideally, the terminal server would
-                // be a separate binary, but it's much easier to distribute a single binary,
-                // so starting the terminal server event loop immediately is the closest
-                // approximation we can get to running a separate binary.
-                crate::terminal::local_tty::server::run_terminal_server(args);
-                return Ok(());
-            }
-            #[cfg(feature = "plugin_host")]
-            warp_cli::Command::Worker(warp_cli::WorkerCommand::PluginHost { .. }) => {
-                return crate::run_plugin_host();
-            }
-            #[cfg(feature = "local_tty")]
-            warp_cli::Command::Worker(warp_cli::WorkerCommand::MinidumpServer { socket_name }) => {
-                cfg_if::cfg_if! {
-                    if #[cfg(all(linux_or_windows, feature = "crash_reporting"))] {
-                        return crate::crash_reporting::run_minidump_server(socket_name);
-                    } else {
-                        let _ = socket_name;
-                        panic!("The minidump server is not supported on this platform");
-                    }
-                }
-            }
-            #[cfg(not(target_family = "wasm"))]
-            warp_cli::Command::Worker(warp_cli::WorkerCommand::RemoteServerProxy(args)) => {
-                init_common(&LaunchMode::RemoteServerProxy, None)?;
-                return crate::remote_server::run_proxy(args.identity_key.clone());
-            }
-            #[cfg(not(target_family = "wasm"))]
-            warp_cli::Command::Worker(warp_cli::WorkerCommand::RemoteServerDaemon(args)) => {
-                init_common(&LaunchMode::RemoteServerDaemon, None)?;
-                return crate::remote_server::run_daemon(args.identity_key.clone());
-            }
-            #[cfg(not(target_family = "wasm"))]
-            warp_cli::Command::Worker(warp_cli::WorkerCommand::RipgrepSearch {
-                parent,
-                ignore_case,
-                multiline,
-                pattern,
-                paths,
-            }) => {
-                warp_ripgrep::search::run_search_subprocess(
-                    std::slice::from_ref(pattern),
-                    paths.clone(),
-                    *ignore_case,
-                    *multiline,
-                    parent.pid,
-                )
-                .map_err(|err| anyhow!(err.to_string()))?;
-                return Ok(());
-            }
-            #[cfg(not(any(
-                feature = "local_tty",
-                feature = "plugin_host",
-                not(target_family = "wasm")
-            )))]
-            warp_cli::Command::Worker(worker) => {
-                // Need this case to handle platforms where there are no enum variants in
-                // warp_cli::WorkerCommand, as we still need to check Command::Worker.
-
-                // On wasm, specifically, we should fail spectacularly if we get here.
-                #[cfg(target_family = "wasm")]
-                panic!("Worker process not supported on WASM: {worker:?}")
-            }
+            warp_cli::Command::Worker(worker) => return run_worker_command(worker),
             warp_cli::Command::Completions { shell } => {
                 return warp_cli::completions::generate_to_stdout(*shell);
             }
             warp_cli::Command::CommandLine(cmd) => {
-                let (is_sandboxed, computer_use_override) = match cmd.as_ref() {
-                    warp_cli::CliCommand::Agent(warp_cli::agent::AgentCommand::Run(run_args)) => (
-                        run_args.sandboxed,
-                        run_args.computer_use.computer_use_override(),
-                    ),
-                    _ => (false, None),
-                };
-
-                return run_internal(LaunchMode::CommandLine {
-                    command: cmd.as_ref().clone(),
-                    global_options: GlobalOptions {
-                        output_format: args.output_format(),
-                        api_key: args.api_key().cloned(),
-                    },
-                    debug: args.debug(),
-                    is_sandboxed,
-                    computer_use_override,
-                });
+                #[cfg(not(target_family = "wasm"))]
+                if let CliCommand::EnvironmentCheckout(args) = cmd.as_ref() {
+                    let (mut tracing_initialization, parent_context) =
+                        tracing::init_child_process(&args.requests_file)?;
+                    let _parent_context = parent_context.attach();
+                    warp_logging::init(warp_logging::LogConfig {
+                        frontend: warp_logging::LogFrontend::Cli,
+                        log_destination: Some(warp_logging::LogDestination::Stderr),
+                        ..Default::default()
+                    })?;
+                    tracing_initialization.log_initialization_warning();
+                    return ai::agent_sdk::run_environment_checkout(args);
+                }
+                return run_internal(LaunchMode::command_line(
+                    cmd.as_ref().clone(),
+                    args.global_options().clone(),
+                    args.debug(),
+                ));
             }
             warp_cli::Command::DumpDebugInfo => {
                 return debug_dump::run();
+            }
+            #[cfg(not(target_family = "wasm"))]
+            warp_cli::Command::DumpSettingsSchema { output_path } => {
+                return settings::schema_generation::dump_settings_schema(output_path.as_deref());
             }
             #[cfg(not(target_family = "wasm"))]
             warp_cli::Command::PrintTelemetryEvents => {
@@ -726,6 +878,79 @@ pub fn run() -> Result<()> {
     })
 }
 
+/// Runs a parsed Warp worker command.
+fn run_worker_command(worker: &warp_cli::WorkerCommand) -> Result<()> {
+    match worker {
+        #[cfg(all(feature = "local_tty", unix))]
+        warp_cli::WorkerCommand::TerminalServer(args) => {
+            crate::terminal::local_tty::run_terminal_server(args);
+            Ok(())
+        }
+        #[cfg(feature = "local_tty")]
+        warp_cli::WorkerCommand::MinidumpServer { socket_name } => {
+            cfg_if::cfg_if! {
+                if #[cfg(all(linux_or_windows, feature = "crash_reporting"))] {
+                    crate::crash_reporting::run_minidump_server(socket_name)
+                } else {
+                    let _ = socket_name;
+                    panic!("The minidump server is not supported on this platform");
+                }
+            }
+        }
+        #[cfg(not(target_family = "wasm"))]
+        warp_cli::WorkerCommand::RemoteServerProxy(args) => {
+            // Proxy is a thin byte bridge (stdin/stdout ↔ Unix socket).
+            // It only needs logging to stderr since stdout is the protocol
+            // channel. No crash reporting, no initialize_app.
+            let launch_mode = LaunchMode::RemoteServerProxy;
+            let mut tracing_initialization = tracing::init()?;
+            warp_logging::init(warp_logging::LogConfig {
+                frontend: launch_mode.log_frontend(),
+                log_destination: launch_mode.log_destination(),
+                ..Default::default()
+            })?;
+            tracing_initialization.log_initialization_warning();
+            crate::remote_server::run_proxy(args.identity_key.clone())
+        }
+        #[cfg(not(target_family = "wasm"))]
+        warp_cli::WorkerCommand::RemoteServerDaemon(args) => {
+            // Daemon handles its own full initialization (including
+            // initialize_app and crash reporting) inside run_daemon_app.
+            crate::remote_server::run_daemon(args.identity_key.clone())
+        }
+        #[cfg(not(target_family = "wasm"))]
+        warp_cli::WorkerCommand::AcpBridge { launch_file } => {
+            // Stdout belongs to the agent's protocol stream, so there is no logging and no
+            // initialize_app.
+            crate::ai::agent_sdk::driver::harness::acp::run_bridge(launch_file)
+        }
+        #[cfg(not(target_family = "wasm"))]
+        warp_cli::WorkerCommand::RipgrepSearch {
+            parent,
+            ignore_case,
+            multiline,
+            pattern,
+            paths,
+        } => {
+            warp_ripgrep::search::run_search_subprocess(
+                std::slice::from_ref(pattern),
+                paths.clone(),
+                *ignore_case,
+                *multiline,
+                parent.pid,
+            )
+            .map_err(|err| anyhow!(err.to_string()))?;
+            Ok(())
+        }
+        #[cfg(all(target_family = "wasm", not(feature = "local_tty")))]
+        worker => {
+            // On wasm, specifically, we should fail spectacularly if we get here.
+            #[cfg(target_family = "wasm")]
+            panic!("Worker process not supported on WASM: {worker:?}")
+        }
+    }
+}
+
 /// Runs an integration test using the provided test driver.
 pub fn run_integration_test(driver: TestDriver) -> Result<()> {
     let is_integration_test = std::env::var("WARP_INTEGRATION").is_ok();
@@ -736,12 +961,64 @@ pub fn run_integration_test(driver: TestDriver) -> Result<()> {
     run_internal(launch)
 }
 
-/// Shared early initialization for **every** process type (app, CLI, proxy,
-/// daemon).  Every step in this function runs for all modes, including
-/// lightweight ones like Proxy.  Think carefully before adding here — if
-/// the step is only needed by the full app, add it to `run_internal`
-/// instead.
-fn init_common(launch_mode: &LaunchMode, timer: Option<&mut IntervalTimer>) -> Result<()> {
+/// Runs the headless TUI front-end (the `warp-tui` binary in the `warp_tui`
+/// crate). Bootstraps the real (headless) app and then runs `mount`, which
+/// builds the root TUI view and starts the non-blocking TUI driver.
+///
+/// `mount` is supplied by the `warp_tui` crate (which owns the concrete root
+/// view plus the window/driver bootstrap), so `warp` never has to depend on
+/// `warp_tui`.
+#[cfg(feature = "tui")]
+pub fn run_tui(api_key: Option<String>, mount: TuiMountFn) -> Result<()> {
+    run_internal(LaunchMode::Tui {
+        entrypoint: TuiEntryPoint::Interactive { mount, api_key },
+    })
+}
+
+/// Executes a CLI command after initializing TUI-scoped settings and secure storage.
+#[cfg(feature = "tui")]
+pub fn run_tui_cli_command(execute: Box<dyn FnOnce(&mut warpui::AppContext)>) -> Result<()> {
+    run_internal(LaunchMode::Tui {
+        entrypoint: TuiEntryPoint::CliCommand { execute },
+    })
+}
+
+/// Dispatches a worker command when the current executable was re-invoked for one.
+#[cfg(feature = "tui")]
+pub fn run_tui_worker_if_requested() -> Option<Result<()>> {
+    // Worker spawners always put the worker mode in argv[1]. Do not scan later
+    // arguments because a TUI prompt value may legitimately match a worker name.
+    let is_worker = std::env::args()
+        .nth(1)
+        .is_some_and(|arg| warp_cli::is_worker_invocation(&arg));
+    if !is_worker {
+        return None;
+    }
+
+    features::init_feature_flags();
+    let args = warp_cli::Args::from_env();
+    let Some(warp_cli::Command::Worker(worker)) = args.command() else {
+        return Some(Err(anyhow!(
+            "Recognized a Warp worker invocation, but failed to parse its worker command"
+        )));
+    };
+    Some(run_worker_command(worker))
+}
+
+/// The headless TUI front-end's mount callback, carried by [`LaunchMode::Tui`].
+/// Supplied to [`run_tui`] by the `warp_tui` crate; it runs after
+/// `initialize_app` to build the root TUI view and start the TUI driver.
+pub type TuiMountFn = Box<dyn FnOnce(&mut warpui::AppContext)>;
+
+/// Runs the app (or CLI / daemon). TUI entry points run after `initialize_app`
+/// in place of the GUI/CLI `launch()` path.
+fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
+    let mut timer = IntervalTimer::new();
+
+    // ── Early initialization (pre-AppBuilder) ──────────────────────
+    // These steps run before the platform event loop is started.
+    // They must not depend on AppContext.
+
     #[cfg(windows)]
     dynamic_libraries::configure_library_loading();
 
@@ -751,7 +1028,7 @@ fn init_common(launch_mode: &LaunchMode, timer: Option<&mut IntervalTimer>) -> R
 
     // The `run` function already initializes feature flags, but ensure they're initialized here
     // for other entrypoints.
-    init_feature_flags();
+    features::init_feature_flags();
 
     #[cfg(feature = "crash_reporting")]
     if launch_mode.needs_crash_reporting() {
@@ -762,54 +1039,63 @@ fn init_common(launch_mode: &LaunchMode, timer: Option<&mut IntervalTimer>) -> R
         sentry::Hub::main();
     }
 
-    if launch_mode.needs_profiling() {
-        tracing::init()?;
-    }
+    let mut tracing_initialization = launch_mode
+        .needs_profiling()
+        .then(tracing::init)
+        .transpose()?;
+
+    // Start the `run_internal` span here - we can't do it before this point
+    // because we need the tracing initialization to be complete first.
+    let span = ::tracing::info_span!(
+        "run_internal",
+        tags.cloud_agent = true,
+        launch_mode = launch_mode.as_str_for_tracing()
+    );
+    let _enter = span.enter();
 
     let log_destination = launch_mode.log_destination();
-    let is_cli = log_destination.is_some();
 
     cfg_if::cfg_if! {
         if #[cfg(enable_crash_recovery)] {
             if crash_recovery::is_crash_recovery_process(launch_mode.args().as_ref()) {
                 warp_logging::init_for_crash_recovery_process()?;
             } else {
-                warp_logging::init(warp_logging::LogConfig { is_cli, log_destination })?;
+                warp_logging::init(warp_logging::LogConfig {
+                    frontend: launch_mode.log_frontend(),
+                    log_destination,
+                    ..Default::default()
+                })?;
             }
         } else {
-            warp_logging::init(warp_logging::LogConfig { is_cli, log_destination })?;
+            warp_logging::init(warp_logging::LogConfig {
+                frontend: launch_mode.log_frontend(),
+                log_destination,
+                ..Default::default()
+            })?;
         }
     }
 
-    if let Some(timer) = timer {
-        timer.mark_interval_end("LOG_FILE_SETUP_COMPLETE");
+    if let Some(initialization) = tracing_initialization.as_mut() {
+        initialization.log_initialization_warning();
     }
+    timer.mark_interval_end("LOG_FILE_SETUP_COMPLETE");
+
+    // Claim a background-only process type before anything else can reach
+    // AppKit, so a windowless launch never acquires a Dock tile. See APP-2946.
+    #[cfg(target_os = "macos")]
+    if !launch_mode.is_gui()
+        && let Err(e) = platform::mac::mark_process_as_background_only()
+    {
+        log::warn!("Failed to mark process as background-only: {e:#}");
+    }
+
+    #[cfg(windows)]
+    platform::windows::check_redirection_guard();
 
     // Adjust resource limits early, before doing other work, to ensure that
     // any children we spawn (like the terminal server) inherit our adjusted
     // rlimits.
     resource_limits::adjust_resource_limits();
-
-    // Configure rustls to use its default crypto provider.  This MUST be called
-    // before making any network requests that use TLS, otherwise rustls will
-    // panic.
-    #[cfg(not(target_family = "wasm"))]
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("must be able to initialize crypto provider for TLS support");
-
-    Ok(())
-}
-
-/// Runs the app.
-///
-/// Note that every initialization step in this function is specific to the GUI app and Oz. If you want
-/// to add setup steps that should be generic to all launch modes (e.g. remote server). It should be added
-/// in init_common instead.
-fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
-    let mut timer = IntervalTimer::new();
-
-    init_common(&launch_mode, Some(&mut timer))?;
 
     // For wasm builds we have this special case to parse out the intent
     // from the url that is used to visite the app on web.
@@ -825,12 +1111,18 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
     // Collect errors that occur in run_internal() before the Sentry client is initialized,
     // so they can be replayed to Sentry once it's ready.
     #[cfg_attr(
-        not(all(feature = "release_bundle", any(windows, target_os = "linux"))),
+        not(all(
+            feature = "release_bundle",
+            any(windows, any(target_os = "linux", target_os = "freebsd"))
+        )),
         expect(unused_mut)
     )]
     let mut pre_sentry_errors: Vec<anyhow::Error> = Vec::new();
 
-    #[cfg(all(feature = "release_bundle", target_os = "linux"))]
+    #[cfg(all(
+        feature = "release_bundle",
+        any(target_os = "linux", target_os = "freebsd")
+    ))]
     if let LaunchMode::App { .. } = launch_mode {
         match app_services::linux::pass_startup_args_to_existing_instance(
             launch_mode.args().as_ref(),
@@ -842,12 +1134,15 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
             Err(app_services::linux::StartupArgsForwardingError::NoExistingInstance) => {}
             // If we just finished an auto-update, we should continue running.
             Err(app_services::linux::StartupArgsForwardingError::IgnoredAfterAutoUpdate) => {}
+            Err(
+                app_services::linux::StartupArgsForwardingError::IgnoredForCrashRecoveryProcess,
+            ) => {}
             // If we were unable to perform the forwarding for an unknown reason,
             // it's better to run a second instance than potentially end up in a
             // state where Warp refuses to run even a first instance.
             Err(err) => {
                 let err = anyhow::Error::from(err).context("Failed to forward startup args");
-                log::error!("{err:#}");
+                report_error!(&err);
                 pre_sentry_errors.push(err);
             }
         }
@@ -865,12 +1160,15 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
             Err(app_services::windows::StartupArgsForwardingError::NoExistingInstance) => {}
             // If we just finished an auto-update, we should continue running.
             Err(app_services::windows::StartupArgsForwardingError::IgnoredAfterAutoUpdate) => {}
+            Err(
+                app_services::windows::StartupArgsForwardingError::IgnoredForCrashRecoveryProcess,
+            ) => {}
             // If we were unable to perform the forwarding for an unknown reason,
             // it's better to run a second instance than potentially end up in a
             // state where Warp refuses to run even a first instance.
             Err(err) => {
                 let err = anyhow::Error::from(err).context("Failed to forward startup args");
-                log::error!("{err:#}");
+                report_error!(&err);
                 pre_sentry_errors.push(err);
             }
         }
@@ -882,13 +1180,26 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
     #[cfg(windows)]
     command::windows::init();
 
+    // Establish the settings surface (GUI vs TUI) before initializing
+    // preferences so the settings infra selects the right file name and
+    // cloud-sync behavior for this launch mode.
+    ::settings::set_settings_mode(launch_mode.settings_mode());
+
     let private_preferences = settings::init_private_user_preferences();
     let (public_preferences, startup_toml_parse_error) = settings::init_public_user_preferences();
 
     // When the SettingsFile feature flag is enabled, public settings live in
     // the TOML-backed store. When disabled, they live in the platform-native
     // store (same backend as private). Use the correct one for pre-app reads.
-    #[cfg_attr(not(any(enable_crash_recovery, target_os = "linux")), expect(unused))]
+    #[cfg_attr(
+        not(any(
+            enable_crash_recovery,
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "macos"
+        )),
+        expect(unused)
+    )]
     let prefs_for_public_settings: &dyn warpui_extras::user_preferences::UserPreferences =
         if FeatureFlag::SettingsFile.is_enabled() {
             public_preferences.as_ref()
@@ -904,26 +1215,62 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
     // ensure that the process is in the cleanest possible state (minimal opened
     // files, modified signal handlers, etc.) to avoid unexpected effects on
     // spawned ptys.
+    //
     #[cfg(feature = "local_tty")]
     let pty_spawner =
         terminal::local_tty::spawner::PtySpawner::new().context("Failed to create pty spawner")?;
 
-    let mut app_builder = if launch_mode.is_headless() {
-        warpui::platform::AppBuilder::new_headless(
-            app_callbacks(launch_mode.is_integration_test()),
+    // The TUI front-end skips the GUI lifecycle callbacks, which reach for
+    // windows and GUI-only state, but still flushes telemetry and reporting on
+    // termination.
+    let callbacks = if matches!(launch_mode, LaunchMode::Tui { .. }) {
+        let mut tracing_initialization = tracing_initialization.take();
+        warpui::platform::AppCallbacks {
+            on_will_terminate: Some(Box::new(move |ctx| {
+                TelemetryCollector::handle(ctx).update(ctx, |telemetry_collector, ctx| {
+                    telemetry_collector.flush_telemetry_events_for_shutdown(ctx);
+                });
+
+                profiling::teardown();
+                if let Some(initialization) = tracing_initialization.as_mut() {
+                    initialization.shutdown();
+                }
+
+                #[cfg(feature = "crash_reporting")]
+                crash_reporting::uninit_sentry();
+            })),
+            ..Default::default()
+        }
+    } else {
+        app_callbacks(
+            launch_mode.is_integration_test(),
+            tracing_initialization.take(),
+        )
+    };
+    let mut app_builder = if launch_mode.is_gui() {
+        warpui::platform::AppBuilder::new(
+            callbacks,
             Box::new(ASSETS),
             launch_mode.take_test_driver(),
         )
     } else {
-        warpui::platform::AppBuilder::new(
-            app_callbacks(launch_mode.is_integration_test()),
+        warpui::platform::AppBuilder::new_windowless(
+            callbacks,
             Box::new(ASSETS),
             launch_mode.take_test_driver(),
         )
     };
 
+    // A user is present for any launch with a UI, so it may query microphone authorization.
+    if !launch_mode.is_headless() {
+        app_builder.enable_windowless_microphone_access_query();
+    }
+
+    // A windowless invocation has no Dock presence, so it performs no Dock-visible
+    // setup at all (Dock icon, Dock menu, menu bar). See APP-2946.
     #[cfg(target_os = "macos")]
-    {
+    if launch_mode.is_gui() {
+        use warpui::AssetProvider as _;
         use warpui::platform::mac::AppExt;
 
         let activate_on_launch = !launch_mode.is_integration_test()
@@ -933,14 +1280,20 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
         let dev_icon = ASSETS.get("bundled/png/local.png")?;
         app_builder.set_dev_icon(dev_icon);
 
+        let show_dock_icon = crate::settings::app_icon::ShowDockIconState::read_from_preferences(
+            prefs_for_public_settings,
+        )
+        .unwrap_or_else(crate::settings::app_icon::ShowDockIconState::default_value);
+        app_builder.set_show_dock_icon_on_launch(show_dock_icon);
         app_builder.set_menu_bar_builder(app_menus::menu_bar);
         app_builder.set_dock_menu_builder(|_| app_menus::dock_menu());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
-        use crate::settings::ForceX11;
         use warpui::platform::linux::{self, AppBuilderExt};
+
+        use crate::settings::ForceX11;
 
         app_builder.set_window_class(ChannelState::app_id().to_string());
 
@@ -1014,18 +1367,9 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
         ctx.add_singleton_model(move |_ctx| private_preferences);
         let startup_toml_parse_error = startup_toml_parse_error;
 
-        // Tell the settings crate whether the TOML settings file is active.
-        // This must happen after preferences are registered but before settings
-        // are initialized, so the routing logic picks the correct backend.
-        ::settings::set_settings_file_enabled(FeatureFlag::SettingsFile.is_enabled());
-
         #[cfg(enable_crash_recovery)]
         ctx.add_singleton_model(move |_ctx| crash_recovery);
 
-        #[cfg(feature = "plugin_host")]
-        ctx.add_singleton_model(move |ctx| {
-            plugin::PluginHost::new(ctx).expect("Could not instantiate PluginHost")
-        });
         let app_state = initialize_app(
             &launch_mode,
             timer,
@@ -1038,7 +1382,22 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
             FeatureFlag::UseTantivySearch.set_enabled(true);
         }
 
-        launch(ctx, app_state, launch_mode);
+        // The TUI front-end reuses the full `initialize_app` bootstrap above (so
+        // auth, `Appearance`, settings, etc. exist), then runs the device-login
+        // flow and mounts the TUI (via `crate::tui::init`) instead of the
+        // GUI/CLI `launch()` path.
+        match launch_mode {
+            #[cfg(feature = "tui")]
+            LaunchMode::Tui { entrypoint } => match entrypoint {
+                TuiEntryPoint::Interactive { mount, .. } => crate::tui::init(mount, ctx),
+                TuiEntryPoint::CliCommand { execute } => execute(ctx),
+            },
+            #[cfg(not(feature = "tui"))]
+            LaunchMode::Tui { .. } => {
+                unreachable!("the `tui` launch mode requires the `tui` feature")
+            }
+            other => launch(ctx, app_state, other),
+        }
     })
 }
 
@@ -1046,7 +1405,94 @@ pub struct UpdateQuakeModeEventArg {
     active_window_id: Option<WindowId>,
 }
 
-fn initialize_app(
+#[derive(Clone)]
+enum StartupUserAuthentication {
+    RefreshUser,
+    ApiKey(String),
+}
+
+impl StartupUserAuthentication {
+    fn start(self, ctx: &mut AppContext) {
+        AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| match self {
+            Self::RefreshUser => auth_manager.refresh_user(ctx),
+            Self::ApiKey(api_key) => auth_manager.authenticate_api_key(api_key, ctx),
+        });
+    }
+}
+
+/// Whether startup user authentication should proceed without blocking on IAP.
+///
+/// The TUI front-end must not stall its startup waiting for a staging IAP token
+/// the server may not even require, so it authenticates immediately and lets IAP
+/// resolve out of band (see [`authenticate_user_after_iap_access`]). Every other
+/// front-end keeps the blocking behavior. IAP config only exists on staging
+/// builds, so this never affects production.
+fn startup_auth_is_non_blocking(launch_mode: &LaunchMode) -> bool {
+    matches!(launch_mode, LaunchMode::Tui { .. })
+}
+
+fn authenticate_user_after_iap_access(
+    authentication: StartupUserAuthentication,
+    non_blocking: bool,
+    ctx: &mut AppContext,
+) {
+    let iap_manager = IapManager::handle(ctx);
+    if !iap_manager.as_ref(ctx).is_enabled() || iap_manager.as_ref(ctx).has_valid_token() {
+        authentication.start(ctx);
+        return;
+    }
+
+    if non_blocking {
+        // Don't stall startup waiting for an IAP token the server may not even
+        // require. Authenticate immediately; if the server DOES enforce IAP, this
+        // first attempt hits an IAP challenge, which notifies `IapManager` to mint
+        // a token (`observe_iap_challenge` -> `handle_challenge`). Once a valid
+        // token lands we retry auth so login still recovers — unless the
+        // optimistic attempt already established a session.
+        authentication.clone().start(ctx);
+        let mut pending_authentication = Some(authentication);
+        ctx.subscribe_to_model(&iap_manager, move |iap_manager, event, ctx| match event {
+            IapManagerEvent::StateChanged => {
+                if !iap_manager.as_ref(ctx).has_valid_token() {
+                    return;
+                }
+                if AuthStateProvider::as_ref(ctx).get().user_id().is_some() {
+                    pending_authentication = None;
+                    return;
+                }
+                if let Some(authentication) = pending_authentication.take() {
+                    authentication.start(ctx);
+                }
+            }
+            IapManagerEvent::AccessUnavailable | IapManagerEvent::RefreshFailed { .. } => {}
+        });
+        iap_manager.update(ctx, |manager, ctx| manager.ensure_access(ctx));
+        return;
+    }
+
+    let mut pending_authentication = Some(authentication);
+    ctx.subscribe_to_model(&iap_manager, move |iap_manager, event, ctx| match event {
+        IapManagerEvent::StateChanged => {
+            if !iap_manager.as_ref(ctx).has_valid_token() {
+                return;
+            }
+            if let Some(authentication) = pending_authentication.take() {
+                authentication.start(ctx);
+            }
+        }
+        IapManagerEvent::AccessUnavailable => {
+            report_error!("Staging IAP access unavailable before startup user authentication");
+        }
+        IapManagerEvent::RefreshFailed {
+            message: _,
+            is_first_failure_of_streak: _,
+        } => {}
+    });
+    iap_manager.update(ctx, |manager, ctx| manager.ensure_access(ctx));
+}
+
+#[::tracing::instrument(skip_all, fields(tags.cloud_agent = true))]
+pub(crate) fn initialize_app(
     launch_mode: &LaunchMode,
     mut timer: IntervalTimer,
     startup_toml_parse_error: Option<warpui_extras::user_preferences::Error>,
@@ -1057,17 +1503,25 @@ fn initialize_app(
     // Sentry. Only the dependencies of crash_reporting should be initialized here. Avoid adding
     // any other stuff here, as failures will be silent. Push them to pre_sentry_errors instead.
     let data_domain = ChannelState::data_domain();
+    let secure_storage_service_name = launch_mode.secure_storage_service_name(&data_domain);
 
-    // Register an implementation of the secure storage service.
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "integration_tests")] {
-            warpui_extras::secure_storage::register_noop(&data_domain, ctx);
-        } else if #[cfg(target_os = "linux")] {
-            warpui_extras::secure_storage::register_with_fallback(&data_domain, warp_core::paths::state_dir(), ctx)
-        } else if #[cfg(target_os = "windows")] {
-            warpui_extras::secure_storage::register_with_dir(&data_domain, warp_core::paths::state_dir(), ctx)
-        } else {
-            warpui_extras::secure_storage::register(&data_domain, ctx);
+    // Daemon auth arrives through the client handshake, so avoid platform keychains that may
+    // require an interactive unlock prompt. Other headless modes still use secure storage for
+    // persisted login and BYO provider credentials.
+    if matches!(launch_mode, LaunchMode::RemoteServerDaemon { .. }) {
+        warpui_extras::secure_storage::register_unavailable(ctx);
+    } else {
+        // Register an implementation of the secure storage service.
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "integration_tests")] {
+                warpui_extras::secure_storage::register_noop(&secure_storage_service_name, ctx);
+            } else if #[cfg(any(target_os = "linux", target_os = "freebsd"))] {
+                warpui_extras::secure_storage::register_with_fallback(&secure_storage_service_name, warp_core::paths::state_dir(), ctx)
+            } else if #[cfg(target_os = "windows")] {
+                warpui_extras::secure_storage::register_with_dir(&secure_storage_service_name, warp_core::paths::state_dir(), ctx)
+            } else {
+                warpui_extras::secure_storage::register(&secure_storage_service_name, ctx);
+            }
         }
     }
 
@@ -1090,33 +1544,80 @@ fn initialize_app(
         ctx.set_zoom_factor(WindowSettings::as_ref(ctx).zoom_level.as_zoom_factor());
     }
 
-    // Extract API key from command line options, if applicable.
-    let api_key = match launch_mode {
-        LaunchMode::CommandLine { global_options, .. } => global_options.api_key.clone(),
-        LaunchMode::App { api_key, .. } if ChannelState::channel().is_dogfood() => api_key.clone(),
-        _ => None,
+    let (auth_state, pending_api_key) = match launch_mode.auth_initialization() {
+        AuthInitialization::Persisted => (AuthState::initialize(ctx), None),
+        AuthInitialization::PendingApiKey(api_key) => (
+            AuthState::initialize_for_credential_validation(ctx),
+            Some(api_key),
+        ),
     };
-    let api_key = if FeatureFlag::APIKeyAuthentication.is_enabled() {
-        api_key
-    } else {
-        None
-    };
-
-    let auth_state = Arc::new(AuthState::initialize(ctx, api_key));
+    let auth_state = Arc::new(auth_state);
     timer.mark_interval_end("AUTH_MANAGER_SET_USER");
 
     let agent_source = determine_agent_source(launch_mode);
 
     // NetworkLogModel must be registered before ServerApiProvider so that
-    // `network_logging::init` (invoked from within `ServerApiProvider::new`)
-    // can reach it via `NetworkLogModel::handle(ctx)` when forwarding items
+    // `NetworkLogModel::install_on_clients` can reach it when forwarding items
     // captured by the HTTP client hooks.
     ctx.add_singleton_model(|_ctx| NetworkLogModel::default());
 
-    let server_api_provider = ctx
-        .add_singleton_model(|ctx| ServerApiProvider::new(auth_state.clone(), agent_source, ctx));
+    // Create a shared IAP state for staging builds. The same `Arc<IapState>`
+    // is handed to both `ServerApi` (for sync reads on the request path) and
+    // `IapManager` (which owns refresh logic on the main thread).
+    #[cfg(not(target_family = "wasm"))]
+    let iap_state = ChannelState::iap_config().map(|cfg| Arc::new(IapState::new(&cfg)));
+    #[cfg(target_family = "wasm")]
+    let iap_state: Option<Arc<IapState>> = None;
+
+    let server_api_provider = ctx.add_singleton_model({
+        let auth_state = auth_state.clone();
+        let iap_state = iap_state.clone();
+        move |ctx| ServerApiProvider::new(auth_state, agent_source, iap_state, ctx)
+    });
+
     let server_api = server_api_provider.as_ref(ctx).get();
+    // Parse the ambient-agent task id once. A set-but-unparseable OZ_RUN_ID is
+    // treated as absent everywhere: it identifies no task and must not enable the
+    // runner-context IAP WIF mint below.
+    #[cfg(not(target_family = "wasm"))]
+    let ambient_agent_task_id: Option<AmbientAgentTaskId> = std::env::var(warp_cli::OZ_RUN_ID_ENV)
+        .ok()
+        .and_then(|run_id| match run_id.parse() {
+            Ok(task_id) => Some(task_id),
+            Err(err) => {
+                log::warn!("Ignoring invalid {}: {err}", warp_cli::OZ_RUN_ID_ENV);
+                None
+            }
+        });
+    #[cfg(all(not(target_family = "wasm"), feature = "crash_reporting"))]
+    if matches!(launch_mode, LaunchMode::CommandLine { .. })
+        && let Some(task_id) = ambient_agent_task_id
+    {
+        crash_reporting::set_task_id_tag(&task_id.to_string());
+    }
+    #[cfg(not(target_family = "wasm"))]
+    server_api.set_ambient_agent_task_id(ambient_agent_task_id);
+    #[cfg(not(target_family = "wasm"))]
+    if let LaunchMode::CommandLine {
+        command: CliCommand::Agent(AgentCommand::RunCloudStandby(args)),
+        ..
+    } = launch_mode
+    {
+        server_api.set_prewarmed_sandbox_id(args.standby_id.clone());
+        if let Some(url) = &args.prewarmed_sandbox_control_url
+            && let Err(e) = ChannelState::override_prewarmed_sandbox_control_url(url.clone())
+        {
+            eprintln!("Error: Invalid pre-warmed sandbox control URL: {e:#}");
+        }
+    }
     let ai_client = server_api_provider.as_ref(ctx).get_ai_client();
+    #[cfg(not(target_family = "wasm"))]
+    // Refresh starts only after the authenticated server client exists; tracing initialization
+    // remains responsible for deciding whether this process opted in to cloud-agent export.
+    tracing::start_auth_refresh(
+        server_api_provider.as_ref(ctx).get_managed_secrets_client(),
+        ctx,
+    );
 
     ctx.add_singleton_model(|_ctx| AuthStateProvider::new(auth_state.clone()));
 
@@ -1136,7 +1637,34 @@ fn initialize_app(
 
     // If any part of sqlite initialization fails, we just don't do session restoration (i.e.
     // feature degradation).
-    let (sqlite_data, writer_handles) = persistence::initialize(ctx);
+    let persistence_scope = match launch_mode {
+        LaunchMode::RemoteServerDaemon { identity_key } => {
+            persistence::PersistenceScope::RemoteServerDaemon {
+                identity_key: identity_key.clone(),
+            }
+        }
+        // The TUI keeps its own database so GUI/TUI version skew can never
+        // migrate a shared database out from under the older binary.
+        LaunchMode::Tui { .. } => persistence::PersistenceScope::Tui,
+        LaunchMode::App { .. }
+        | LaunchMode::CommandLine { .. }
+        | LaunchMode::RemoteServerProxy
+        | LaunchMode::Test { .. } => persistence::PersistenceScope::App,
+    };
+    // Only read the subsets of persisted data this launch mode actually
+    // consumes; loading everything is expensive on large databases.
+    let persisted_data_scope = match launch_mode {
+        LaunchMode::Tui { .. } => persistence::PersistedDataScope::TuiFrontend,
+        LaunchMode::RemoteServerDaemon { .. } => {
+            persistence::PersistedDataScope::CodebaseIndicesOnly
+        }
+        LaunchMode::App { .. }
+        | LaunchMode::CommandLine { .. }
+        | LaunchMode::RemoteServerProxy
+        | LaunchMode::Test { .. } => persistence::PersistedDataScope::Full,
+    };
+    let (sqlite_data, writer_handles) =
+        persistence::initialize(ctx, persistence_scope, persisted_data_scope);
     timer.mark_interval_end("SQLITE_INITIALIZED");
 
     let persistence_writer = PersistenceWriter::new(writer_handles);
@@ -1181,6 +1709,7 @@ fn initialize_app(
         object_actions,
         experiments,
         ai_queries,
+        nld_prompts,
         persisted_workspaces,
         workspace_language_servers,
         multi_agent_conversations,
@@ -1195,13 +1724,14 @@ fn initialize_app(
                 sqlite_data.cloud_objects,
                 sqlite_data.workspaces,
                 sqlite_data.current_workspace_uid,
-                Some(sqlite_data.app_state),
+                sqlite_data.app_state,
                 sqlite_data.command_history,
                 sqlite_data.user_profiles,
                 sqlite_data.time_of_next_force_object_refresh,
                 sqlite_data.object_actions,
                 sqlite_data.experiments,
                 sqlite_data.ai_queries,
+                sqlite_data.nld_prompts,
                 sqlite_data.codebase_indices,
                 sqlite_data.workspace_language_servers,
                 sqlite_data.multi_agent_conversations,
@@ -1232,8 +1762,18 @@ fn initialize_app(
                 Default::default(),
                 Default::default(),
                 Default::default(),
+                Default::default(),
             )
         });
+
+    // The daemon's `PersistedDataScope::CodebaseIndicesOnly` read already
+    // skips everything except codebase index metadata.
+    if matches!(launch_mode, LaunchMode::RemoteServerDaemon { .. }) {
+        let codebase_index_count = persisted_workspaces.len();
+        log::debug!(
+            "[Remote codebase indexing] Restored daemon codebase index metadata: metadata_count={codebase_index_count}"
+        );
+    }
 
     // Initialize a global model to track server-side experiment state.
     // This depends on the [`GlobalResourceHandlesProvider`] and so it must
@@ -1257,9 +1797,71 @@ fn initialize_app(
         #[cfg_attr(target_family = "wasm", allow(unused_mut))]
         let mut manager = ::ai::api_keys::ApiKeyManager::new(ctx);
         #[cfg(not(target_family = "wasm"))]
+        if matches!(launch_mode, LaunchMode::Tui { .. }) {
+            manager.subscribe_to_tui_api_key_changes(ctx);
+        }
+        #[cfg(not(target_family = "wasm"))]
         manager.subscribe_to_settings_changes(ctx);
+        // Gemini Enterprise (GEAP) credential refresh triggers: workspace
+        // settings saves / team changes and the member's enablement toggle.
+        #[cfg(not(target_family = "wasm"))]
+        if FeatureFlag::GeminiEnterprise.is_enabled() {
+            manager.subscribe_to_geap_settings_changes(ctx);
+        }
+        // The Grok subscription refresher (`ai::grok_subscription`) has no
+        // visibility into workspace policy, so wire the BYO API key policy in
+        // here. The initial value resumes proactive refresh of any tokens
+        // restored from secure storage; TeamsChanged keeps the policy aligned
+        // as team data loads or the workspace changes.
+        #[cfg(not(target_family = "wasm"))]
+        if FeatureFlag::SuperGrok.is_enabled() {
+            use crate::workspaces::user_workspaces::UserWorkspacesEvent;
+            ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |manager, _, event, ctx| {
+                if matches!(event, UserWorkspacesEvent::TeamsChanged) {
+                    let allowed = UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx);
+                    manager.set_grok_refresh_allowed(allowed, ctx);
+                }
+            });
+            let allowed = UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx);
+            manager.set_grok_refresh_allowed(allowed, ctx);
+        }
         manager
     });
+
+    ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |_, event, ctx| {
+        if matches!(
+            event,
+            UserWorkspacesEvent::CurrentWorkspaceChanged
+                | UserWorkspacesEvent::AiOveragesUpdated
+                | UserWorkspacesEvent::PurchaseAddonCreditsSuccess
+        ) {
+            AIRequestUsageModel::handle(ctx).update(ctx, |usage_model, ctx| {
+                usage_model.request_availability_refresh(ctx);
+            });
+        }
+    });
+    ctx.subscribe_to_model(
+        &::ai::api_keys::ApiKeyManager::handle(ctx),
+        |_, event, ctx| {
+            if let ::ai::api_keys::ApiKeyManagerEvent::KeysUpdated = event {
+                AIRequestUsageModel::handle(ctx).update(ctx, |usage_model, ctx| {
+                    usage_model.request_availability_refresh(ctx);
+                });
+            }
+        },
+    );
+    if FeatureFlag::ChatGPTSubscription.is_enabled() {
+        let ai_client = server_api_provider.as_ref(ctx).get_ai_client();
+        ctx.add_singleton_model(|_| ChatGPTSubscriptionModel::new(ai_client));
+        ChatGPTSubscriptionModel::handle(ctx).update(ctx, |model, ctx| model.refresh(ctx));
+        ctx.subscribe_to_model(&AuthManager::handle(ctx), |_, event, ctx| {
+            if matches!(event, AuthManagerEvent::AuthComplete) {
+                ChatGPTSubscriptionModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.refresh(ctx);
+                });
+            }
+        });
+    }
 
     ctx.add_singleton_model(AntivirusInfo::new);
 
@@ -1285,14 +1887,21 @@ fn initialize_app(
 
     ctx.set_default_binding_validator(is_binding_cross_platform);
 
-    if FeatureFlag::Autoupdate.is_enabled() {
-        // Attempt to clean up any old executable, whether or not we were
-        // explicitly launched as part of the auto-update process.  We may have
-        // failed to remove the executable on a previous launch of the app and
-        // should try again.
-        if let Err(e) = autoupdate::remove_old_executable() {
-            log::error!("Failed to remove old executable: {e:?}");
-        }
+    // Attempt to clean up any old executable, whether or not we were explicitly
+    // launched as part of the auto-update process. We may have failed to remove
+    // the executable on a previous launch of the app and should try again.
+    //
+    // On macOS this deletes `Contents/MacOS/old` from inside the installed app
+    // bundle, so it runs behind the same `can_autoupdate` guard as the rest of
+    // the autoupdate machinery: an execution mode that never autoupdates must
+    // not mutate that bundle. The bundled CLI runs the GUI executable from
+    // inside `Warp.app`, so without this it would rewrite a bundle it does not
+    // own. See APP-2946.
+    if FeatureFlag::Autoupdate.is_enabled()
+        && AppExecutionMode::as_ref(ctx).can_autoupdate()
+        && let Err(e) = autoupdate::remove_old_executable()
+    {
+        report_error!(e.context("Failed to remove old executable"));
     }
 
     experiments::init(ctx);
@@ -1302,9 +1911,11 @@ fn initialize_app(
 
     ctx.add_singleton_model(|_| SettingsPaneManager::new());
     ctx.add_singleton_model(|_| AIFactManager::new());
+    ctx.add_singleton_model(|_| RecordingController::new());
     ctx.add_singleton_model(|_| ExecutionProfileEditorManager::default());
     ctx.add_singleton_model(|_| NetworkLogPaneManager::default());
     ctx.add_singleton_model(|_| pricing::PricingInfoModel::new());
+    ctx.add_singleton_model(ai::pricing_promotion::PricingPromotionState::new);
     ctx.add_singleton_model(|ctx| {
         // Not using the *Provider types isn't ideal, but it's worth it for the ability to move managed secrets to a separate crate.
         ManagedSecretManager::new(
@@ -1314,7 +1925,7 @@ fn initialize_app(
     });
 
     #[cfg(target_os = "macos")]
-    if !launch_mode.is_headless() {
+    if launch_mode.is_gui() {
         AppearanceManager::as_ref(ctx).set_app_icon(ctx);
     }
 
@@ -1337,6 +1948,8 @@ fn initialize_app(
 
     ctx.add_singleton_model(remote_server::manager::RemoteServerManager::new);
     #[cfg(not(target_family = "wasm"))]
+    ctx.add_singleton_model(remote_server::codebase_index_model::RemoteCodebaseIndexModel::new);
+    #[cfg(not(target_family = "wasm"))]
     remote_server::wire_auth_token_rotation(ctx);
 
     log::info!(
@@ -1355,10 +1968,10 @@ fn initialize_app(
     // Rewrite recognized Warp web URLs (sessions, Drive, settings, home) into local
     // intent URLs when possible so they open directly in the desktop app.
     ctx.set_before_open_url(|url_str, _ctx| {
-        if let Ok(url) = Url::parse(url_str) {
-            if let Some(intent) = maybe_rewrite_web_url_to_intent(&url) {
-                return intent.to_string();
-            }
+        if let Ok(url) = Url::parse(url_str)
+            && let Some(intent) = maybe_rewrite_web_url_to_intent(&url)
+        {
+            return intent.to_string();
         }
         url_str.to_owned()
     });
@@ -1375,15 +1988,6 @@ fn initialize_app(
     let user_is_logged_in = auth_state.is_logged_in();
 
     if user_is_logged_in {
-        // Skip refresh_user for CLI mode — the CLI handles auth refresh in
-        // ensure_auth_state so it can detect invalid credentials before running
-        // a command.
-        if !matches!(launch_mode, LaunchMode::CommandLine { .. }) {
-            AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
-                auth_manager.refresh_user(ctx);
-            });
-        }
-
         // Set the first frame callback to record the app's startup time.
         // This is only sent for logged-in users so that new users don't skew performance metrics.
         let is_screen_reader_enabled = ctx.is_screen_reader_enabled();
@@ -1436,6 +2040,18 @@ fn initialize_app(
     #[cfg(not(target_family = "wasm"))]
     {
         ctx.add_singleton_model(DirectoryWatcher::new);
+        // Register the skill provider directories as force-included paths so
+        // the gitignore-pruning watch descend filter still watches gitignored
+        // skill directories (e.g. `.agents/skills`) for `Repository`
+        // subscribers (LSP, MCP). Registered before any repository begins
+        // watching so it gates descent on the very first registration.
+        DirectoryWatcher::handle(ctx).update(ctx, |watcher, _| {
+            watcher.register_force_included_paths(
+                ::ai::skills::SKILL_PROVIDER_DEFINITIONS
+                    .iter()
+                    .map(|provider| provider.skills_path.clone()),
+            );
+        });
         ctx.add_singleton_model(|_| DetectedRepositories::default());
         if let Some(home_dir) = dirs::home_dir() {
             ctx.add_singleton_model(|ctx| HomeDirectoryWatcher::new(home_dir, ctx));
@@ -1448,16 +2064,31 @@ fn initialize_app(
     {
         let imported_config_model = ctx.add_singleton_model(ImportedConfigModel::new);
 
-        if FeatureFlag::SettingsImport.is_enabled()
-            && ChannelState::channel() != warp_core::channel::Channel::Integration
-        {
+        if ChannelState::channel() != warp_core::channel::Channel::Integration {
             imported_config_model.update(ctx, |model, ctx| {
                 model.search_for_settings_to_import(ctx);
             });
         }
 
+        let emit_incremental_updates = matches!(launch_mode, LaunchMode::RemoteServerDaemon { .. });
         ctx.add_singleton_model(|ctx| {
-            let model = RepoMetadataModel::new(ctx);
+            let model = if emit_incremental_updates {
+                RepoMetadataModel::new_with_incremental_updates(ctx)
+            } else {
+                RepoMetadataModel::new(ctx)
+            };
+            model.register_force_included_paths(
+                ::ai::skills::SKILL_PROVIDER_DEFINITIONS
+                    .iter()
+                    .map(|provider| provider.skills_path.clone()),
+                ctx,
+            );
+            model.set_project_skill_provider_paths(
+                ::ai::skills::SKILL_PROVIDER_DEFINITIONS
+                    .iter()
+                    .map(|provider| provider.skills_path.clone()),
+                ctx,
+            );
 
             // Subscribe to RemoteServerManager push events so that remote repo
             // metadata snapshots and incremental updates populate the remote
@@ -1465,7 +2096,7 @@ fn initialize_app(
             {
                 use remote_server::manager::{RemoteServerManager, RemoteServerManagerEvent};
                 let mgr = RemoteServerManager::handle(ctx);
-                ctx.subscribe_to_model(&mgr, |me, event, ctx| match event {
+                ctx.subscribe_to_model(&mgr, |me, _, event, ctx| match event {
                     RemoteServerManagerEvent::RepoMetadataSnapshot { host_id, update } => {
                         me.insert_remote_snapshot(host_id.clone(), update, ctx);
                     }
@@ -1484,10 +2115,7 @@ fn initialize_app(
         });
     }
 
-    {
-        use code_review::git_status_update::GitStatusUpdateModel;
-        ctx.add_singleton_model(|_| GitStatusUpdateModel::new());
-    }
+    ctx.add_singleton_model(|_| GitRepoModels::new());
 
     ctx.add_singleton_model(|ctx| {
         ProjectManagementModel::new(persisted_projects, persistence_writer.sender(), ctx)
@@ -1543,9 +2171,6 @@ fn initialize_app(
     ai_assistant::panel::init(ctx);
     settings_view::update_environment_form::init(ctx);
     env_vars::env_var_collection_block::init(ctx);
-    terminal::ssh::install_tmux::init(ctx);
-    terminal::ssh::warpify::init(ctx);
-    terminal::ssh::error::init(ctx);
     context_chips::display_menu::init(ctx);
     context_chips::node_version_popup::init(ctx);
     env_vars::view::env_var_collection::init(ctx);
@@ -1564,7 +2189,9 @@ fn initialize_app(
     ctx.add_singleton_model(|_| GitHubAuthNotifier::new());
     ctx.add_singleton_model(|_| NetworkStatus::new());
     ctx.add_singleton_model(|_| SystemStats::new());
+    workspace::auto_handoff::init(ctx);
     ctx.add_singleton_model(|_| KeybindingChangedNotifier::new());
+    ctx.add_singleton_model(|_| TabShortcutModifierState::new());
     ctx.add_singleton_model(|_| search::command_palette::SelectedItems::new());
     ctx.add_singleton_model(search::files::model::FileSearchModel::new);
     ctx.add_singleton_model(|_| VimRegisters::new());
@@ -1615,6 +2242,7 @@ fn initialize_app(
             time_of_next_force_object_refresh,
         )
     });
+    ctx.add_singleton_model(ai::cloud_environments::CloudEnvironmentCatalog::new);
 
     let unsynced_actions: Vec<(CloudObjectTypeAndId, ObjectAction)> = object_actions
         .iter()
@@ -1639,25 +2267,70 @@ fn initialize_app(
         )
     });
 
+    // Seed the orchestration pin set from persisted conversation data
+    // before the conversations vec is consumed by the singletons below.
+    // Each conversation's `AgentConversationData.pinned` is the source of
+    // truth; the singleton mirrors them in memory for fast cross-pane lookups.
+    let initial_pinned_conversations: HashSet<AIConversationId> = multi_agent_conversations
+        .iter()
+        .filter_map(|conv| {
+            let data =
+                serde_json::from_str::<AgentConversationData>(&conv.conversation.conversation_data)
+                    .ok()?;
+            if !data.pinned {
+                return None;
+            }
+            AIConversationId::try_from(conv.conversation.conversation_id.clone()).ok()
+        })
+        .collect();
     {
         let conversations = &multi_agent_conversations;
-        ctx.add_singleton_model(move |_| BlocklistAIHistoryModel::new(ai_queries, conversations));
+        ctx.add_singleton_model(move |_| {
+            // Only wire NLD prompt history when the feature is enabled; disabled
+            // (stable/preview) builds skip this so they don't retain the prompt snapshot.
+            let nld_prompts = if FeatureFlag::NldPromptHistoryMatch.is_enabled() {
+                nld_prompts
+            } else {
+                Vec::new()
+            };
+            BlocklistAIHistoryModel::new(ai_queries, nld_prompts, conversations)
+        });
     }
-    ctx.add_singleton_model(move |_| RestoredAgentConversations::new(multi_agent_conversations));
+    // Per-conversation queued prompts. Registered after the history model
+    // since it subscribes to history events for cleanup.
+    ctx.add_singleton_model(ai::blocklist::QueuedQueryModel::new);
+    // Cross-pane UI state for the orchestration pill bar. Registered
+    // after the history model since it subscribes to history events.
+    ctx.add_singleton_model(move |ctx| {
+        ai::blocklist::agent_view::orchestration_pill_bar_model::OrchestrationPillBarModel::new(
+            initial_pinned_conversations,
+            ctx,
+        )
+    });
+    // Conversations restore lazily from the local DB on demand; startup only
+    // loads metadata.
+    ctx.add_singleton_model(|_| RestoredAgentConversations::new());
     ctx.add_singleton_model(|_| CLIAgentSessionsModel::new());
     // ActiveAgentViewsModel is used to track active agent conversations and notify listeners when they change.
     ctx.add_singleton_model(|_| ActiveAgentViewsModel::new());
     ctx.add_singleton_model(AgentNotificationsModel::new);
     ctx.add_singleton_model(BlocklistAIPermissions::new);
     ctx.add_singleton_model(ai::blocklist::orchestration_events::OrchestrationEventService::new);
-    ctx.add_singleton_model(ai::blocklist::task_status_sync_model::TaskStatusSyncModel::new);
-    if warp_core::features::FeatureFlag::OrchestrationV2.is_enabled() {
-        ctx.add_singleton_model(
-            ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::new,
-        );
-    }
+    ctx.add_singleton_model(
+        ai::blocklist::local_agent_task_sync_model::LocalAgentTaskSyncModel::new,
+    );
+    ctx.add_singleton_model(
+        ai::blocklist::pending_cli_harness_prompt_queue::PendingCliHarnessPromptQueue::new,
+    );
+    ctx.add_singleton_model(
+        ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::new,
+    );
 
-    ctx.add_singleton_model(RepoOutlines::new);
+    if launch_mode.supports_indexing() {
+        ctx.add_singleton_model(RepoOutlines::new);
+    } else {
+        ctx.add_singleton_model(|ctx| RepoOutlines::new_with_indexing_enabled(false, ctx));
+    }
     ctx.add_singleton_model(|ctx| {
         warp_core::sync_queue::SyncQueue::<SyncTask>::new_with_rate_limit(
             &ctx.background_executor(),
@@ -1692,13 +2365,19 @@ fn initialize_app(
     });
 
     let toml_file_path = settings::user_preferences_toml_file_path();
-    ctx.add_singleton_model(move |ctx| {
+    let cloud_preferences_syncer = ctx.add_singleton_model(move |ctx| {
         initialize_cloud_preferences_syncer(
             toml_file_path,
             startup_toml_parse_error_for_syncer.as_deref(),
             ctx,
         )
     });
+    ctx.subscribe_to_model(&cloud_preferences_syncer, |_, event, ctx| {
+        if let CloudPreferencesSyncerEvent::InitialLoadCompleted = event {
+            window_settings::migrate_legacy_background_backdrop(ctx);
+        }
+    });
+    ai::custom_endpoints::init(launch_mode, ctx);
 
     // LogManager must be registered before any subsystem (e.g. MCP, LSP) that creates file-based loggers.
     ctx.add_singleton_model(|_| simple_logger::manager::LogManager::new());
@@ -1761,7 +2440,86 @@ fn initialize_app(
     {
         ctx.add_singleton_model(LocalShellState::new);
         ctx.add_singleton_model(system::SystemInfo::new);
-        ctx.add_singleton_model(system::TabResourceMonitor::new);
+    }
+
+    // In a sandboxed Oz runner, mint IAP tokens by self-minting via Workload
+    // Identity Federation (impersonating the IAP access service account). Gated
+    // on a valid ambient-agent task id so local staging clients — and any runner
+    // with a stray or malformed OZ_RUN_ID — keep using the gcloud path.
+    #[cfg(not(target_family = "wasm"))]
+    let managed_iap_mint = ambient_agent_task_id.is_some().then(|| {
+        let client = server_api_provider.as_ref(ctx).get_managed_secrets_client();
+        ManagedIapMint::new(Arc::new(ManagedSecretsIapMinter::new(client)))
+    });
+    #[cfg(target_family = "wasm")]
+    let managed_iap_mint: Option<ManagedIapMint> = None;
+
+    // `IapManager` drives IAP token refresh for staging builds.
+    // Register it after `LocalShellState`: the Manager needs to know where the gcloud
+    // cli lives & thus needs PATH config set by ~/.zshrc et al.
+    //
+    // Registered on all targets (including wasm) so consumers such as the
+    // shared-session viewer network — which compiles and runs on wasm — can
+    // read the singleton without panicking. On wasm `iap_state` is always
+    // `None`, making this an inert no-op: `IapManager::new` early-returns from
+    // its refresh loop and `iap_state()` yields no proxy-auth header.
+    ctx.add_singleton_model(move |ctx| {
+        let path_resolver = Box::new(|_ctx: &mut AppContext| {
+            #[cfg(feature = "local_tty")]
+            let path_future = LocalShellState::handle(_ctx).update(_ctx, |shell_state, ctx| {
+                shell_state.get_interactive_path_env_var(ctx)
+            });
+
+            #[cfg(not(feature = "local_tty"))]
+            let path_future =
+                futures::FutureExt::boxed_local(futures::future::ready(None::<String>));
+
+            path_future
+        });
+        IapManager::new(iap_state, path_resolver, managed_iap_mint, ctx)
+    });
+    // Subscribe to IAP manager events to show toasts when refresh fails.
+    ctx.subscribe_to_model(&IapManager::handle(ctx), |_, e, ctx| {
+        match e {
+            IapManagerEvent::RefreshFailed {
+                message,
+                is_first_failure_of_streak,
+            } if *is_first_failure_of_streak => {
+                let window_id = ctx
+                    .windows()
+                    .active_window()
+                    .or_else(|| ctx.windows().ordered_window_ids().first().copied());
+                let Some(window_id) = window_id else {
+                    return;
+                };
+                let toast: DismissibleToast<WorkspaceAction> =
+                    DismissibleToast::error(format!("IAP credential refresh failed: {message}"));
+                ToastStack::handle(ctx).update(ctx, |stack, ctx| {
+                    stack.add_ephemeral_toast(toast, window_id, ctx);
+                });
+            }
+            _ => {}
+        };
+    });
+
+    // CLI commands establish IAP access and refresh auth in their dispatch path so they can
+    // surface failures synchronously. Other interactive clients gate startup user authentication
+    // on IAP here, since the request itself calls the IAP-gated warp-server — except the TUI,
+    // which authenticates immediately and resolves IAP out of band (see
+    // `startup_auth_is_non_blocking`).
+    let startup_authentication = if matches!(launch_mode, LaunchMode::CommandLine { .. }) {
+        None
+    } else {
+        pending_api_key
+            .map(StartupUserAuthentication::ApiKey)
+            .or_else(|| user_is_logged_in.then_some(StartupUserAuthentication::RefreshUser))
+    };
+    if let Some(authentication) = startup_authentication {
+        authenticate_user_after_iap_access(
+            authentication,
+            startup_auth_is_non_blocking(launch_mode),
+            ctx,
+        );
     }
 
     // Add a singleton model that holds the current prompt configuration.
@@ -1789,54 +2547,100 @@ fn initialize_app(
     ctx.add_singleton_model(LocalWorkflows::new);
 
     ctx.add_singleton_model(LLMPreferences::new);
+    ctx.add_singleton_model(HarnessAvailabilityModel::new);
+    ctx.add_singleton_model(ConnectedSelfHostedWorkersModel::new);
 
-    ctx.add_singleton_model(|ctx| {
+    let tip_model_handle = ctx.add_singleton_model(|ctx| {
         ai::agent_tips::AITipModel::<ai::AgentTip>::new_for_agent_tips(ctx)
     });
+    {
+        // Rebuild the tip pool when AI settings change so tips whose applicability
+        // depends on AI settings appear/disappear without waiting for the next cooldown cycle.
+        let tip_model_handle_for_ai = tip_model_handle.clone();
+        ctx.subscribe_to_model(&AISettings::handle(ctx), move |_, _, ctx| {
+            tip_model_handle_for_ai.update(ctx, |model, ctx| {
+                model.revalidate_tips(ctx);
+            });
+        });
+        // Also revalidate when workspace/team data changes (e.g. voice toggled at
+        // the org level). Billing metadata — including `warp_ai_policy.is_voice_enabled`
+        // — lives inside the team data, so `TeamsChanged` covers all policy updates.
+        let tip_model_handle_for_teams = tip_model_handle.clone();
+        ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), move |_, event, ctx| {
+            if matches!(event, UserWorkspacesEvent::TeamsChanged) {
+                tip_model_handle_for_teams.update(ctx, |model, ctx| {
+                    model.revalidate_tips(ctx);
+                });
+            }
+        });
+        // Revalidate when any keybinding changes so tips with `<keybinding>`
+        // placeholders are hidden/shown when the referenced binding is cleared
+        // or reassigned.
+        ctx.subscribe_to_model(&KeybindingChangedNotifier::handle(ctx), move |_, _, ctx| {
+            tip_model_handle.update(ctx, |model, ctx| {
+                model.revalidate_tips(ctx);
+            });
+        });
+    }
 
     timer.mark_interval_end("SINGLETON_MODELS_REGISTERED");
 
     ctx.add_singleton_model(move |_| timer);
-
-    let is_ssh_tmux_wrapper_enabled = ctx
-        .private_user_preferences()
-        .read_value("SshTmuxWrapperOverride")
-        .ok()
-        .flatten()
-        .and_then(|s| s.parse().ok());
-
-    if let Some(is_ssh_tmux_wrapper_enabled) = is_ssh_tmux_wrapper_enabled {
-        FeatureFlag::SSHTmuxWrapper.set_user_preference(is_ssh_tmux_wrapper_enabled);
-    }
 
     ctx.add_singleton_model(|ctx| AIExecutionProfilesModel::new(launch_mode, ctx));
 
     ctx.add_singleton_model(DefaultTerminal::new);
 
     ctx.add_singleton_model(|ctx| {
-        let indices_to_restore = if UserWorkspaces::as_ref(ctx).is_codebase_context_enabled(ctx)
-            && launch_mode.supports_indexing()
-        {
+        let should_restore_indices = launch_mode.supports_indexing()
+            && (matches!(launch_mode, LaunchMode::RemoteServerDaemon { .. })
+                || UserWorkspaces::as_ref(ctx).is_codebase_context_enabled(ctx));
+        let indices_to_restore = if should_restore_indices {
             persisted_workspaces.clone()
         } else {
             vec![]
         };
 
         let codebase_limits = AIRequestUsageModel::as_ref(ctx).codebase_context_limits();
-
-        CodebaseIndexManager::new(
+        let mut codebase_index_config = CodebaseIndexManagerConfig::new(
             indices_to_restore,
             codebase_limits.max_indices_allowed,
             codebase_limits.max_files_per_repo,
             codebase_limits.embedding_generation_batch_size,
             server_api_provider.as_ref(ctx).get(),
+            launch_mode.supports_indexing(),
+        );
+        if matches!(launch_mode, LaunchMode::RemoteServerDaemon { .. }) {
+            codebase_index_config = codebase_index_config.defer_persisted_index_restore();
+        }
+        #[cfg(feature = "local_fs")]
+        if let Some(snapshot_storage) = daemon_codebase_index_snapshot_storage(launch_mode) {
+            return CodebaseIndexManager::new_with_snapshot_storage(
+                codebase_index_config,
+                Some(snapshot_storage),
+                ctx,
+            );
+        }
+
+        CodebaseIndexManager::new_with_config(codebase_index_config, ctx)
+    });
+
+    ctx.add_singleton_model(|ctx| {
+        ProjectContextModel::new_from_persisted(
+            persisted_project_rules,
+            read_project_rule_contents,
             ctx,
         )
     });
 
-    ctx.add_singleton_model(|ctx| {
-        ProjectContextModel::new_from_persisted(persisted_project_rules, ctx)
-    });
+    // Index global rules (e.g. ~/.agents/AGENTS.md) on a background task so
+    // they are available to subsequent agent queries.
+    ProjectContextModel::handle(ctx).update(ctx, |me, ctx| me.index_global_rules(ctx));
+    #[cfg(all(not(target_family = "wasm"), feature = "local_fs"))]
+    {
+        ctx.add_singleton_model(ai::remote_agent_context::RemoteAgentContext::new);
+    }
+
     ctx.add_singleton_model(|ctx| {
         PersistedWorkspace::new(
             persisted_workspaces,
@@ -1857,20 +2661,33 @@ fn initialize_app(
         aliases.connect(ctx);
     });
 
-    // When running natively, add the http server singleton to the application.
     #[cfg(not(target_family = "wasm"))]
-    ctx.add_singleton_model(move |ctx| {
-        let routers = vec![
-            app_installation_detection::make_router(),
-            profiling::make_router(),
-        ];
-        http_server::HttpServer::new(routers, ctx)
-    });
+    if launch_mode.should_start_local_http_server() {
+        ctx.add_singleton_model(move |ctx| {
+            let routers = vec![
+                app_installation_detection::make_router(),
+                profiling::make_router(),
+            ];
+            http_server::HttpServer::new(routers, ctx)
+        });
+    }
+    #[cfg(feature = "local_fs")]
+    if matches!(
+        launch_mode,
+        LaunchMode::App { .. } | LaunchMode::Test { .. }
+    ) && FeatureFlag::WarpControlCli.is_enabled()
+    {
+        ctx.add_singleton_model(local_control::LocalControlBridge::new);
+        ctx.add_singleton_model(local_control::LocalControlServer::new);
+    }
 
     app_state
 }
 
-fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
+pub(crate) fn app_callbacks(
+    is_integration_test: bool,
+    mut tracing_initialization: Option<tracing::Initialization>,
+) -> warpui::platform::AppCallbacks {
     warpui::platform::AppCallbacks {
         on_internet_reachability_changed: Some(Box::new(move |reachable, ctx| {
             NetworkStatus::handle(ctx)
@@ -1989,6 +2806,9 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
             crash_recovery::CrashRecovery::handle(ctx).update(ctx, |crash_recovery, _ctx| {
                 crash_recovery.teardown();
             });
+            if let Some(initialization) = tracing_initialization.as_mut() {
+                initialization.shutdown();
+            }
 
             // Tear down crash reporting as the last thing we do before the application
             // terminates.
@@ -1999,8 +2819,9 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
             let general_settings = GeneralSettings::as_ref(ctx);
             // On Linux or Windows, if we're about to close the final window, we should quit the app instead.
             // On Mac, we do this conditionally based on a user setting.
-            let quit_on_last_window_closed = cfg!(any(target_os = "linux", windows))
-                || *general_settings.quit_on_last_window_closed;
+            let quit_on_last_window_closed =
+                cfg!(any(target_os = "linux", target_os = "freebsd", windows))
+                    || *general_settings.quit_on_last_window_closed;
             if ctx.window_ids().count() == 1 && quit_on_last_window_closed {
                 log::info!("No windows left, terminating app");
                 ctx.terminate_app(TerminationMode::Cancellable, None);
@@ -2017,7 +2838,7 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
             );
 
             // Don't show dialog on integration test. Machine can't press buttons.
-            if !is_integration_test && summary.should_display_warning(ctx) {
+            if !is_integration_test && summary.save_unsaved_code_and_should_warn(ctx) {
                 let shown = summary
                     .dialog()
                     .on_confirm(move |ctx| {
@@ -2040,7 +2861,20 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
                 ApproveTerminateResult::Terminate
             }
         })),
-        on_should_terminate_app: Some(Box::new(move |ctx| {
+        on_should_terminate_app: Some(Box::new(move |source, ctx| {
+            // Never interrupt a system-initiated termination (logout / restart /
+            // scheduled OS update): both cancel paths below return
+            // `ApproveTerminateResult::Cancel`, which macOS interprets as Warp
+            // refusing to quit. That can abort a scheduled OS update while the
+            // quit-warning modal has no visible window to attach to, leaving
+            // Warp waiting on a prompt nobody can see (#12441). Skipping
+            // `apply_pending_update` here doesn't lose the update: the next
+            // update check re-detects it (autoupdate state isn't persisted
+            // across restarts, so the artifact may be re-downloaded).
+            if source == TerminationRequestSource::System {
+                return ApproveTerminateResult::Terminate;
+            }
+
             send_telemetry_from_app_ctx!(
                 TelemetryEvent::UserInitiatedClose {
                     initiated_on: CloseTarget::App,
@@ -2062,7 +2896,7 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
 
             let summary = UnsavedStateSummary::for_app(ctx);
             // Don't show dialog on integration test. Machine can't press buttons.
-            if !is_integration_test && summary.should_display_warning(ctx) {
+            if !is_integration_test && summary.save_unsaved_code_and_should_warn(ctx) {
                 let shown = summary
                     .dialog()
                     .on_confirm(|ctx| ctx.terminate_app(TerminationMode::ForceTerminate, None))
@@ -2078,9 +2912,11 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
         })),
         on_disable_warning_modal: Some(Box::new(move |ctx| {
             GeneralSettings::handle(ctx).update(ctx, |general_settings, ctx| {
-                report_if_error!(general_settings
-                    .show_warning_before_quitting
-                    .toggle_and_save_value(ctx));
+                report_if_error!(
+                    general_settings
+                        .show_warning_before_quitting
+                        .toggle_and_save_value(ctx)
+                );
             });
             send_telemetry_from_app_ctx!(TelemetryEvent::QuitModalDisabled, ctx);
         })),
@@ -2096,19 +2932,19 @@ fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppCallbacks {
                 {
                     // Ensure the window ID exists, if so dispatch an action to focus
                     // the correct pane.
-                    if ctx.window_ids().contains(&window_id) {
-                        if let Some(root_view_id) = ctx.root_view_id(window_id) {
-                            ctx.dispatch_action(
-                                window_id,
-                                &[root_view_id],
-                                "root_view:handle_notification_click",
-                                &PaneViewLocator {
-                                    pane_group_id,
-                                    pane_id,
-                                },
-                                log::Level::Info,
-                            );
-                        }
+                    if ctx.window_ids().contains(&window_id)
+                        && let Some(root_view_id) = ctx.root_view_id(window_id)
+                    {
+                        ctx.dispatch_action(
+                            window_id,
+                            &[root_view_id],
+                            "root_view:handle_notification_click",
+                            &PaneViewLocator {
+                                pane_group_id,
+                                pane_id,
+                            },
+                            log::Level::Info,
+                        );
                     }
                 }
             }
@@ -2197,12 +3033,12 @@ fn focus_running_window_and_show_native_modal(
             .expect("already checked len > 0")
     });
     ctx.windows().show_window_and_focus_app(window_id_to_focus);
-    if let Some(workspaces) = ctx.views_of_type::<Workspace>(window_id_to_focus) {
-        if let Some(handle) = workspaces.first() {
-            handle.update(ctx, |view, ctx| {
-                view.show_native_modal(dialog_with_callbacks, ctx);
-            });
-        }
+    if let Some(workspaces) = ctx.views_of_type::<Workspace>(window_id_to_focus)
+        && let Some(handle) = workspaces.first()
+    {
+        handle.update(ctx, |view, ctx| {
+            view.show_native_modal(dialog_with_callbacks, ctx);
+        });
     }
 }
 
@@ -2243,18 +3079,18 @@ fn on_close_app_cancelled(open_navigation_palette: bool, ctx: &mut AppContext) {
     windowing_model.show_window_and_focus_app(window_id_to_focus);
 
     // open the nav palette in the selected window
-    if let Some(workspaces) = ctx.views_of_type::<Workspace>(window_id_to_focus) {
-        if let Some(handle) = workspaces.first() {
-            ctx.dispatch_typed_action_for_view(
-                window_id_to_focus,
-                handle.id(),
-                &WorkspaceAction::OpenPalette {
-                    mode: PaletteMode::Navigation,
-                    source: PaletteSource::QuitModal,
-                    query: Some("running".to_owned()),
-                },
-            );
-        }
+    if let Some(workspaces) = ctx.views_of_type::<Workspace>(window_id_to_focus)
+        && let Some(handle) = workspaces.first()
+    {
+        ctx.dispatch_typed_action_for_view(
+            window_id_to_focus,
+            handle.id(),
+            &WorkspaceAction::OpenPalette {
+                mode: PaletteMode::Navigation,
+                source: PaletteSource::QuitModal,
+                query: Some("running".to_owned()),
+            },
+        );
     }
 }
 
@@ -2288,21 +3124,31 @@ fn on_close_window_cancelled(
     // if we haven't returned early, it means open_navigation_palette is true as the
     // user pressed the modal button for opening the navigation palette to show their
     // running processes
-    if let Some(workspaces) = ctx.views_of_type::<Workspace>(window_id) {
-        if let Some(handle) = workspaces.first() {
-            ctx.dispatch_typed_action_for_view(
-                window_id,
-                handle.id(),
-                &WorkspaceAction::OpenPalette {
-                    mode: PaletteMode::Navigation,
-                    source: PaletteSource::QuitModal,
-                    query: Some("running".to_owned()),
-                },
-            );
-        }
+    if let Some(workspaces) = ctx.views_of_type::<Workspace>(window_id)
+        && let Some(handle) = workspaces.first()
+    {
+        ctx.dispatch_typed_action_for_view(
+            window_id,
+            handle.id(),
+            &WorkspaceAction::OpenPalette {
+                mode: PaletteMode::Navigation,
+                source: PaletteSource::QuitModal,
+                query: Some("running".to_owned()),
+            },
+        );
     }
 }
 
+fn is_cloud_agent_web_home_launch_url(url: &Url) -> bool {
+    url.scheme() == ChannelState::url_scheme()
+        && url.host_str() == Some("action")
+        && url.path() == "/new_cloud_agent_conversation"
+        && url
+            .query_pairs()
+            .any(|(key, value)| key == "source" && value == "web_home")
+}
+
+#[::tracing::instrument(skip_all, fields(tags.cloud_agent = true))]
 fn launch(ctx: &mut warpui::AppContext, app_state: Option<AppState>, launch_mode: LaunchMode) {
     IntervalTimer::handle(ctx).update(ctx, |timer, _ctx| {
         timer.mark_interval_end("APP_LAUNCHED");
@@ -2318,8 +3164,17 @@ fn launch(ctx: &mut warpui::AppContext, app_state: Option<AppState>, launch_mode
     #[cfg(target_family = "wasm")]
     ctx.set_fallback_font_fn(font_fallback::fallback_font_fn);
 
-    match &launch_mode {
+    match launch_mode {
+        // The TUI front-end runs its own mount in the run closure and returns
+        // before reaching launch().
+        LaunchMode::Tui { .. } => unreachable!("LaunchMode::Tui is handled before launch()"),
         LaunchMode::App { .. } | LaunchMode::Test { .. } => {
+            let should_skip_restore = launch_mode
+                .args()
+                .urls
+                .iter()
+                .any(is_cloud_agent_web_home_launch_url);
+            let app_state = if should_skip_restore { None } else { app_state };
             // Attempt to restore windows from the persisted application state.
             let arg = OpenFromRestoredArg { app_state };
             ctx.dispatch_global_action("root_view:open_from_restored", &arg);
@@ -2372,11 +3227,21 @@ fn launch(ctx: &mut warpui::AppContext, app_state: Option<AppState>, launch_mode
                 }
             }
         }
-        // RemoteServerProxy and RemoteServerDaemon never go through
-        // run_internal / launch; they call init_common directly and then
-        // their own entry points.
-        LaunchMode::RemoteServerProxy | LaunchMode::RemoteServerDaemon => {
-            log::error!("Proxy/Daemon modes should not use the launch() path");
+        // Proxy should never reach launch() — it's a thin byte bridge.
+        LaunchMode::RemoteServerProxy => {
+            report_error!("Proxy mode should not use the launch() path");
+            std::process::exit(1);
+        }
+        // Daemon: bind the Unix socket and register the ServerModel.
+        // initialize_app already set up everything else including crash
+        // reporting.
+        #[cfg(unix)]
+        LaunchMode::RemoteServerDaemon { identity_key } => {
+            remote_server::unix::launch_daemon(&identity_key, ctx);
+        }
+        #[cfg(not(unix))]
+        LaunchMode::RemoteServerDaemon { .. } => {
+            report_error!("RemoteServerDaemon is not supported on this platform");
             std::process::exit(1);
         }
     }
@@ -2399,483 +3264,6 @@ fn init_logging_for_unit_tests_glue() {
     warp_logging::init_logging_for_unit_tests();
 }
 
-/// Mark all features which should be enabled on the current channel as enabled.
-/// This sets global feature flag state and should never be called in a unit test.
-pub fn init_feature_flags() {
-    for flag in enabled_features() {
-        flag.set_enabled(true);
-    }
-    features::mark_initialized();
-}
-
-/// Returns all feature flags which should be enabled in the current channel.
-pub fn enabled_features() -> HashSet<FeatureFlag> {
-    // Enable features overridden for the given channel.
-    let mut flags = ChannelState::additional_features();
-
-    // Enable flags for release builds, if appropriate.
-    if ChannelState::is_release_bundle() {
-        flags.extend(features::RELEASE_FLAGS);
-    }
-
-    flags.extend([
-        #[cfg(feature = "autoupdate")]
-        FeatureFlag::Autoupdate,
-        #[cfg(feature = "changelog")]
-        FeatureFlag::Changelog,
-        #[cfg(feature = "cocoa_sentry")]
-        FeatureFlag::CocoaSentry,
-        #[cfg(feature = "crash_reporting")]
-        FeatureFlag::CrashReporting,
-        #[cfg(feature = "log_expensive_frames_in_sentry")]
-        FeatureFlag::LogExpensiveFramesInSentry,
-        #[cfg(feature = "record_app_active_events")]
-        FeatureFlag::RecordAppActiveEvents,
-        #[cfg(feature = "runtime_feature_flags")]
-        FeatureFlag::RuntimeFeatureFlags,
-        #[cfg(feature = "sequential_storage")]
-        FeatureFlag::SequentialStorage,
-        #[cfg(feature = "in_band_generators_ssh")]
-        FeatureFlag::InBandGeneratorsForSSH,
-        #[cfg(feature = "run_generators_with_cmd_exe")]
-        FeatureFlag::RunGeneratorsWithCmdExe,
-        #[cfg(feature = "ligatures")]
-        FeatureFlag::Ligatures,
-        #[cfg(feature = "selectable_prompt")]
-        FeatureFlag::SelectablePrompt,
-        #[cfg(feature = "viewing_shared_sessions")]
-        FeatureFlag::ViewingSharedSessions,
-        #[cfg(feature = "creating_shared_sessions")]
-        FeatureFlag::CreatingSharedSessions,
-        #[cfg(feature = "agent_mode")]
-        FeatureFlag::AgentMode,
-        #[cfg(feature = "shared_session_long_running_commands")]
-        FeatureFlag::SharedSessionWriteToLongRunningCommands,
-        #[cfg(feature = "resize_fix")]
-        FeatureFlag::ResizeFix,
-        #[cfg(feature = "richtext_multiselect")]
-        FeatureFlag::RichTextMultiselect,
-        #[cfg(feature = "default_waterfall_mode")]
-        FeatureFlag::DefaultWaterfallMode,
-        #[cfg(feature = "settings_file")]
-        FeatureFlag::SettingsFile,
-        #[cfg(feature = "settings_import")]
-        FeatureFlag::SettingsImport,
-        #[cfg(feature = "rect_selection")]
-        FeatureFlag::RectSelection,
-        #[cfg(feature = "alacritty_settings_import")]
-        FeatureFlag::AlacrittySettingsImport,
-        #[cfg(feature = "dynamic_workflow_enums")]
-        FeatureFlag::DynamicWorkflowEnums,
-        #[cfg(feature = "shared_with_me")]
-        FeatureFlag::SharedWithMe,
-        #[cfg(feature = "am_workflows")]
-        FeatureFlag::AgentModeWorkflows,
-        #[cfg(feature = "ai_rules")]
-        FeatureFlag::AIRules,
-        #[cfg(feature = "ssh_tmux_wrapper")]
-        FeatureFlag::SSHTmuxWrapper,
-        #[cfg(feature = "less_horizontal_terminal_padding")]
-        FeatureFlag::LessHorizontalTerminalPadding,
-        #[cfg(feature = "shell_selector")]
-        FeatureFlag::ShellSelector,
-        #[cfg(feature = "block_toolbelt_save_as_workflow")]
-        FeatureFlag::BlockToolbeltSaveAsWorkflow,
-        #[cfg(feature = "integration_command")]
-        FeatureFlag::IntegrationCommand,
-        #[cfg(feature = "artifact_command")]
-        FeatureFlag::ArtifactCommand,
-        #[cfg(feature = "cloud_environments")]
-        FeatureFlag::CloudEnvironments,
-        #[cfg(all(feature = "simulate_github_unauthed", debug_assertions))]
-        FeatureFlag::SimulateGithubUnauthed,
-        #[cfg(feature = "session_sharing_acls")]
-        FeatureFlag::SessionSharingAcls,
-        #[cfg(feature = "full_screen_zen_mode")]
-        FeatureFlag::FullScreenZenMode,
-        #[cfg(feature = "minimalist_ui")]
-        FeatureFlag::MinimalistUI,
-        #[cfg(feature = "remove_alt_screen_padding")]
-        FeatureFlag::RemoveAltScreenPadding,
-        #[cfg(feature = "avatar_in_tab_bar")]
-        FeatureFlag::AvatarInTabBar,
-        #[cfg(feature = "workflow_aliases")]
-        FeatureFlag::WorkflowAliases,
-        #[cfg(feature = "ssh_drag_and_drop")]
-        FeatureFlag::SshDragAndDrop,
-        #[cfg(feature = "drag_tabs_to_windows")]
-        FeatureFlag::DragTabsToWindows,
-        #[cfg(feature = "cycle_next_command_suggestion")]
-        FeatureFlag::CycleNextCommandSuggestion,
-        #[cfg(feature = "multi_workspace")]
-        FeatureFlag::MultiWorkspace,
-        #[cfg(feature = "ime_marked_text")]
-        FeatureFlag::ImeMarkedText,
-        #[cfg(feature = "partial_next_command_suggestions")]
-        FeatureFlag::PartialNextCommandSuggestions,
-        #[cfg(feature = "iterm_images")]
-        FeatureFlag::ITermImages,
-        #[cfg(feature = "validate_autosuggestions")]
-        FeatureFlag::ValidateAutosuggestions,
-        #[cfg(feature = "prompt_suggestions_via_maa")]
-        FeatureFlag::PromptSuggestionsViaMAA,
-        #[cfg(feature = "clear_autosuggestion_on_escape")]
-        FeatureFlag::ClearAutosuggestionOnEscape,
-        #[cfg(feature = "autoupdate_ui_revamp")]
-        FeatureFlag::AutoupdateUIRevamp,
-        #[cfg(all(not(windows), feature = "kitty_images"))]
-        FeatureFlag::KittyImages,
-        #[cfg(feature = "warp_packs")]
-        FeatureFlag::WarpPacks,
-        #[cfg(feature = "global_ai_analytics_banner")]
-        FeatureFlag::GlobalAIAnalyticsBanner,
-        #[cfg(feature = "global_ai_analytics_collection")]
-        FeatureFlag::GlobalAIAnalyticsCollection,
-        #[cfg(feature = "default_adeberry_theme")]
-        FeatureFlag::DefaultAdeberryTheme,
-        #[cfg(feature = "agent_mode_primary_xml")]
-        FeatureFlag::AgentModePrimaryXML,
-        #[cfg(feature = "agent_mode_pre_plan_xml")]
-        FeatureFlag::AgentModePrePlanXML,
-        #[cfg(feature = "agent_onboarding")]
-        FeatureFlag::AgentOnboarding,
-        #[cfg(feature = "agent_shared_sessions")]
-        FeatureFlag::AgentSharedSessions,
-        #[cfg(feature = "suggested_rules")]
-        FeatureFlag::SuggestedRules,
-        #[cfg(feature = "suggested_agent_mode_workflows")]
-        FeatureFlag::SuggestedAgentModeWorkflows,
-        #[cfg(feature = "command_correction_key")]
-        FeatureFlag::CommandCorrectionKey,
-        #[cfg(feature = "predict_am_queries")]
-        FeatureFlag::PredictAMQueries,
-        #[cfg(feature = "full_source_code_embedding")]
-        FeatureFlag::FullSourceCodeEmbedding,
-        #[cfg(feature = "use_tantivy_search")]
-        FeatureFlag::UseTantivySearch,
-        #[cfg(feature = "grep_tool")]
-        FeatureFlag::GrepTool,
-        #[cfg(feature = "mcp_server")]
-        FeatureFlag::McpServer,
-        #[cfg(feature = "mcp_debugging_ids")]
-        FeatureFlag::McpDebuggingIds,
-        #[cfg(feature = "markdown_tables")]
-        FeatureFlag::MarkdownTables,
-        #[cfg(feature = "blocklist_markdown_table_rendering")]
-        FeatureFlag::BlocklistMarkdownTableRendering,
-        #[cfg(feature = "blocklist_markdown_images")]
-        FeatureFlag::BlocklistMarkdownImages,
-        #[cfg(feature = "markdown_mermaid")]
-        FeatureFlag::MarkdownMermaid,
-        #[cfg(feature = "editable_markdown_mermaid")]
-        FeatureFlag::EditableMarkdownMermaid,
-        #[cfg(feature = "image_as_context")]
-        FeatureFlag::ImageAsContext,
-        #[cfg(feature = "msys2_shells")]
-        FeatureFlag::MSYS2Shells,
-        #[cfg(feature = "file_retrieval_tools")]
-        FeatureFlag::FileRetrievalTools,
-        #[cfg(feature = "reload_stale_conversation_files")]
-        FeatureFlag::ReloadStaleConversationFiles,
-        #[cfg(feature = "shared_block_title_generation")]
-        FeatureFlag::SharedBlockTitleGeneration,
-        #[cfg(feature = "retry_truncated_code_responses")]
-        FeatureFlag::RetryTruncatedCodeResponses,
-        #[cfg(feature = "read_image_files")]
-        FeatureFlag::ReadImageFiles,
-        #[cfg(feature = "usage_based_pricing")]
-        FeatureFlag::UsageBasedPricing,
-        #[cfg(feature = "cross_repo_context")]
-        FeatureFlag::CrossRepoContext,
-        #[cfg(feature = "codebase_index_persistence")]
-        FeatureFlag::CodebaseIndexPersistence,
-        #[cfg(feature = "ai_context_menu")]
-        FeatureFlag::AIContextMenuEnabled,
-        #[cfg(feature = "at_menu_outside_of_ai_mode")]
-        FeatureFlag::AtMenuOutsideOfAIMode,
-        #[cfg(feature = "ai_resume_button")]
-        FeatureFlag::AIResumeButton,
-        #[cfg(feature = "figma_detection")]
-        FeatureFlag::FigmaDetection,
-        #[cfg(feature = "agent_decides_command_execution")]
-        FeatureFlag::AgentDecidesCommandExecution,
-        #[cfg(feature = "codebase_index_speedbump")]
-        FeatureFlag::CodebaseIndexSpeedbump,
-        #[cfg(feature = "context_line_review_comments")]
-        FeatureFlag::ContextLineReviewComments,
-        #[cfg(feature = "nld_fasttext_model")]
-        FeatureFlag::NLDClassifierModelEnabled,
-        #[cfg(feature = "fast_forward_autoexecute_button")]
-        FeatureFlag::FastForwardAutoexecuteButton,
-        #[cfg(feature = "code_find_replace")]
-        FeatureFlag::CodeFindReplace,
-        #[cfg(feature = "command_palette_file_search")]
-        FeatureFlag::CommandPaletteFileSearch,
-        #[cfg(feature = "ai_context_menu_commands")]
-        FeatureFlag::AIContextMenuCommands,
-        #[cfg(feature = "ai_context_menu_code")]
-        FeatureFlag::AIContextMenuCode,
-        #[cfg(feature = "expand_edit_to_pane")]
-        FeatureFlag::ExpandEditToPane,
-        #[cfg(feature = "fallback_model_load_output_messaging")]
-        FeatureFlag::FallbackModelLoadOutputMessaging,
-        #[cfg(feature = "tab_close_button_on_left")]
-        FeatureFlag::TabCloseButtonOnLeft,
-        #[cfg(feature = "profiles_design_revamp")]
-        FeatureFlag::ProfilesDesignRevamp,
-        #[cfg(feature = "search_codebase_ui")]
-        FeatureFlag::SearchCodebaseUI,
-        #[cfg(feature = "changed_lines_only_apply_diff_result")]
-        FeatureFlag::ChangedLinesOnlyApplyDiffResult,
-        #[cfg(feature = "linked_code_blocks")]
-        FeatureFlag::LinkedCodeBlocks,
-        #[cfg(feature = "tabbed_editor_view")]
-        FeatureFlag::TabbedEditorView,
-        #[cfg(feature = "send_telemetry_to_file")]
-        FeatureFlag::SendTelemetryToFile,
-        #[cfg(feature = "undo_closed_panes")]
-        FeatureFlag::UndoClosedPanes,
-        #[cfg(feature = "multi_profile")]
-        FeatureFlag::MultiProfile,
-        #[cfg(feature = "conversation_artifacts")]
-        FeatureFlag::ConversationArtifacts,
-        #[cfg(feature = "sync_ambient_plans")]
-        FeatureFlag::SyncAmbientPlans,
-        #[cfg(feature = "get_started_tab")]
-        FeatureFlag::GetStartedTab,
-        #[cfg(feature = "welcome_tab")]
-        FeatureFlag::WelcomeTab,
-        #[cfg(feature = "projects")]
-        FeatureFlag::Projects,
-        #[cfg(feature = "drive_objects_as_context")]
-        FeatureFlag::DriveObjectsAsContext,
-        #[cfg(feature = "pr_comments_slash_command")]
-        FeatureFlag::PRCommentsSlashCommand,
-        #[cfg(feature = "pr_comments_v2")]
-        FeatureFlag::PRCommentsV2,
-        #[cfg(feature = "pr_comments_skill")]
-        FeatureFlag::PRCommentsSkill,
-        #[cfg(feature = "selection_as_context")]
-        FeatureFlag::SelectionAsContext,
-        #[cfg(feature = "code_mode_chip")]
-        FeatureFlag::CodeModeChip,
-        #[cfg(feature = "github_pr_prompt_chip")]
-        FeatureFlag::GithubPrPromptChip,
-        #[cfg(feature = "create_project_flow")]
-        FeatureFlag::CreateProjectFlow,
-        #[cfg(feature = "vim_code_editor")]
-        FeatureFlag::VimCodeEditor,
-        #[cfg(feature = "allow_opening_file_links_using_editor_env")]
-        FeatureFlag::AllowOpeningFileLinksUsingEditorEnv,
-        #[cfg(feature = "nld_improvements")]
-        FeatureFlag::NldImprovements,
-        #[cfg(feature = "revert_diff_hunk")]
-        FeatureFlag::RevertDiffHunk,
-        #[cfg(feature = "code_review_save_changes")]
-        FeatureFlag::CodeReviewSaveChanges,
-        #[cfg(feature = "file_tree")]
-        FeatureFlag::FileTree,
-        #[cfg(feature = "allow_ignoring_input_suggestions")]
-        FeatureFlag::AllowIgnoringInputSuggestions,
-        #[cfg(feature = "ambient_agents_command_line")]
-        FeatureFlag::AmbientAgentsCommandLine,
-        #[cfg(feature = "ambient_agents_image_upload")]
-        FeatureFlag::AmbientAgentsImageUpload,
-        #[cfg(feature = "scheduled_ambient_agents")]
-        FeatureFlag::ScheduledAmbientAgents,
-        #[cfg(feature = "code_launch_modal")]
-        FeatureFlag::CodeLaunchModal,
-        #[cfg(feature = "api_key_authentication")]
-        FeatureFlag::APIKeyAuthentication,
-        #[cfg(feature = "api_key_management")]
-        FeatureFlag::APIKeyManagement,
-        #[cfg(feature = "mcp_oauth")]
-        FeatureFlag::McpOauth,
-        #[cfg(feature = "file_based_mcp")]
-        FeatureFlag::FileBasedMcp,
-        #[cfg(feature = "diff_set_as_context")]
-        FeatureFlag::DiffSetAsContext,
-        #[cfg(feature = "discard_per_file_and_all_changes")]
-        FeatureFlag::DiscardPerFileAndAllChanges,
-        #[cfg(feature = "summarization_cancellation_confirmation")]
-        FeatureFlag::SummarizationCancellationConfirmation,
-        #[cfg(feature = "code_review_find")]
-        FeatureFlag::CodeReviewFind,
-        #[cfg(feature = "ui_zoom")]
-        FeatureFlag::UIZoom,
-        #[cfg(feature = "auto_open_code_review_pane")]
-        FeatureFlag::AutoOpenCodeReviewPane,
-        #[cfg(feature = "inline_code_review")]
-        FeatureFlag::InlineCodeReview,
-        #[cfg(feature = "create_environment_slash_command")]
-        FeatureFlag::CreateEnvironmentSlashCommand,
-        #[cfg(feature = "summarize_conversation_command")]
-        FeatureFlag::SummarizationConversationCommand,
-        #[cfg(feature = "mcp_grouped_server_context")]
-        FeatureFlag::MCPGroupedServerContext,
-        #[cfg(feature = "web_search_ui")]
-        FeatureFlag::WebSearchUI,
-        #[cfg(feature = "web_fetch_ui")]
-        FeatureFlag::WebFetchUI,
-        #[cfg(feature = "fork_from_command")]
-        FeatureFlag::ForkFromCommand,
-        #[cfg(feature = "context_window_usage_v2")]
-        FeatureFlag::ContextWindowUsageV2,
-        #[cfg(feature = "global_search")]
-        FeatureFlag::GlobalSearch,
-        #[cfg(feature = "embedded_code_review_comments")]
-        FeatureFlag::EmbeddedCodeReviewComments,
-        #[cfg(feature = "file_and_diff_set_comments")]
-        FeatureFlag::FileAndDiffSetComments,
-        #[cfg(feature = "revert_to_checkpoints")]
-        FeatureFlag::RevertToCheckpoints,
-        #[cfg(feature = "rewind_slash_command")]
-        FeatureFlag::RewindSlashCommand,
-        #[cfg(feature = "agent_management_view")]
-        FeatureFlag::AgentManagementView,
-        #[cfg(feature = "agent_management_details_view")]
-        FeatureFlag::AgentManagementDetailsView,
-        #[cfg(feature = "agent_view")]
-        FeatureFlag::AgentView,
-        #[cfg(feature = "agent_view_block_context")]
-        FeatureFlag::AgentViewBlockContext,
-        #[cfg(feature = "warp_managed_secrets")]
-        FeatureFlag::WarpManagedSecrets,
-        #[cfg(feature = "v4a_file_diffs")]
-        FeatureFlag::V4AFileDiffs,
-        #[cfg(feature = "interactive_conversation_management_view")]
-        FeatureFlag::InteractiveConversationManagementView,
-        #[cfg(feature = "agent_tips")]
-        FeatureFlag::AgentTips,
-        #[cfg(feature = "agent_mode_computer_use")]
-        FeatureFlag::AgentModeComputerUse,
-        #[cfg(feature = "local_computer_use")]
-        FeatureFlag::LocalComputerUse,
-        #[cfg(feature = "team_api_keys")]
-        FeatureFlag::TeamApiKeys,
-        #[cfg(feature = "cloud_conversations")]
-        FeatureFlag::CloudConversations,
-        #[cfg(feature = "agent_toolbar_editor")]
-        FeatureFlag::AgentToolbarEditor,
-        #[cfg(feature = "configurable_toolbar")]
-        FeatureFlag::ConfigurableToolbar,
-        #[cfg(feature = "agent_view_prompt_chip")]
-        FeatureFlag::AgentViewPromptChip,
-        #[cfg(feature = "ambient_agents_rtc")]
-        FeatureFlag::AmbientAgentsRTC,
-        #[cfg(feature = "classic_completions")]
-        FeatureFlag::ClassicCompletions,
-        #[cfg(feature = "force_classic_completions")]
-        FeatureFlag::ForceClassicCompletions,
-        #[cfg(feature = "agent_view_conversation_list_view")]
-        FeatureFlag::AgentViewConversationListView,
-        #[cfg(feature = "inline_history_menu")]
-        FeatureFlag::InlineHistoryMenu,
-        #[cfg(feature = "inline_repo_menu")]
-        FeatureFlag::InlineRepoMenu,
-        #[cfg(feature = "cloud_mode")]
-        FeatureFlag::CloudMode,
-        #[cfg(feature = "cloud_mode_from_local_session")]
-        FeatureFlag::CloudModeFromLocalSession,
-        #[cfg(feature = "cloud_mode_image_context")]
-        FeatureFlag::CloudModeImageContext,
-        #[cfg(feature = "summarization_via_message_replacement")]
-        FeatureFlag::SummarizationViaMessageReplacement,
-        #[cfg(feature = "pluggable_notifications")]
-        FeatureFlag::PluggableNotifications,
-        #[cfg(feature = "list_skills")]
-        FeatureFlag::ListSkills,
-        #[cfg(feature = "ask_user_question")]
-        FeatureFlag::AskUserQuestion,
-        #[cfg(feature = "lsp_as_a_tool")]
-        FeatureFlag::LSPAsATool,
-        #[cfg(feature = "inline_profile_selector")]
-        FeatureFlag::InlineProfileSelector,
-        #[cfg(feature = "oz_platform_skills")]
-        FeatureFlag::OzPlatformSkills,
-        #[cfg(feature = "oz_identity_federation")]
-        FeatureFlag::OzIdentityFederation,
-        #[cfg(feature = "oz_changelog_updates")]
-        FeatureFlag::OzChangelogUpdates,
-        #[cfg(feature = "bundled_skills")]
-        FeatureFlag::BundledSkills,
-        #[cfg(feature = "oz_launch_modal")]
-        FeatureFlag::OzLaunchModal,
-        #[cfg(feature = "open_warp_launch_modal")]
-        FeatureFlag::OpenWarpLaunchModal,
-        #[cfg(feature = "new_tab_styling")]
-        FeatureFlag::NewTabStyling,
-        #[cfg(feature = "skill_arguments")]
-        FeatureFlag::SkillArguments,
-        #[cfg(feature = "active_conversation_requires_interaction")]
-        FeatureFlag::ActiveConversationRequiresInteraction,
-        #[cfg(feature = "conversations_as_context")]
-        FeatureFlag::ConversationsAsContext,
-        #[cfg(feature = "incremental_auto_reload")]
-        FeatureFlag::IncrementalAutoReload,
-        #[cfg(feature = "orchestration")]
-        FeatureFlag::Orchestration,
-        #[cfg(feature = "orchestration_v2")]
-        FeatureFlag::OrchestrationV2,
-        #[cfg(feature = "orchestration_pill_bar")]
-        FeatureFlag::OrchestrationPillBar,
-        #[cfg(feature = "pending_user_query_indicator")]
-        FeatureFlag::PendingUserQueryIndicator,
-        #[cfg(feature = "queue_slash_command")]
-        FeatureFlag::QueueSlashCommand,
-        #[cfg(feature = "kitty_keyboard_protocol")]
-        FeatureFlag::KittyKeyboardProtocol,
-        #[cfg(feature = "inline_menu_headers")]
-        FeatureFlag::InlineMenuHeaders,
-        #[cfg(feature = "directory_tab_colors")]
-        FeatureFlag::DirectoryTabColors,
-        #[cfg(feature = "open_warp_new_settings_modes")]
-        FeatureFlag::OpenWarpNewSettingsModes,
-        #[cfg(feature = "hoa_code_review")]
-        FeatureFlag::HoaCodeReview,
-        #[cfg(feature = "vertical_tabs")]
-        FeatureFlag::VerticalTabs,
-        #[cfg(feature = "vertical_tabs_summary_mode")]
-        FeatureFlag::VerticalTabsSummaryMode,
-        #[cfg(feature = "tab_configs")]
-        FeatureFlag::TabConfigs,
-        #[cfg(feature = "agent_harness")]
-        FeatureFlag::AgentHarness,
-        #[cfg(feature = "oz_handoff")]
-        FeatureFlag::OzHandoff,
-        #[cfg(feature = "hoa_notifications")]
-        FeatureFlag::HOANotifications,
-        #[cfg(feature = "open_code_notifications")]
-        FeatureFlag::OpenCodeNotifications,
-        #[cfg(feature = "cli_agent_rich_input")]
-        FeatureFlag::CLIAgentRichInput,
-        #[cfg(feature = "transfer_control_tool")]
-        FeatureFlag::TransferControlTool,
-        #[cfg(feature = "warpify_footer")]
-        FeatureFlag::WarpifyFooter,
-        #[cfg(feature = "solo_user_byok")]
-        FeatureFlag::SoloUserByok,
-        #[cfg(feature = "skip_firebase_anonymous_user")]
-        FeatureFlag::SkipFirebaseAnonymousUser,
-        #[cfg(feature = "hoa_onboarding_flow")]
-        FeatureFlag::HOAOnboardingFlow,
-        #[cfg(feature = "git_operations_in_code_review")]
-        FeatureFlag::GitOperationsInCodeReview,
-        #[cfg(feature = "hoa_remote_control")]
-        FeatureFlag::HOARemoteControl,
-        #[cfg(feature = "codex_notifications")]
-        FeatureFlag::CodexNotifications,
-        #[cfg(feature = "trim_trailing_blank_lines")]
-        FeatureFlag::TrimTrailingBlankLines,
-        #[cfg(feature = "cloud_mode_setup_v2")]
-        FeatureFlag::CloudModeSetupV2,
-        #[cfg(feature = "cloud_mode_input_v2")]
-        FeatureFlag::CloudModeInputV2,
-        #[cfg(feature = "configurable_context_window")]
-        FeatureFlag::ConfigurableContextWindow,
-        #[cfg(feature = "handoff_cloud_cloud")]
-        FeatureFlag::HandoffCloudCloud,
-    ]);
-
-    flags
-}
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;

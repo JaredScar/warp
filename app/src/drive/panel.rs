@@ -1,39 +1,40 @@
 use futures::Future;
+use warp_errors::report_error;
+use warpui::elements::{
+    Align, Flex, Hoverable, MouseStateHandle, ParentElement, SavePosition, Shrinkable,
+};
+use warpui::presenter::ChildView;
+use warpui::windowing::{StateEvent, WindowManager};
 use warpui::{
-    elements::{Align, Flex, Hoverable, MouseStateHandle, ParentElement, SavePosition, Shrinkable},
-    presenter::ChildView,
-    windowing::{StateEvent, WindowManager},
     AppContext, Element, Entity, FocusContext, SingletonEntity, TypedActionView, View, ViewContext,
     ViewHandle,
 };
 
-use crate::{
-    ai::{document::ai_document_model::AIDocumentId, facts::CloudAIFactModel},
-    cloud_object::{
-        model::{persistence::CloudModel, view::CloudViewModel},
-        CloudObjectEventEntrypoint, GenericStringObjectFormat, JsonObjectType, Owner, Space,
-    },
-    env_vars::{manager::EnvVarCollectionSource, CloudEnvVarCollection},
-    notebooks::{manager::NotebookSource, CloudNotebook},
-    server::{
-        cloud_objects::update_manager::{InitiatedBy, UpdateManager},
-        ids::{ClientId, ServerId, SyncId},
-        telemetry::SharingDialogSource,
-    },
-    workflows::{manager::WorkflowOpenSource, CloudWorkflow, WorkflowViewMode},
-    workspaces::user_workspaces::UserWorkspaces,
+use super::drive_helpers::{
+    has_feature_gated_anonymous_user_reached_env_var_limit,
+    has_feature_gated_anonymous_user_reached_notebook_limit,
+    has_feature_gated_anonymous_user_reached_workflow_limit,
 };
-
-use super::{
-    drive_helpers::{
-        has_feature_gated_anonymous_user_reached_env_var_limit,
-        has_feature_gated_anonymous_user_reached_notebook_limit,
-        has_feature_gated_anonymous_user_reached_workflow_limit,
-    },
-    index::{DriveIndex, DriveIndexAction, DriveIndexEvent},
-    items::WarpDriveItemId,
-    CloudObjectTypeAndId, DriveObjectType,
+use super::index::{DriveIndex, DriveIndexAction, DriveIndexEvent};
+use super::items::WarpDriveItemId;
+use super::{CloudObjectTypeAndId, DriveObjectType};
+use crate::ai::document::ai_document_model::AIDocumentId;
+use crate::ai::facts::CloudAIFactModel;
+use crate::cloud_object::model::persistence::CloudModel;
+use crate::cloud_object::model::view::CloudViewModel;
+use crate::cloud_object::{
+    CloudObjectEventEntrypoint, GenericStringObjectFormat, JsonObjectType, Owner, Space,
 };
+use crate::env_vars::CloudEnvVarCollection;
+use crate::env_vars::manager::EnvVarCollectionSource;
+use crate::notebooks::CloudNotebook;
+use crate::notebooks::manager::NotebookSource;
+use crate::server::cloud_objects::update_manager::{InitiatedBy, UpdateManager};
+use crate::server::ids::{ClientId, ServerId, SyncId};
+use crate::server::telemetry::SharingDialogSource;
+use crate::workflows::manager::WorkflowOpenSource;
+use crate::workflows::{CloudWorkflow, WorkflowViewMode};
+use crate::workspaces::user_workspaces::UserWorkspaces;
 
 pub const MIN_SIDEBAR_WIDTH: f32 = 250.;
 pub const MAX_SIDEBAR_WIDTH_RATIO: f32 = 0.75;
@@ -150,7 +151,10 @@ impl DrivePanel {
                     }));
                 }
                 None => {
-                    log::error!("Cannot identify a notebook owner from {space:?}");
+                    report_error!(
+                        "Cannot identify a notebook owner",
+                        extra: { "space" => ?space }
+                    );
                 }
             },
             DriveIndexEvent::OpenImportModal {
@@ -162,7 +166,10 @@ impl DrivePanel {
                     initial_folder_id: *initial_folder_id,
                 }),
                 None => {
-                    log::error!("Cannot identify an import target from {space:?}");
+                    report_error!(
+                        "Cannot identify an import target",
+                        extra: { "space" => ?space }
+                    );
                 }
             },
             DriveIndexEvent::CreateFolder {
@@ -185,7 +192,10 @@ impl DrivePanel {
                     });
                 }
                 None => {
-                    log::error!("Cannot identify a folder owner from {space:?}");
+                    report_error!(
+                        "Cannot identify a folder owner",
+                        extra: { "space" => ?space }
+                    );
                 }
             },
             DriveIndexEvent::CreateEnvVarCollection {
@@ -201,7 +211,10 @@ impl DrivePanel {
                     },
                 )),
                 None => {
-                    log::error!("Cannot identify an env var owner from {space:?}");
+                    report_error!(
+                        "Cannot identify an env var owner",
+                        extra: { "space" => ?space }
+                    );
                 }
             },
             DriveIndexEvent::CreateWorkflow {
@@ -222,7 +235,10 @@ impl DrivePanel {
                     WorkflowViewMode::Create,
                 )),
                 None => {
-                    log::error!("Cannot identify a workflow owner from {space:?}");
+                    report_error!(
+                        "Cannot identify a workflow owner",
+                        extra: { "space" => ?space }
+                    );
                 }
             },
             DriveIndexEvent::OpenAIFactCollection => {
@@ -343,7 +359,10 @@ impl DrivePanel {
                     });
                 }
                 None => {
-                    log::error!("Cannot identify an AI rule owner from {space:?}");
+                    report_error!(
+                        "Cannot identify an AI rule owner",
+                        extra: { "space" => ?space }
+                    );
                 }
             },
             DriveIndexEvent::AttachPlanAsContext(id) => {
@@ -583,7 +602,7 @@ impl DrivePanel {
         ctx.emit(DrivePanelEvent::OpenMCPServerCollection);
     }
 
-    /// Recomputes and intializes the section states for the WD Index. This is needed after
+    /// Recomputes and initializes the section states for the WD Index. This is needed after
     /// we directly change anything about the state of the index (such as folders being open/closed).
     ///
     /// This should only be called if we immeidiately need to update and rely on the updated state.
@@ -641,7 +660,7 @@ impl DrivePanel {
     pub fn has_warp_drive_initialized_sections(
         &self,
         app: &AppContext,
-    ) -> impl Future<Output = ()> {
+    ) -> impl Future<Output = ()> + use<> {
         self.index_view.as_ref(app).has_initialized_sections()
     }
 
@@ -735,5 +754,5 @@ pub(crate) mod styles {
 }
 
 #[cfg(test)]
-#[path = "panel_test.rs"]
+#[path = "panel_tests.rs"]
 mod tests;

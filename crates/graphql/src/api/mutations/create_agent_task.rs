@@ -1,7 +1,7 @@
-use crate::{
-    error::UserFacingError, request_context::RequestContext, response_context::ResponseContext,
-    schema,
-};
+use crate::error::UserFacingError;
+use crate::request_context::RequestContext;
+use crate::response_context::ResponseContext;
+use crate::schema;
 
 #[derive(cynic::QueryVariables, Debug)]
 pub struct CreateAgentTaskVariables {
@@ -44,4 +44,6 @@ pub struct CreateAgentTaskInput {
     pub parent_run_id: Option<cynic::Id>,
     #[cynic(skip_serializing_if = "Option::is_none")]
     pub agent_config_snapshot: Option<String>,
+    #[cynic(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
 }

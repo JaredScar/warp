@@ -1,36 +1,33 @@
-use std::{
-    fs,
-    io::{self, IsTerminal as _, Read},
-};
+use std::fs;
+use std::io::{self, IsTerminal as _, Read};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use comfy_table::Cell;
 use inquire::{Confirm, InquireError, Password};
 use serde::Serialize;
-use warp_cli::{
-    agent::OutputFormat,
-    scope::ObjectScope,
-    secret::{
-        AnthropicMethod, CreateProvider, CreateSecretArgs, DeleteSecretArgs, ListSecretsArgs,
-        SecretCommand, SecretType, UpdateSecretArgs, ValueArgs,
-    },
-    GlobalOptions,
+use warp_cli::GlobalOptions;
+use warp_cli::agent::OutputFormat;
+use warp_cli::scope::ObjectScope;
+use warp_cli::secret::{
+    AnthropicMethod, CodexMethod, CreateProvider, CreateSecretArgs, DeleteSecretArgs,
+    ListSecretsArgs, SecretCommand, SecretType, UpdateSecretArgs, ValueArgs,
 };
 use warp_core::features::FeatureFlag;
-use warp_graphql::{
-    managed_secrets::{ManagedSecret, ManagedSecretType},
-    object::SpaceType,
-};
-use warp_managed_secrets::{client::SecretOwner, ManagedSecretManager, ManagedSecretValue};
-use warpui::{platform::TerminationMode, AppContext, SingletonEntity as _};
-
-use crate::{
-    auth::UserUid, cloud_object::Owner, server::ids::ServerId,
-    util::time_format::format_approx_duration_from_now_utc,
-};
+use warp_graphql::managed_secrets::{ManagedSecret, ManagedSecretType};
+use warp_graphql::object::SpaceType;
+use warp_managed_secrets::ManagedSecretValue;
+use warp_managed_secrets::client::SecretOwner;
+use warpui::platform::TerminationMode;
+use warpui::{AppContext, SingletonEntity as _};
 
 use super::output::{self, TableFormat};
+use crate::auth::UserUid;
+use crate::cloud_object::Owner;
+use crate::server::ids::ServerId;
+use crate::server::server_api::managed_secrets::AppManagedSecretManager as ManagedSecretManager;
+use crate::server::team_scope::RequestTeamScope;
+use crate::util::time_format::format_approx_duration_from_now_utc;
 
 #[derive(Serialize)]
 struct SecretInfo {
@@ -64,6 +61,15 @@ impl TableFormat for SecretInfo {
             Cell::new(format_approx_duration_from_now_utc(self.updated_at)),
         ]
     }
+}
+
+fn resolve_secret_owner_and_request_scope(
+    scope: &ObjectScope,
+    ctx: &AppContext,
+) -> Result<(Owner, RequestTeamScope)> {
+    let team_scope = super::common::resolve_object_scope(scope, ctx)?;
+    let owner = super::common::resolve_owner_for_team_scope(&team_scope, ctx)?;
+    Ok((owner, RequestTeamScope::from_scope(&team_scope)))
 }
 
 /// Run secret-related commands.
@@ -105,6 +111,18 @@ enum SecretInput {
         session_token: Option<String>,
         region: Option<String>,
     },
+    /// OpenAI API key secret with optional base URL.
+    OpenaiApiKey {
+        value_args: ValueArgs,
+        base_url: Option<String>,
+    },
+    /// Multi-field container registry credential with dedicated CLI flags.
+    DockerRegistry {
+        host: Option<String>,
+        username: Option<String>,
+        password: Option<String>,
+        password_file: Option<std::path::PathBuf>,
+    },
 }
 
 impl SecretInput {
@@ -137,6 +155,16 @@ impl SecretInput {
                 session_token,
                 region,
             ),
+            SecretInput::OpenaiApiKey {
+                value_args,
+                base_url,
+            } => read_openai_api_key_secret_value(&value_args, base_url),
+            SecretInput::DockerRegistry {
+                host,
+                username,
+                password,
+                password_file,
+            } => read_docker_registry_secret_value(host, username, password, password_file),
         }
     }
 }
@@ -176,6 +204,28 @@ fn create_secret(ctx: &mut AppContext, args: CreateSecretArgs) -> Result<()> {
                 a.common.scope,
             ),
         },
+        Some(CreateProvider::Codex(codex)) => match codex.method {
+            CodexMethod::ApiKey(a) => (
+                a.common.name,
+                SecretInput::OpenaiApiKey {
+                    value_args: a.value,
+                    base_url: a.base_url,
+                },
+                a.common.description,
+                a.common.scope,
+            ),
+        },
+        Some(CreateProvider::DockerRegistry(a)) => (
+            a.common.name,
+            SecretInput::DockerRegistry {
+                host: a.host,
+                username: a.username,
+                password: a.password,
+                password_file: a.password_file,
+            },
+            a.common.description,
+            a.common.scope,
+        ),
         None => {
             let name = args.name.ok_or_else(|| {
                 anyhow::anyhow!("Secret name is required. Usage: oz secret create <NAME>")
@@ -215,8 +265,8 @@ fn create_secret_with_input(
                 return;
             }
 
-            let owner = match super::common::resolve_owner(scope.team, scope.personal, ctx) {
-                Ok(owner) => owner,
+            let (owner, request_scope) = match resolve_secret_owner_and_request_scope(&scope, ctx) {
+                Ok(resolved) => resolved,
                 Err(err) => {
                     super::report_fatal_error(err, ctx);
                     return;
@@ -244,6 +294,7 @@ fn create_secret_with_input(
             };
 
             let create_future = manager.create_secret(
+                request_scope,
                 secret_owner,
                 name.clone(),
                 managed_value,
@@ -268,8 +319,7 @@ fn create_secret_with_input(
 fn delete_secret(ctx: &mut AppContext, args: DeleteSecretArgs) -> Result<()> {
     let name = args.name;
     let force = args.force;
-    let team = args.scope.team;
-    let personal = args.scope.personal;
+    let scope = args.scope;
 
     ManagedSecretManager::handle(ctx).update(ctx, move |_manager, ctx| {
         let refresh_future = super::common::refresh_workspace_metadata(ctx);
@@ -280,13 +330,14 @@ fn delete_secret(ctx: &mut AppContext, args: DeleteSecretArgs) -> Result<()> {
                 return;
             }
 
-            let owner = match super::common::resolve_owner(team, personal, ctx) {
-                Ok(owner) => owner,
-                Err(err) => {
-                    super::report_fatal_error(err, ctx);
-                    return;
-                }
-            };
+            let (owner, request_scope) =
+                match resolve_secret_owner_and_request_scope(&scope, ctx) {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        super::report_fatal_error(err, ctx);
+                        return;
+                    }
+                };
 
             let secret_owner = match owner {
                 Owner::User { .. } => SecretOwner::CurrentUser,
@@ -336,7 +387,8 @@ fn delete_secret(ctx: &mut AppContext, args: DeleteSecretArgs) -> Result<()> {
                 }
             }
 
-            let delete_future = manager.delete_secret(secret_owner, name.clone());
+            let delete_future =
+                manager.delete_secret(request_scope, secret_owner, name.clone());
             ctx.spawn(delete_future, move |_, result, ctx| match result {
                 Ok(()) => {
                     println!("Secret '{name}' deleted");
@@ -364,9 +416,9 @@ fn update_secret(ctx: &mut AppContext, args: UpdateSecretArgs) -> Result<()> {
                 return;
             }
 
-            let owner =
-                match super::common::resolve_owner(args.scope.team, args.scope.personal, ctx) {
-                    Ok(owner) => owner,
+            let (owner, request_scope) =
+                match resolve_secret_owner_and_request_scope(&args.scope, ctx) {
+                    Ok(resolved) => resolved,
                     Err(err) => {
                         super::report_fatal_error(err, ctx);
                         return;
@@ -401,7 +453,7 @@ fn update_secret(ctx: &mut AppContext, args: UpdateSecretArgs) -> Result<()> {
 
             if let Some(secret_value) = secret_value {
                 // Look up the existing secret's type so we use the correct ManagedSecretValue variant.
-                let list_future = manager.list_secrets();
+                let list_future = manager.list_secrets(Some(request_scope));
                 ctx.spawn(list_future, move |manager, list_result, ctx| {
                     let secrets = match list_result {
                         Ok(secrets) => secrets,
@@ -431,6 +483,7 @@ fn update_secret(ctx: &mut AppContext, args: UpdateSecretArgs) -> Result<()> {
                             }
                         };
                     let update_future = manager.update_secret(
+                        request_scope,
                         secret_owner,
                         args.name.clone(),
                         Some(managed_secret_value),
@@ -449,6 +502,7 @@ fn update_secret(ctx: &mut AppContext, args: UpdateSecretArgs) -> Result<()> {
             } else {
                 // Description-only update; no encryption needed.
                 let update_future = manager.update_secret(
+                    request_scope,
                     secret_owner,
                     args.name.clone(),
                     None,
@@ -474,37 +528,68 @@ fn update_secret(ctx: &mut AppContext, args: UpdateSecretArgs) -> Result<()> {
 fn list_secrets(
     ctx: &mut AppContext,
     output_format: OutputFormat,
-    _args: ListSecretsArgs,
+    args: ListSecretsArgs,
 ) -> Result<()> {
-    ManagedSecretManager::handle(ctx).update(ctx, |manager, ctx| {
-        ctx.spawn(manager.list_secrets(), move |_, result, ctx| match result {
-            Ok(secrets) => {
-                let secret_infos = secrets.into_iter().map(|secret| {
-                    let owner = match secret.owner.type_ {
-                        SpaceType::User => Owner::User {
-                            user_uid: UserUid::new(secret.owner.uid.inner()),
-                        },
-                        SpaceType::Team => Owner::Team {
-                            team_uid: ServerId::from_string_lossy(secret.owner.uid.inner()),
-                        },
-                    };
-
-                    SecretInfo {
-                        name: secret.name,
-                        scope: super::common::format_owner(&owner).to_string(),
-                        secret_type: secret.type_,
-                        created_at: secret.created_at.utc(),
-                        updated_at: secret.updated_at.utc(),
-                    }
-                });
-
-                output::print_list(secret_infos, output_format);
-
-                ctx.terminate_app(TerminationMode::ForceTerminate, None);
-            }
-            Err(err) => {
+    ManagedSecretManager::handle(ctx).update(ctx, move |_manager, ctx| {
+        let refresh_future = super::common::refresh_workspace_metadata(ctx);
+        ctx.spawn(refresh_future, move |manager, refresh_result, ctx| {
+            if let Err(err) = refresh_result {
                 super::report_fatal_error(err, ctx);
+                return;
             }
+            let include_user_secrets = !args.scope.is_team();
+            let include_team_secrets = !args.scope.personal;
+            let request_scope = if args.scope.is_team() {
+                match super::common::request_team_scope_for_cli(&args.scope.team_selection, ctx) {
+                    Ok(request_scope) => Some(request_scope),
+                    Err(err) => {
+                        super::report_fatal_error(err, ctx);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            ctx.spawn(
+                manager.list_secrets(request_scope),
+                move |_, result, ctx| match result {
+                    Ok(secrets) => {
+                        let secret_infos = secrets
+                            .into_iter()
+                            .filter(|secret| match secret.owner.type_ {
+                                SpaceType::User => include_user_secrets,
+                                SpaceType::Team => include_team_secrets,
+                            })
+                            .map(|secret| {
+                                let owner = match secret.owner.type_ {
+                                    SpaceType::User => Owner::User {
+                                        user_uid: UserUid::new(secret.owner.uid.inner()),
+                                    },
+                                    SpaceType::Team => Owner::Team {
+                                        team_uid: ServerId::from_string_lossy(
+                                            secret.owner.uid.inner(),
+                                        ),
+                                    },
+                                };
+
+                                SecretInfo {
+                                    name: secret.name,
+                                    scope: super::common::format_owner(&owner).to_string(),
+                                    secret_type: secret.type_,
+                                    created_at: secret.created_at.utc(),
+                                    updated_at: secret.updated_at.utc(),
+                                }
+                            });
+
+                        output::print_list(secret_infos, output_format);
+
+                        ctx.terminate_app(TerminationMode::ForceTerminate, None);
+                    }
+                    Err(err) => {
+                        super::report_fatal_error(err, ctx);
+                    }
+                },
+            );
         });
     });
     Ok(())
@@ -556,6 +641,11 @@ fn make_simple_secret_value(secret_type: SecretType, raw: &str) -> ManagedSecret
             // Bedrock secrets are multi-field and handled via SecretInput::Bedrock.
             unreachable!("Bedrock secrets should not go through make_simple_secret_value")
         }
+        SecretType::OpenaiApiKey => {
+            // OpenAI API key secrets are handled via SecretInput::OpenaiApiKey so the optional
+            // base URL can be plumbed through alongside the API key.
+            unreachable!("OpenAI API key secrets should not go through make_simple_secret_value")
+        }
     }
 }
 
@@ -583,7 +673,82 @@ fn make_secret_value_from_gql_type(
                 "Bedrock API key secrets cannot be updated via `--value`; re-create the secret instead"
             ))
         }
+        ManagedSecretType::OpenaiApiKey => Ok(ManagedSecretValue::openai_api_key(raw, None)),
+        ManagedSecretType::LlmProviderApiKey => Err(anyhow::anyhow!(
+            "LLM provider API key secrets must be updated through the provider-aware secrets form"
+        )),
+        ManagedSecretType::DockerRegistry => {
+            // Registry credentials are multi-field and have no CLI creation/update flow yet.
+            Err(anyhow::anyhow!(
+                "Container registry credential secrets cannot be updated via `--value`; re-create the secret instead"
+            ))
+        }
+        ManagedSecretType::AwsEcrCredential => {
+            // AWS ECR credentials are multi-field and have no CLI creation/update flow yet.
+            Err(anyhow::anyhow!(
+                "AWS ECR credential secrets cannot be updated via `--value`; re-create the secret instead"
+            ))
+        }
     }
+}
+
+/// Read an OpenAI API key secret from CLI flags or interactive prompts.
+///
+/// The API key value is read from `--value-file`, stdin, or an interactive password prompt (in
+/// that order), matching the behavior of other simple secret types.
+///
+/// `base_url` is optional. When `--base-url` is provided we use it verbatim (an empty value is
+/// treated as "no base URL"). When it is not provided and we are running interactively, we
+/// prompt for it; pressing Enter at the prompt skips the base URL. In non-interactive mode we
+/// silently default to no base URL, since the vast majority of users use the provider's default
+/// endpoint.
+fn read_openai_api_key_secret_value(
+    value_args: &ValueArgs,
+    base_url: Option<String>,
+) -> Result<Option<ManagedSecretValue>> {
+    let api_key = match read_simple_secret_value(value_args)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    // The base URL is optional. An empty `--base-url` flag, empty interactive submission, or
+    // omission in non-interactive mode all map to `None` so we never persist a blank string.
+    let base_url: Option<String> = match base_url {
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        }
+        None => {
+            if !io::stdin().is_terminal() {
+                // Non-interactive: leave the base URL unset rather than prompting or failing.
+                None
+            } else {
+                match inquire::Text::new("OpenAI base URL (optional, press Enter to skip):")
+                    .with_help_message("e.g. https://us.api.openai.com/v1 for a regional endpoint")
+                    .prompt()
+                {
+                    Ok(value) => {
+                        let trimmed = value.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_owned())
+                        }
+                    }
+                    Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+                        return Ok(None);
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+    };
+
+    Ok(Some(ManagedSecretValue::openai_api_key(api_key, base_url)))
 }
 
 /// Read a Bedrock API key secret from dedicated CLI flags or interactive prompts.
@@ -745,6 +910,101 @@ fn read_bedrock_access_key_secret_value(
     )))
 }
 
+/// Mirrors the server's registry-host format check (a bare host, no scheme or path), matching
+/// the same rule the web UI enforces client-side.
+fn validate_registry_host(host: &str) -> Result<()> {
+    if host.contains("://") || host.contains('/') {
+        anyhow::bail!("Registry host must not include a scheme or path.");
+    }
+    Ok(())
+}
+
+/// Read a container registry credential secret from dedicated CLI flags or interactive prompts.
+fn read_docker_registry_secret_value(
+    host: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    password_file: Option<std::path::PathBuf>,
+) -> Result<Option<ManagedSecretValue>> {
+    const NON_INTERACTIVE_REQUIRED_MSG: &str = "Container registry credentials require --host, --username, and one of --password or --password-file in non-interactive mode";
+
+    // Check once and reuse: querying terminal status is a syscall.
+    let is_terminal = io::stdin().is_terminal();
+
+    let host = match host {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            if !is_terminal {
+                return Err(anyhow::anyhow!(NON_INTERACTIVE_REQUIRED_MSG));
+            }
+            match inquire::Text::new("Registry host (e.g. ghcr.io):").prompt() {
+                Ok(value) if !value.is_empty() => value,
+                Ok(_) => return Ok(None),
+                Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+                    return Ok(None);
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    };
+    validate_registry_host(&host)?;
+
+    let username = match username {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            if !is_terminal {
+                return Err(anyhow::anyhow!(NON_INTERACTIVE_REQUIRED_MSG));
+            }
+            match inquire::Text::new("Registry username:").prompt() {
+                Ok(value) if !value.is_empty() => value,
+                Ok(_) => return Ok(None),
+                Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+                    return Ok(None);
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    };
+
+    let password = match password {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            if let Some(password_file) = password_file {
+                let value = fs::read_to_string(&password_file).with_context(|| {
+                    format!(
+                        "Failed to read registry password from: {}",
+                        password_file.display()
+                    )
+                })?;
+                let value = value.trim_end_matches(['\n', '\r']);
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                value.to_owned()
+            } else if !is_terminal {
+                return Err(anyhow::anyhow!(NON_INTERACTIVE_REQUIRED_MSG));
+            } else {
+                match Password::new("Registry password or access token:")
+                    .with_display_toggle_enabled()
+                    .without_confirmation()
+                    .prompt()
+                {
+                    Ok(value) if !value.is_empty() => value,
+                    Ok(_) => return Ok(None),
+                    Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+                        return Ok(None);
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+    };
+
+    Ok(Some(ManagedSecretValue::docker_registry(
+        host, username, password,
+    )))
+}
+
 /// Finds the type of an existing secret by name and owner scope.
 fn find_secret_type(
     secrets: &[ManagedSecret],
@@ -772,5 +1032,13 @@ fn format_secret_type(type_: &ManagedSecretType) -> String {
         ManagedSecretType::AnthropicApiKey => "Anthropic API Key".to_string(),
         ManagedSecretType::AnthropicBedrockAccessKey => "Anthropic Bedrock Access Key".to_string(),
         ManagedSecretType::AnthropicBedrockApiKey => "Anthropic Bedrock API Key".to_string(),
+        ManagedSecretType::OpenaiApiKey => "OpenAI API Key".to_string(),
+        ManagedSecretType::LlmProviderApiKey => "LLM provider API key".to_string(),
+        ManagedSecretType::DockerRegistry => "Container Registry Credential".to_string(),
+        ManagedSecretType::AwsEcrCredential => "AWS ECR Credential".to_string(),
     }
 }
+
+#[cfg(test)]
+#[path = "secret_tests.rs"]
+mod tests;

@@ -3,19 +3,15 @@ use std::collections::HashMap;
 use lazy_static::lazy_static;
 use warp_core::features::FeatureFlag;
 use warp_core::ui::theme::color::internal_colors;
-use warpui::elements::Wrap;
-use warpui::{
-    elements::{
-        Container, CornerRadius, Flex, Hoverable, MouseStateHandle, ParentElement, Radius, Text,
-    },
-    platform::Cursor,
-    AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext,
+use warpui::elements::{
+    Container, CornerRadius, Flex, Hoverable, MouseStateHandle, ParentElement, Radius, Text, Wrap,
 };
+use warpui::platform::Cursor;
+use warpui::{AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext};
 
 use crate::appearance::Appearance;
 use crate::drive::settings::{WarpDriveSettings, WarpDriveSettingsChangedEvent};
-use crate::search::FilterChipRenderer;
-use crate::search::QueryFilter;
+use crate::search::{FilterChipRenderer, QueryFilter};
 use crate::settings::{AISettings, AISettingsChangedEvent};
 
 lazy_static! {
@@ -28,10 +24,6 @@ lazy_static! {
         (
             "# find \"foo\" in files",
             QueryFilter::NaturalLanguage
-        ),
-        (
-            "notebooks: deploy production server",
-            QueryFilter::Notebooks
         ),
     ]);
 }
@@ -287,8 +279,6 @@ impl TypedActionView for CommandSearchZeroStateView {
     }
 }
 
-/// Returns list of valid query filters that may be applied. This does not include notebooks if the
-/// notebooks feature flag is disabled.
 fn valid_query_filters(app: &AppContext) -> Vec<QueryFilter> {
     let mut filters = vec![QueryFilter::History];
 
@@ -300,8 +290,7 @@ fn valid_query_filters(app: &AppContext) -> Vec<QueryFilter> {
     }
 
     if WarpDriveSettings::is_warp_drive_enabled(app) {
-        filters.extend([QueryFilter::Workflows, QueryFilter::Notebooks]);
-
+        filters.push(QueryFilter::Workflows);
         filters.push(QueryFilter::EnvironmentVariables);
     }
 

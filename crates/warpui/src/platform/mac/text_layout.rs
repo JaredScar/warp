@@ -1,34 +1,3 @@
-use block::{Block, ConcreteBlock};
-use core_foundation::array::CFArray;
-use core_foundation::attributed_string::CFMutableAttributedStringRef;
-use core_foundation::base::CFType;
-use core_foundation::boolean::CFBoolean;
-use core_foundation::dictionary::CFDictionary;
-use core_foundation::mach_port::CFIndex;
-use core_foundation::number::CFNumber;
-use core_foundation::{
-    attributed_string::CFMutableAttributedString,
-    base::CFTypeID,
-    base::{CFRange, TCFType},
-    declare_TCFType, impl_TCFType,
-    string::CFString,
-};
-use core_graphics::base::CGFloat;
-use core_graphics::color::CGColor;
-use core_graphics::display::{CGPoint, CGRect, CGSize};
-use core_graphics::path::CGPath;
-use core_text::framesetter::CTFramesetter;
-use core_text::line::CTLineRef;
-use core_text::run::{CTRun, CTRunRef};
-use core_text::string_attributes::kCTKernAttributeName;
-use core_text::{
-    font::CTFont,
-    line::CTLine,
-    string_attributes::{kCTFontAttributeName, kCTParagraphStyleAttributeName},
-};
-use itertools::Itertools;
-use ordered_float::OrderedFloat;
-use pathfinder_geometry::vector::vec2f;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -36,6 +5,31 @@ use std::marker::PhantomData;
 use std::ops::Range;
 use std::rc::Rc;
 use std::slice;
+
+use block::{Block, ConcreteBlock};
+use core_foundation::array::CFArray;
+use core_foundation::attributed_string::{CFMutableAttributedString, CFMutableAttributedStringRef};
+use core_foundation::base::{CFRange, CFType, CFTypeID, TCFType};
+use core_foundation::boolean::CFBoolean;
+use core_foundation::dictionary::CFDictionary;
+use core_foundation::mach_port::CFIndex;
+use core_foundation::number::CFNumber;
+use core_foundation::string::CFString;
+use core_foundation::{declare_TCFType, impl_TCFType};
+use core_graphics::base::CGFloat;
+use core_graphics::color::CGColor;
+use core_graphics::display::{CGPoint, CGRect, CGSize};
+use core_graphics::path::CGPath;
+use core_text::font::CTFont;
+use core_text::framesetter::CTFramesetter;
+use core_text::line::{CTLine, CTLineRef};
+use core_text::run::{CTRun, CTRunRef};
+use core_text::string_attributes::{
+    kCTFontAttributeName, kCTKernAttributeName, kCTParagraphStyleAttributeName,
+};
+use itertools::Itertools;
+use ordered_float::OrderedFloat;
+use pathfinder_geometry::vector::vec2f;
 use vec1::Vec1;
 use warpui_core::fonts::GlyphId;
 use warpui_core::platform::LineStyle;
@@ -169,7 +163,7 @@ impl<'a> ParagraphStyle<'a> {
     }
 }
 
-extern "C" {
+unsafe extern "C" {
     fn CFAttributedStringBeginEditing(mutable_string: CFMutableAttributedStringRef);
 
     fn CFAttributedStringEndEditing(mutable_string: CFMutableAttributedStringRef);
@@ -453,6 +447,39 @@ fn apply_paragraph_style_settings(
     }
 }
 
+/// Merges adjacent style runs that are contiguous (no gap between them) and share an identical
+/// [`StyleAndFont`] into a single run.
+///
+/// Core Text's attribute-range bookkeeping gets costly, in both time and memory, as the number
+/// of distinct ranges in an attributed string grows, even when many of them are stylistically
+/// identical. Coalescing adjacent identical runs up front bounds that range count without
+/// changing the visual output.
+fn merge_adjacent_identical_runs(
+    style_runs: &[(Range<usize>, StyleAndFont)],
+) -> Cow<'_, [(Range<usize>, StyleAndFont)]> {
+    // Avoid allocating when the runs are already maximally coalesced, the common case.
+    let first_mergeable = style_runs
+        .windows(2)
+        .position(|pair| pair[0].0.end == pair[1].0.start && pair[0].1 == pair[1].1);
+    let Some(first_mergeable) = first_mergeable else {
+        return Cow::Borrowed(style_runs);
+    };
+
+    let mut merged: Vec<(Range<usize>, StyleAndFont)> = Vec::with_capacity(style_runs.len());
+    merged.extend_from_slice(&style_runs[..first_mergeable]);
+    for (range, style) in &style_runs[first_mergeable..] {
+        if let Some(last) = merged.last_mut()
+            && last.0.end == range.start
+            && last.1 == *style
+        {
+            last.0.end = range.end;
+        } else {
+            merged.push((range.clone(), *style));
+        }
+    }
+    Cow::Owned(merged)
+}
+
 /// Creates a `CFAttributedString` out of `text` with the correct font ranges based on `runs`.
 fn create_attributed_string(
     text: &str,
@@ -470,6 +497,9 @@ fn create_attributed_string(
     unsafe {
         CFAttributedStringBeginEditing(attributed_string.as_concrete_TypeRef());
     }
+
+    let style_runs = merge_adjacent_identical_runs(style_runs);
+    let style_runs = style_runs.as_ref();
 
     let mut utf16_lens = text.chars().map(|c| c.len_utf16());
     let mut prev_char_ix: usize = 0;
@@ -1023,5 +1053,5 @@ fn advances(run: &CTRun) -> Cow<'_, [CGSize]> {
 }
 
 #[cfg(test)]
-#[path = "text_layout_test.rs"]
+#[path = "text_layout_tests.rs"]
 mod tests;

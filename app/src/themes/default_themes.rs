@@ -1,11 +1,11 @@
 use asset_macro::bundled_or_fetched_asset;
 use pathfinder_color::ColorU;
-use warp_core::ui::{
-    color::{blend::Blend, coloru_with_opacity, OPAQUE},
-    theme::{
-        color::CustomDetails, AnsiColor, AnsiColors, Details, Fill, HorizontalGradient, Image,
-        TerminalColors, VerticalGradient, WarpTheme,
-    },
+use warp_core::ui::color::blend::Blend;
+use warp_core::ui::color::{OPAQUE, coloru_with_opacity};
+use warp_core::ui::theme::color::CustomDetails;
+use warp_core::ui::theme::{
+    AnsiColor, AnsiColors, Details, Fill, HorizontalGradient, Image, TerminalColors,
+    VerticalGradient, WarpTheme,
 };
 
 const DARK_MODE_NORMAL_COLORS: AnsiColors = AnsiColors::new(
@@ -261,7 +261,7 @@ pub(super) fn adeberry_colors() -> TerminalColors {
 /// Default bundled themes
 pub fn dark_theme() -> WarpTheme {
     WarpTheme::new(
-        Fill::Solid(ColorU::from_u32(0x000000FF)),
+        Fill::Solid(ColorU::from_u32(0x050505FF)),
         ColorU::from_u32(0xffffffff),
         Fill::Solid(ColorU::from_u32(0x19AAD8FF)),
         None,

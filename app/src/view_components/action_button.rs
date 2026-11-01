@@ -1,33 +1,33 @@
+use std::borrow::Cow;
+use std::sync::Arc;
+
 use pathfinder_color::ColorU;
-use pathfinder_geometry::vector::{vec2f, Vector2F};
-use std::{borrow::Cow, sync::Arc};
-use warp_core::ui::{
-    appearance::Appearance,
-    color::{coloru_with_opacity, contrast::MinimumAllowedContrast, ContrastingColor},
-    theme::{color::internal_colors, AnsiColorIdentifier, Fill},
+use pathfinder_geometry::vector::{Vector2F, vec2f};
+use warp_core::ui::appearance::Appearance;
+use warp_core::ui::color::contrast::MinimumAllowedContrast;
+use warp_core::ui::color::{ContrastingColor, coloru_with_opacity};
+use warp_core::ui::theme::color::internal_colors;
+use warp_core::ui::theme::{AnsiColorIdentifier, Fill};
+use warpui::elements::{
+    Border, ChildAnchor, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
+    DEFAULT_UI_LINE_HEIGHT_RATIO, Flex, Hoverable, MainAxisAlignment, MainAxisSize,
+    MouseStateHandle, OffsetPositioning, Padding, ParentAnchor, ParentElement as _,
+    ParentOffsetBounds, Radius, Stack, Text,
 };
-use warpui::{elements::MainAxisAlignment, Gradient};
-use warpui::{elements::MainAxisSize, text_layout::ClipConfig};
+use warpui::fonts::{Properties, Weight};
+use warpui::keymap::Keystroke;
+use warpui::platform::Cursor;
+use warpui::text_layout::ClipConfig;
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{
-    elements::{
-        Border, ChildAnchor, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Flex,
-        Hoverable, MouseStateHandle, OffsetPositioning, Padding, ParentAnchor, ParentElement as _,
-        ParentOffsetBounds, Radius, Stack, Text, DEFAULT_UI_LINE_HEIGHT_RATIO,
-    },
-    fonts::{Properties, Weight},
-    keymap::Keystroke,
-    platform::Cursor,
-    ui_components::components::{Coords, UiComponent, UiComponentStyles},
-    AppContext, BlurContext, Element, Entity, EventContext, FocusContext, SingletonEntity as _,
-    TypedActionView, View, ViewContext,
+    AppContext, BlurContext, Element, Entity, EventContext, FocusContext, Gradient,
+    SingletonEntity as _, TypedActionView, View, ViewContext,
 };
 
-use crate::{
-    settings_view::keybindings::{KeybindingChangedEvent, KeybindingChangedNotifier},
-    terminal::input::{MenuPositioning, MenuPositioningProvider},
-    ui_components::icons::Icon,
-    util::bindings::keybinding_name_to_keystroke,
-};
+use crate::settings_view::keybindings::{KeybindingChangedEvent, KeybindingChangedNotifier};
+use crate::terminal::input::{MenuPositioning, MenuPositioningProvider};
+use crate::ui_components::icons::Icon;
+use crate::util::bindings::keybinding_name_to_keystroke;
 
 /// Maximum width of a tooltip before it soft-wraps.
 const TOOLTIP_MAX_WIDTH: f32 = 300.;
@@ -52,6 +52,7 @@ pub struct ActionButton {
     /// An optional tooltip to show on hover.
     tooltip: Option<String>,
     tooltip_sublabel: Option<String>,
+    tooltip_keybinding: Option<&'static str>,
     /// Maximum height of a tooltip before it truncates.
     tooltip_max_height: Option<f32>,
     size: ButtonSize,
@@ -224,6 +225,7 @@ impl ActionButton {
             label: label.into(),
             tooltip: None,
             tooltip_sublabel: None,
+            tooltip_keybinding: None,
             tooltip_max_height: None,
             has_menu: false,
             size: Default::default(),
@@ -269,6 +271,11 @@ impl ActionButton {
 
     pub fn with_tooltip_sublabel(mut self, tooltip_sublabel: impl Into<String>) -> Self {
         self.tooltip_sublabel = Some(tooltip_sublabel.into());
+        self
+    }
+
+    pub fn with_tooltip_keybinding(mut self, binding_name: &'static str) -> Self {
+        self.tooltip_keybinding = Some(binding_name);
         self
     }
 
@@ -323,6 +330,10 @@ impl ActionButton {
     pub fn with_menu(mut self, has_menu: bool) -> Self {
         self.has_menu = has_menu;
         self
+    }
+    pub fn set_has_menu(&mut self, has_menu: bool, ctx: &mut ViewContext<Self>) {
+        self.has_menu = has_menu;
+        ctx.notify();
     }
 
     #[allow(dead_code)]
@@ -429,6 +440,16 @@ impl ActionButton {
 
     pub fn set_tooltip(&mut self, tooltip: Option<impl Into<String>>, ctx: &mut ViewContext<Self>) {
         self.tooltip = tooltip.map(|t| t.into());
+        ctx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn tooltip_for_test(&self) -> Option<&str> {
+        self.tooltip.as_deref()
+    }
+
+    pub fn clear_tooltip(&mut self, ctx: &mut ViewContext<Self>) {
+        self.tooltip = None;
         ctx.notify();
     }
 
@@ -547,7 +568,11 @@ impl ActionButton {
             return;
         };
 
-        let tooltip_element = if let Some(tooltip_sublabel) = self.tooltip_sublabel.clone() {
+        let tooltip_sublabel = self
+            .tooltip_keybinding
+            .and_then(|name| KeystrokeSource::Binding(name).displayed(app))
+            .or_else(|| self.tooltip_sublabel.clone());
+        let tooltip_element = if let Some(tooltip_sublabel) = tooltip_sublabel {
             appearance
                 .ui_builder()
                 .tool_tip_with_sublabel(tooltip, tooltip_sublabel)

@@ -1,38 +1,62 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use warp_core::send_telemetry_from_ctx;
+use warp_core::ui::Icon;
 use warp_core::ui::theme::color::internal_colors;
-use warp_core::{send_telemetry_from_ctx, ui::Icon};
+use warp_errors::report_error;
 use warp_util::path::LineAndColumnArg;
+use warpui::elements::{
+    Align, ChildView, ConstrainedBox, Container, CrossAxisAlignment, DragBarSide, Element, Empty,
+    Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Resizable,
+    ResizableStateHandle, Shrinkable, resizable_state_handle,
+};
+use warpui::fonts::Weight;
+use warpui::platform::Cursor;
+use warpui::ui_components::button::ButtonVariant;
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{
-    elements::{
-        resizable_state_handle, ChildView, ConstrainedBox, Container, CrossAxisAlignment,
-        DragBarSide, Element, Empty, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle,
-        ParentElement, Resizable, ResizableStateHandle, Shrinkable,
-    },
-    platform::Cursor,
-    ui_components::components::{Coords, UiComponent, UiComponentStyles},
     AppContext, Entity, FocusContext, ModelHandle, SingletonEntity, TypedActionView, View,
     ViewContext, ViewHandle, WeakViewHandle,
 };
 
+use crate::TelemetryEvent;
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent_conversations_model::AgentConversationsModel;
+use crate::appearance::Appearance;
+use crate::auth::AuthStateProvider;
+use crate::code::buffer_location::LocalOrRemotePath;
 #[cfg(feature = "local_fs")]
 use crate::code::file_tree::FileTreeEvent;
+use crate::code::file_tree::FileTreeView;
 use crate::coding_panel_enablement_state::CodingPanelEnablementState;
-use crate::drive::panel::{DrivePanel, DrivePanelEvent};
+use crate::drive::panel::{
+    DrivePanel, DrivePanelEvent, MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH,
+};
+use crate::drive::settings::WarpDriveSettings;
+use crate::pane_group::pane::view::header::PANE_HEADER_HEIGHT;
+use crate::pane_group::pane::view::header::components::HEADER_EDGE_PADDING;
 use crate::pane_group::working_directories::WorkingDirectory;
-use crate::pane_group::{PaneGroup, WorkingDirectoriesEvent, WorkingDirectoriesModel};
+use crate::pane_group::{
+    PaneGroup, WorkingDirectoriesEvent, WorkingDirectoriesModel, {self},
+};
 #[cfg(feature = "local_fs")]
 use crate::server::telemetry::CodePanelsFileOpenEntrypoint;
 use crate::server::telemetry::{FileTreeSource, WarpDriveSource};
+use crate::settings::AISettings;
 use crate::settings_view::keybindings::{KeybindingChangedEvent, KeybindingChangedNotifier};
+use crate::terminal::resizable_data::{ModalType, ResizableData};
+use crate::ui_components::buttons::{icon_button, icon_button_with_color};
+use crate::ui_components::icons;
+use crate::util::bindings::keybinding_name_to_display_string;
 #[cfg(feature = "local_fs")]
 use crate::util::file::external_editor::EditorSettings;
-#[cfg(feature = "local_fs")]
-use crate::util::openable_file_type::resolve_file_target_with_editor_choice;
 use crate::util::openable_file_type::FileTarget;
+#[cfg(feature = "local_fs")]
+use crate::util::openable_file_type::{
+    EditorLayout, is_markdown_file, resolve_file_target_with_editor_choice,
+};
+use crate::workspace::WorkspaceAction;
 use crate::workspace::view::conversation_list::view::{
     ConversationListView, Event as ConversationListViewEvent,
 };
@@ -45,28 +69,15 @@ use crate::workspace::view::{
     OPEN_GLOBAL_SEARCH_BINDING_NAME, TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME,
     TOGGLE_PROJECT_EXPLORER_BINDING_NAME, TOGGLE_WARP_DRIVE_BINDING_NAME,
 };
-use crate::{
-    appearance::Appearance,
-    code::file_tree::FileTreeView,
-    drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH},
-    pane_group::pane::view::header::{components::HEADER_EDGE_PADDING, PANE_HEADER_HEIGHT},
-    pane_group::{self},
-    terminal::resizable_data::{ModalType, ResizableData},
-    ui_components::{
-        buttons::{icon_button, icon_button_with_color},
-        icons,
-    },
-    util::bindings::keybinding_name_to_display_string,
-    workspace::WorkspaceAction,
-    TelemetryEvent,
-};
+use crate::workspaces::user_workspaces::UserWorkspaces;
 
 #[derive(Default)]
 struct MouseStateHandles {
     project_explorer_button: MouseStateHandle,
+    conversation_list_view_button: MouseStateHandle,
     global_search_button: MouseStateHandle,
     warp_drive_button: MouseStateHandle,
-    conversation_list_view_button: MouseStateHandle,
+    sign_in_button: MouseStateHandle,
 }
 
 #[derive(Clone, Debug)]
@@ -75,15 +86,53 @@ pub enum LeftPanelAction {
     GlobalSearch { entry_focus: GlobalSearchEntryFocus },
     WarpDrive,
     ConversationListView,
+    SignIn,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolPanelAvailability {
+    Available,
+    RequiresAccount,
+    RequiresAi,
+}
+
+impl ToolPanelView {
+    fn availability(self, app: &AppContext) -> ToolPanelAvailability {
+        match self {
+            ToolPanelView::ProjectExplorer | ToolPanelView::GlobalSearch { .. } => {
+                ToolPanelAvailability::Available
+            }
+            ToolPanelView::WarpDrive => {
+                if WarpDriveSettings::is_warp_drive_available(app) {
+                    ToolPanelAvailability::Available
+                } else {
+                    ToolPanelAvailability::RequiresAccount
+                }
+            }
+            ToolPanelView::ConversationListView => {
+                if AuthStateProvider::as_ref(app)
+                    .get()
+                    .is_anonymous_or_logged_out()
+                {
+                    ToolPanelAvailability::RequiresAccount
+                } else if AISettings::as_ref(app).is_conversation_history_available(app) {
+                    ToolPanelAvailability::Available
+                } else {
+                    ToolPanelAvailability::RequiresAi
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
 pub enum LeftPanelEvent {
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
     FileTree(pane_group::Event),
     WarpDrive(DrivePanelEvent),
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
     OpenFileWithTarget {
-        path: PathBuf,
+        location: LocalOrRemotePath,
         target: FileTarget,
         line_col: Option<LineAndColumnArg>,
     },
@@ -93,6 +142,7 @@ pub enum LeftPanelEvent {
         conversation_title: String,
         terminal_view_id: Option<warpui::EntityId>,
     },
+    SignInRequested,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,8 +156,9 @@ pub enum ToolPanelView {
 /// Encapsulates the active view state to enforce that all mutations go through
 /// `active_view_state::set`, which handles necessary side effects.
 mod active_view_state {
-    use super::ToolPanelView;
     use warpui::ViewContext;
+
+    use super::ToolPanelView;
 
     pub struct ActiveViewState(ToolPanelView);
 
@@ -182,10 +233,10 @@ fn toolbelt_tooltip_keybinding(binding_names: &[&'static str], app: &AppContext)
 
     // Preserve caller-provided ordering so we can prioritize specific bindings.
     for binding_name in binding_names {
-        if let Some(displayed) = keybinding_name_to_display_string(binding_name, app) {
-            if seen.insert(displayed.clone()) {
-                parts.push(displayed);
-            }
+        if let Some(displayed) = keybinding_name_to_display_string(binding_name, app)
+            && seen.insert(displayed.clone())
+        {
+            parts.push(displayed);
         }
     }
 
@@ -193,6 +244,97 @@ fn toolbelt_tooltip_keybinding(binding_names: &[&'static str], app: &AppContext)
 }
 
 impl LeftPanelView {
+    pub(crate) fn active_view_availability(&self, app: &AppContext) -> ToolPanelAvailability {
+        self.active_view.get().availability(app)
+    }
+
+    fn render_unavailable_panel(
+        &self,
+        appearance: &Appearance,
+        view: ToolPanelView,
+        availability: ToolPanelAvailability,
+    ) -> Box<dyn Element> {
+        let (title, description) = match (view, availability) {
+            (ToolPanelView::WarpDrive, ToolPanelAvailability::RequiresAccount) => (
+                "Sign in to access Warp Drive",
+                "Create an account to save and share workflows, notebooks, prompts, and more.",
+            ),
+            (ToolPanelView::ConversationListView, ToolPanelAvailability::RequiresAccount) => (
+                "Sign in to access Agent conversations",
+                "Create an account and enable AI to access your conversation history.",
+            ),
+            (ToolPanelView::ConversationListView, ToolPanelAvailability::RequiresAi) => (
+                "Turn on AI to access Agent conversations",
+                "Enable Warp AI to access your conversation history.",
+            ),
+            (
+                ToolPanelView::ProjectExplorer
+                | ToolPanelView::GlobalSearch { .. }
+                | ToolPanelView::WarpDrive,
+                ToolPanelAvailability::RequiresAi,
+            )
+            | (
+                ToolPanelView::ProjectExplorer | ToolPanelView::GlobalSearch { .. },
+                ToolPanelAvailability::RequiresAccount,
+            )
+            | (_, ToolPanelAvailability::Available) => {
+                debug_assert!(false, "unexpected locked tool-panel state");
+                (
+                    "Feature unavailable",
+                    "This feature is currently unavailable.",
+                )
+            }
+        };
+        let theme = appearance.theme();
+        let title = appearance
+            .ui_builder()
+            .paragraph(title)
+            .with_style(UiComponentStyles {
+                font_size: Some(16.),
+                font_weight: Some(Weight::Semibold),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+        let description = appearance
+            .ui_builder()
+            .paragraph(description)
+            .with_style(UiComponentStyles {
+                font_size: Some(13.),
+                font_color: Some(internal_colors::text_sub(
+                    theme,
+                    theme.background().into_solid(),
+                )),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+        let mut content = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(title)
+            .with_child(Container::new(description).with_margin_top(8.).finish());
+        if availability == ToolPanelAvailability::RequiresAccount {
+            let sign_in = appearance
+                .ui_builder()
+                .button(
+                    ButtonVariant::Accent,
+                    self.mouse_state_handles.sign_in_button.clone(),
+                )
+                .with_text_label("Sign in".to_string())
+                .build()
+                .on_click(|ctx, _, _| {
+                    ctx.dispatch_typed_action(LeftPanelAction::SignIn);
+                })
+                .finish();
+            content = content.with_child(Container::new(sign_in).with_margin_top(16.).finish());
+        }
+        let content = ConstrainedBox::new(content.finish())
+            .with_max_width(280.)
+            .finish();
+
+        Align::new(Container::new(content).with_uniform_padding(24.).finish()).finish()
+    }
     pub fn new(
         working_directories_model: ModelHandle<WorkingDirectoriesModel>,
         views: Vec<ToolPanelView>,
@@ -205,7 +347,7 @@ impl LeftPanelView {
         {
             Some(handle) => handle,
             None => {
-                log::error!("Couldn't retrieve left panel resizable state handle.");
+                report_error!("Couldn't retrieve left panel resizable state handle.");
                 resizable_state_handle(600.0)
             }
         };
@@ -270,27 +412,45 @@ impl LeftPanelView {
                 }
                 let has_terminal_session = directories.iter().any(|dir| dir.terminal_id.is_some());
 
-                // Update GlobalSearchView root directories based on all working directories
-                let roots: Vec<PathBuf> = directories.iter().map(|d| d.path.clone()).collect();
+                // Split directories into local and remote.
+                let local_paths: Vec<PathBuf> = directories
+                    .iter()
+                    .filter_map(|d| d.path.to_local_path().map(|p| p.to_path_buf()))
+                    .collect();
+                #[allow(unused_variables)]
+                let remote_repos: Vec<repo_metadata::RemoteRepositoryIdentifier> = directories
+                    .iter()
+                    .filter_map(|d| match &d.path {
+                        LocalOrRemotePath::Remote(remote_path) => {
+                            Some(repo_metadata::RemoteRepositoryIdentifier::new(
+                                remote_path.host_id.clone(),
+                                remote_path.path.clone(),
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .collect();
 
+                // Update GlobalSearchView root directories (local + remote).
+                let all_directories: Vec<LocalOrRemotePath> =
+                    directories.iter().map(|d| d.path.clone()).collect();
                 let global_search_view =
                     me.get_or_create_global_search_view_for_pane_group(active_pane_group.id(), ctx);
                 global_search_view.update(ctx, |view, view_ctx| {
-                    view.set_root_directories(roots, view_ctx);
+                    view.set_root_directories(all_directories, view_ctx);
                 });
 
-                let directories: Vec<PathBuf> =
-                    directories.iter().map(|dir| dir.path.clone()).collect();
-
                 // Directories are already in display order (most recent first) from the model
-                let directories = deduplicate_by_directory_name(directories);
+                let local_directories = deduplicate_by_directory_name(local_paths);
                 let file_tree_view =
                     me.get_or_create_file_tree_view_for_pane_group(active_pane_group.id(), ctx);
 
                 let is_visible =
                     active_pane_group.as_ref(ctx).left_panel_open && me.is_file_tree_active();
                 file_tree_view.update(ctx, |view, ctx| {
-                    view.set_root_directories(directories, ctx);
+                    view.set_root_directories(local_directories, ctx);
+                    #[cfg(feature = "local_fs")]
+                    view.set_remote_root_directories(&remote_repos, ctx);
                     view.set_has_terminal_session(has_terminal_session, ctx);
                     view.set_is_active(is_visible, ctx);
 
@@ -365,6 +525,16 @@ impl LeftPanelView {
         } else {
             self.update_button_active_states();
         }
+        // The selected tab can remain the same while its account/AI
+        // availability changes. Reconcile the real conversation view's open
+        // registration so a locked placeholder never polls, and enabling AI
+        // while the panel is open starts polling without another click.
+        let is_left_panel_open = self
+            .active_pane_group
+            .as_ref()
+            .and_then(|pane_group| pane_group.upgrade(ctx))
+            .is_some_and(|pane_group| pane_group.as_ref(ctx).left_panel_open);
+        self.on_conversation_list_view_visibility_changed(is_left_panel_open, ctx);
 
         ctx.notify();
     }
@@ -573,10 +743,10 @@ impl LeftPanelView {
 
         self.active_pane_group = Some(pane_group.downgrade());
 
-        if let Some(previous_pane_group_id) = previous_pane_group_id {
-            if previous_pane_group_id != pane_group_id {
-                self.deactivate_file_tree_view_for_pane_group(previous_pane_group_id, ctx);
-            }
+        if let Some(previous_pane_group_id) = previous_pane_group_id
+            && previous_pane_group_id != pane_group_id
+        {
+            self.deactivate_file_tree_view_for_pane_group(previous_pane_group_id, ctx);
         }
 
         // Query the current state from the model
@@ -591,26 +761,44 @@ impl LeftPanelView {
             .iter()
             .any(|dir| dir.terminal_id.is_some());
 
-        // Update GlobalSearchView root directories based on all working directories
-        let roots: Vec<PathBuf> = active_directories.iter().map(|d| d.path.clone()).collect();
+        // Split directories into local and remote.
+        let local_paths: Vec<PathBuf> = active_directories
+            .iter()
+            .filter_map(|d| d.path.to_local_path().map(|p| p.to_path_buf()))
+            .collect();
+        #[allow(unused_variables)]
+        let remote_repos: Vec<repo_metadata::RemoteRepositoryIdentifier> = active_directories
+            .iter()
+            .filter_map(|d| match &d.path {
+                LocalOrRemotePath::Remote(remote_path) => {
+                    Some(repo_metadata::RemoteRepositoryIdentifier::new(
+                        remote_path.host_id.clone(),
+                        remote_path.path.clone(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Update GlobalSearchView root directories (local + remote).
+        let all_directories: Vec<LocalOrRemotePath> =
+            active_directories.iter().map(|d| d.path.clone()).collect();
         let global_search_view =
             self.get_or_create_global_search_view_for_pane_group(pane_group_id, ctx);
         global_search_view.update(ctx, |view, view_ctx| {
-            view.set_root_directories(roots, view_ctx);
+            view.set_root_directories(all_directories, view_ctx);
         });
 
-        let directories: Vec<PathBuf> = active_directories
-            .iter()
-            .map(|dir| dir.path.clone())
-            .collect();
-        let directories = deduplicate_by_directory_name(directories);
+        let local_directories = deduplicate_by_directory_name(local_paths);
         let active_file_model = pane_group.as_ref(ctx).active_file_model().clone();
 
         let file_tree_view = self.get_or_create_file_tree_view_for_pane_group(pane_group_id, ctx);
         let left_panel_open = pane_group.as_ref(ctx).left_panel_open;
         let is_visible = left_panel_open && self.is_file_tree_active();
         file_tree_view.update(ctx, |view, ctx| {
-            view.set_root_directories(directories, ctx);
+            view.set_root_directories(local_directories, ctx);
+            #[cfg(feature = "local_fs")]
+            view.set_remote_root_directories(&remote_repos, ctx);
             view.set_has_terminal_session(has_terminal_session, ctx);
             view.set_active_file_model(active_file_model, ctx);
             view.set_is_active(is_visible, ctx);
@@ -647,6 +835,10 @@ impl LeftPanelView {
     }
 
     pub fn focus_active_view_on_entry(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.active_view_availability(ctx) != ToolPanelAvailability::Available {
+            ctx.focus_self();
+            return;
+        }
         match self.active_view.get() {
             ToolPanelView::ProjectExplorer => {
                 if let Some(file_tree_view) = self.active_file_tree_view(ctx) {
@@ -701,7 +893,7 @@ impl LeftPanelView {
     ) {
         match event {
             GlobalSearchViewEvent::OpenMatch {
-                path,
+                location,
                 line_number,
                 column_num,
             } => {
@@ -711,13 +903,27 @@ impl LeftPanelView {
                 };
 
                 let settings = EditorSettings::as_ref(ctx);
-                let target = resolve_file_target_with_editor_choice(
-                    path,
-                    *settings.open_code_panels_file_editor,
-                    *settings.prefer_markdown_viewer,
-                    *settings.open_file_layout,
-                    None,
-                );
+                let target = match location {
+                    LocalOrRemotePath::Local(path) => resolve_file_target_with_editor_choice(
+                        path,
+                        *settings.open_code_panels_file_editor,
+                        *settings.prefer_markdown_viewer,
+                        *settings.open_file_layout,
+                        None,
+                    ),
+                    // Local-fs-based target resolution can't inspect remote
+                    // files; mirror the file tree's remote handling (code
+                    // editor, or markdown viewer by extension + preference).
+                    LocalOrRemotePath::Remote(remote) => {
+                        let is_markdown =
+                            is_markdown_file(std::path::Path::new(remote.path.as_str()));
+                        if is_markdown && *settings.prefer_markdown_viewer {
+                            FileTarget::MarkdownViewer(EditorLayout::SplitPane)
+                        } else {
+                            FileTarget::CodeEditor(EditorLayout::SplitPane)
+                        }
+                    }
+                };
 
                 send_telemetry_from_ctx!(
                     TelemetryEvent::CodePanelsFileOpened {
@@ -728,7 +934,7 @@ impl LeftPanelView {
                 );
 
                 ctx.emit(LeftPanelEvent::OpenFileWithTarget {
-                    path: path.clone(),
+                    location: location.clone(),
                     target,
                     line_col: Some(line_col),
                 });
@@ -761,7 +967,7 @@ impl LeftPanelView {
                 line_col,
             } => {
                 ctx.emit(LeftPanelEvent::OpenFileWithTarget {
-                    path: path.clone(),
+                    location: path.clone(),
                     target: target.clone(),
                     line_col: *line_col,
                 });
@@ -834,6 +1040,7 @@ impl LeftPanelView {
                 LeftPanelAction::ConversationListView => {
                     self.active_view.get() == ToolPanelView::ConversationListView
                 }
+                LeftPanelAction::SignIn => false,
             };
         }
     }
@@ -953,27 +1160,34 @@ impl LeftPanelView {
             }
             LeftPanelAction::WarpDrive => {
                 active_view_state::set(self, ToolPanelView::WarpDrive, ctx);
-                if force_open {
-                    send_telemetry_from_ctx!(
-                        TelemetryEvent::WarpDriveOpened {
-                            source: WarpDriveSource::ForceOpened,
-                            is_code_mode_v2: true
-                        },
-                        ctx
-                    );
-                } else {
-                    send_telemetry_from_ctx!(
-                        TelemetryEvent::WarpDriveOpened {
-                            source: WarpDriveSource::LeftPanelToolbelt,
-                            is_code_mode_v2: true
-                        },
-                        ctx
-                    );
+                if self.active_view_availability(ctx) == ToolPanelAvailability::Available {
+                    if force_open {
+                        send_telemetry_from_ctx!(
+                            TelemetryEvent::WarpDriveOpened {
+                                source: WarpDriveSource::ForceOpened,
+                                is_code_mode_v2: true
+                            },
+                            ctx
+                        );
+                    } else {
+                        send_telemetry_from_ctx!(
+                            TelemetryEvent::WarpDriveOpened {
+                                source: WarpDriveSource::LeftPanelToolbelt,
+                                is_code_mode_v2: true
+                            },
+                            ctx
+                        );
+                    }
                 }
             }
             LeftPanelAction::ConversationListView => {
                 active_view_state::set(self, ToolPanelView::ConversationListView, ctx);
-                send_telemetry_from_ctx!(TelemetryEvent::ConversationListViewOpened, ctx);
+                if self.active_view_availability(ctx) == ToolPanelAvailability::Available {
+                    send_telemetry_from_ctx!(TelemetryEvent::ConversationListViewOpened, ctx);
+                }
+            }
+            LeftPanelAction::SignIn => {
+                ctx.emit(LeftPanelEvent::SignInRequested);
             }
         }
     }
@@ -1033,11 +1247,15 @@ impl LeftPanelView {
         is_now_open: bool,
         ctx: &mut ViewContext<Self>,
     ) {
+        let is_available = self.active_view.get() == ToolPanelView::ConversationListView
+            && self.active_view_availability(ctx) == ToolPanelAvailability::Available;
         let window_id = ctx.window_id();
         let view_id = self.conversation_list_view.id();
-        AgentConversationsModel::handle(ctx).update(ctx, |model, ctx| {
-            if is_now_open {
-                model.register_view_open(window_id, view_id, ctx);
+        let team_context_resolver =
+            UserWorkspaces::team_context_resolver(self.conversation_list_view.downgrade());
+        AgentConversationsModel::handle(ctx).update(ctx, move |model, ctx| {
+            if is_now_open && is_available {
+                model.register_view_open(window_id, view_id, team_context_resolver, ctx);
             } else {
                 model.register_view_closed(window_id, view_id, ctx);
             }
@@ -1060,7 +1278,9 @@ impl View for LeftPanelView {
 
     fn on_focus(&mut self, focus_ctx: &FocusContext, ctx: &mut ViewContext<Self>) {
         // Focus the active tool panel view on-left-panel-focus.
-        if focus_ctx.is_self_focused() {
+        if focus_ctx.is_self_focused()
+            && self.active_view_availability(ctx) == ToolPanelAvailability::Available
+        {
             match self.active_view.get() {
                 ToolPanelView::ProjectExplorer => {
                     if let Some(view) = self.active_file_tree_view(ctx) {
@@ -1083,11 +1303,11 @@ impl View for LeftPanelView {
 
         let mouse_state_handles = vec![
             self.mouse_state_handles.project_explorer_button.clone(),
-            self.mouse_state_handles.global_search_button.clone(),
-            self.mouse_state_handles.warp_drive_button.clone(),
             self.mouse_state_handles
                 .conversation_list_view_button
                 .clone(),
+            self.mouse_state_handles.global_search_button.clone(),
+            self.mouse_state_handles.warp_drive_button.clone(),
         ];
 
         // If there is only one button in the toolbelt row,
@@ -1109,42 +1329,49 @@ impl View for LeftPanelView {
             None
         };
 
-        let content_area: Box<dyn Element> = match self.active_view.get() {
-            ToolPanelView::ProjectExplorer => {
-                if let Some(file_tree_view) = self.active_file_tree_view(app) {
-                    Shrinkable::new(
+        let active_view = self.active_view.get();
+        let availability = self.active_view_availability(app);
+        let content_area: Box<dyn Element> = if availability != ToolPanelAvailability::Available {
+            Shrinkable::new(
+                1.0,
+                self.render_unavailable_panel(appearance, active_view, availability),
+            )
+            .finish()
+        } else {
+            match active_view {
+                ToolPanelView::ProjectExplorer => match self.active_file_tree_view(app) {
+                    Some(file_tree_view) => Shrinkable::new(
                         1.0,
                         Container::new(ChildView::new(&file_tree_view).finish())
                             .with_padding_left(2.)
                             .with_padding_right(2.)
                             .finish(),
                     )
-                    .finish()
-                } else {
-                    Shrinkable::new(1.0, Container::new(Empty::new().finish()).finish()).finish()
-                }
-            }
-            ToolPanelView::GlobalSearch { .. } => {
-                if let Some(global_search_view) = self.active_global_search_view(app) {
-                    Shrinkable::new(
+                    .finish(),
+                    _ => Shrinkable::new(1.0, Container::new(Empty::new().finish()).finish())
+                        .finish(),
+                },
+                ToolPanelView::GlobalSearch { .. } => match self.active_global_search_view(app) {
+                    Some(global_search_view) => Shrinkable::new(
                         1.0,
                         Container::new(ChildView::new(&global_search_view).finish()).finish(),
                     )
-                    .finish()
-                } else {
-                    Shrinkable::new(1.0, Container::new(Empty::new().finish()).finish()).finish()
-                }
-            }
-            ToolPanelView::WarpDrive => Shrinkable::new(
-                1.0,
-                Container::new(ChildView::new(&self.warp_drive_view).finish())
-                    .with_padding_left(2.)
-                    .with_padding_right(2.)
                     .finish(),
-            )
-            .finish(),
-            ToolPanelView::ConversationListView => {
-                Shrinkable::new(1.0, ChildView::new(&self.conversation_list_view).finish()).finish()
+                    _ => Shrinkable::new(1.0, Container::new(Empty::new().finish()).finish())
+                        .finish(),
+                },
+                ToolPanelView::WarpDrive => Shrinkable::new(
+                    1.0,
+                    Container::new(ChildView::new(&self.warp_drive_view).finish())
+                        .with_padding_left(2.)
+                        .with_padding_right(2.)
+                        .finish(),
+                )
+                .finish(),
+                ToolPanelView::ConversationListView => {
+                    Shrinkable::new(1.0, ChildView::new(&self.conversation_list_view).finish())
+                        .finish()
+                }
             }
         };
 

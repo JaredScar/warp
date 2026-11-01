@@ -7,8 +7,9 @@ use warpui::elements::ChildView;
 use warpui::{Element, Entity, ModelHandle, SingletonEntity, View, ViewContext, ViewHandle};
 
 use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
+use crate::ai::agent_conversations_model::AgentConversationEntryId;
 use crate::ai::blocklist::agent_view::AgentViewController;
-use crate::ai::conversation_navigation::ConversationNavigationData;
+use crate::ai::blocklist::conversation_selection::ConversationSelectionHandle;
 use crate::features::FeatureFlag;
 use crate::search::data_source::{Query, QueryFilter};
 use crate::search::mixer::SearchMixer;
@@ -22,14 +23,13 @@ use crate::terminal::input::suggestions_mode_model::{
     InputSuggestionsModeEvent, InputSuggestionsModeModel,
 };
 use crate::terminal::model::session::active_session::ActiveSession;
+use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
 
 /// Events emitted by InlineConversationMenuView.
 #[derive(Debug, Clone)]
 pub enum InlineConversationMenuEvent {
     /// User 'accepted' a conversation (hit enter).
-    NavigateToConversation {
-        conversation_navigation_data: Box<ConversationNavigationData>,
-    },
+    NavigateToConversation { item_id: AgentConversationEntryId },
     /// User dismissed the menu (escape or click).
     Dismissed,
 }
@@ -62,13 +62,30 @@ impl InlineConversationMenuView {
     pub fn new(
         input_suggestions_model: ModelHandle<InputSuggestionsModeModel>,
         agent_view_controller: ModelHandle<AgentViewController>,
+        conversation_selection: ConversationSelectionHandle,
         input_buffer_model: &ModelHandle<InputBufferModel>,
         positioner: &ModelHandle<InlineMenuPositioner>,
         active_session: ModelHandle<ActiveSession>,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
-        let data_source = ctx.add_model(|_| {
-            ConversationMenuDataSource::new(agent_view_controller.clone(), active_session)
+        let team_context_resolver = UserWorkspaces::team_context_resolver(ctx.handle());
+        let data_source = ctx.add_model(move |_| {
+            ConversationMenuDataSource::new(
+                conversation_selection,
+                active_session,
+                team_context_resolver,
+            )
+        });
+        let window_id = ctx.window_id();
+        ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), move |me, _, event, ctx| {
+            if matches!(
+                event,
+                UserWorkspacesEvent::WindowTeamChanged {
+                    window_id: changed_window_id
+                } if *changed_window_id == window_id
+            ) {
+                me.rerun_query(ctx);
+            }
         });
 
         let tab_configs = TAB_CONFIGS.clone();
@@ -104,7 +121,7 @@ impl InlineConversationMenuView {
         ctx.subscribe_to_view(&menu_view, |me, _, event, ctx| match event {
             InlineMenuEvent::AcceptedItem { item, .. } => {
                 ctx.emit(InlineConversationMenuEvent::NavigateToConversation {
-                    conversation_navigation_data: Box::new(item.navigation_data.clone()),
+                    item_id: item.item_id,
                 });
             }
             InlineMenuEvent::SelectedItem { .. } | InlineMenuEvent::NoResults => (),

@@ -2,14 +2,12 @@ use std::path::PathBuf;
 
 use futures_util::future::LocalBoxFuture;
 
+use super::menu::MenuItemPropertyChanges;
+use crate::keymap::Keystroke;
 use crate::modals::ModalId;
 use crate::windowing::state::ApplicationStage;
 use crate::windowing::{WindowCallbackDispatcher, WindowManager};
-use crate::{
-    keymap::Keystroke, notification, AppContext, ClosedWindowData, SingletonEntity, WindowId,
-};
-
-use super::menu::MenuItemPropertyChanges;
+use crate::{AppContext, ClosedWindowData, SingletonEntity, WindowId, notification};
 
 pub type AppInitCallbackFn =
     Box<dyn FnOnce(&mut crate::AppContext, LocalBoxFuture<'static, crate::App>)>;
@@ -27,7 +25,8 @@ pub struct AppCallbacks {
     pub on_resigned_active: Option<Box<dyn FnMut(&mut AppContext)>>,
     pub on_will_terminate: Option<Box<dyn FnMut(&mut AppContext)>>,
     /// Callback on whether the app will proceed with termination.
-    pub on_should_terminate_app: Option<Box<dyn FnMut(&mut AppContext) -> ApproveTerminateResult>>,
+    pub on_should_terminate_app:
+        Option<Box<dyn FnMut(TerminationRequestSource, &mut AppContext) -> ApproveTerminateResult>>,
     /// Callback on whether the window will proceed with closing.
     pub on_should_close_window:
         Option<Box<dyn FnMut(WindowId, &mut AppContext) -> ApproveTerminateResult>>,
@@ -68,6 +67,22 @@ pub enum ApproveTerminateResult {
     Cancel,
 }
 
+/// Who asked the app to terminate.
+///
+/// Platform code passes this through to `on_should_terminate_app` so the
+/// application can decide whether it is appropriate to interrupt the
+/// termination, e.g. with a confirmation dialog. Blocking a system-initiated
+/// termination (logout / restart / scheduled OS update) makes the OS treat the
+/// app as refusing to quit, which can abort the whole system operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationRequestSource {
+    /// The user asked the app to quit (menu, keyboard shortcut, Dock, …).
+    User,
+    /// The system asked the app to quit (logout, restart, shutdown, or a
+    /// scheduled OS update).
+    System,
+}
+
 impl AppCallbackDispatcher {
     pub fn new(callbacks: AppCallbacks, ui_app: crate::App) -> Self {
         Self { callbacks, ui_app }
@@ -105,7 +120,12 @@ impl AppCallbackDispatcher {
     // click on/interact with a notification.
     // TODO(CORE-2322): implement desktop notifications on Windows
     #[cfg_attr(
-        any(target_os = "linux", target_os = "windows", target_family = "wasm"),
+        any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "windows",
+            target_family = "wasm"
+        ),
         allow(dead_code)
     )]
     pub fn notification_clicked(&mut self, response: notification::NotificationResponse) {
@@ -138,9 +158,12 @@ impl AppCallbackDispatcher {
         }
     }
 
-    pub fn should_terminate_app(&mut self) -> ApproveTerminateResult {
+    pub fn should_terminate_app(
+        &mut self,
+        source: TerminationRequestSource,
+    ) -> ApproveTerminateResult {
         if let Some(callback) = &mut self.callbacks.on_should_terminate_app {
-            self.ui_app.update(|ctx| callback(ctx))
+            self.ui_app.update(|ctx| callback(source, ctx))
         } else {
             ApproveTerminateResult::Terminate
         }
@@ -294,7 +317,12 @@ impl AppCallbackDispatcher {
 // application menus, so these never get called.
 // TODO(CORE-2691): implement native Windows OS app menus
 #[cfg_attr(
-    any(target_os = "linux", target_os = "windows", target_family = "wasm"),
+    any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_family = "wasm"
+    ),
     allow(dead_code)
 )]
 impl AppCallbackDispatcher {
@@ -316,7 +344,12 @@ impl AppCallbackDispatcher {
 // native platform modals on these platforms, so these never get called.
 // TODO(CORE-2323): implement native Windows OS modal
 #[cfg_attr(
-    any(target_os = "linux", target_os = "windows", target_family = "wasm"),
+    any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_family = "wasm"
+    ),
     allow(dead_code)
 )]
 impl AppCallbackDispatcher {

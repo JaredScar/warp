@@ -1,13 +1,10 @@
 // Re-export a couple winit types and modules as the concrete implementations
 // for the linux platform.
+use super::AsInnerMut;
+use super::app::AppBackend;
+use crate::AppContext;
 pub use crate::windowing::winit::app::App;
-
-use crate::{
-    windowing::{self, WindowingSystem},
-    AppContext,
-};
-
-use super::{app::AppBackend, AsInnerMut};
+use crate::windowing::{self, WindowingSystem};
 
 /// An extension trait defining additional configurability for
 /// applications when running on Linux.
@@ -27,14 +24,14 @@ impl AppBuilderExt for super::AppBuilder {
     fn set_window_class(&mut self, window_class: String) {
         match self.as_inner_mut() {
             AppBackend::CurrentPlatform(app) => app.set_window_class(window_class),
-            AppBackend::Headless(_) => (),
+            AppBackend::Windowless(_) => (),
         }
     }
 
     fn force_x11(&mut self, force_x11: bool) {
         match self.as_inner_mut() {
             AppBackend::CurrentPlatform(app) => app.force_x11(force_x11),
-            AppBackend::Headless(_) => (),
+            AppBackend::Windowless(_) => (),
         }
     }
 }
@@ -56,11 +53,7 @@ pub fn user_windowing_system() -> WindowingSystem {
 }
 
 pub fn is_wsl() -> bool {
-    use std::sync::OnceLock;
-    static IS_WSL: OnceLock<bool> = OnceLock::new();
-    IS_WSL
-        .get_or_init(|| std::path::Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists())
-        .to_owned()
+    command::wsl::is_wsl()
 }
 
 pub fn is_wayland_env_var_set() -> bool {

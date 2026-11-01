@@ -1,12 +1,6 @@
 //! This module contains the `Priority` struct, which may be specified on [`Suggestion`]s to
 //! influence the order of suggestions returned to users.  
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "v2")] {
-        mod v2;
-    }
-}
-
 use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
@@ -95,5 +89,5 @@ impl From<Priority> for warp_command_signatures::Priority {
 }
 
 #[cfg(test)]
-#[path = "priority_test.rs"]
+#[path = "priority_tests.rs"]
 mod tests;

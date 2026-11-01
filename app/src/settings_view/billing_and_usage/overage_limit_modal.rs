@@ -1,20 +1,15 @@
+use warpui::elements::{
+    Align, Border, ChildView, Clipped, Container, CornerRadius, CrossAxisAlignment, Expanded, Flex,
+    MouseStateHandle, Padding, ParentElement, Radius, Text,
+};
+use warpui::ui_components::button::ButtonVariant;
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{
-    elements::{Align, Clipped},
-    ui_components::components::{Coords, UiComponentStyles},
     AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
 };
 
-use crate::{
-    editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions},
-    Appearance,
-};
-use warpui::{
-    elements::{
-        Border, ChildView, Container, CornerRadius, CrossAxisAlignment, Expanded, Flex,
-        MouseStateHandle, Padding, ParentElement, Radius, Text,
-    },
-    ui_components::{button::ButtonVariant, components::UiComponent},
-};
+use crate::Appearance;
+use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
 
 const MAXIMUM_SPENDING_LIMIT_CENTS: u32 = 999999999;
 
@@ -173,10 +168,10 @@ impl SpendingLimitModal {
     fn handle_editor_event(&mut self, event: &EditorEvent, ctx: &mut ViewContext<Self>) {
         match event {
             EditorEvent::Enter => {
-                if self.input_error_state.is_none() {
-                    if let Some(amount_cents) = self.parse_amount(ctx) {
-                        ctx.emit(SpendingLimitModalEvent::Update { amount_cents });
-                    }
+                if self.input_error_state.is_none()
+                    && let Some(amount_cents) = self.parse_amount(ctx)
+                {
+                    ctx.emit(SpendingLimitModalEvent::Update { amount_cents });
                 }
             }
             EditorEvent::Escape => {

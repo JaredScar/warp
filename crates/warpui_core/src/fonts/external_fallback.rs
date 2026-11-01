@@ -1,14 +1,13 @@
-use super::{Cache, FamilyId, FontFallbackCache, FontFamilyName, FontId, GlyphId};
-
-use crate::assets::asset_cache::Asset;
-use crate::{text_layout, Entity, ModelContext, SingletonEntity};
-
 use std::hash::{Hash, Hasher};
 use std::mem;
 use std::sync::Arc;
 
 use anyhow::Result;
 use itertools::Itertools;
+
+use super::{Cache, FamilyId, FontFallbackCache, FontFamilyName, FontId, GlyphId};
+use crate::assets::asset_cache::Asset;
+use crate::{Entity, ModelContext, SingletonEntity, text_layout};
 
 /// Represents a font family that is lazy loaded from the web. i.e. Not a
 /// bundled or system font.
@@ -34,6 +33,7 @@ pub(crate) enum RequestedFallbackFontSource {
     GlyphForChar((FontId, char)),
     Line(text_layout::CacheKeyValue),
     TextFrame(text_layout::CacheKeyValue),
+    UncachedText,
 }
 
 pub(crate) struct FontBytes(pub Vec<u8>);

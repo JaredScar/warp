@@ -3,57 +3,62 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{Context as _, anyhow};
+use bytes::Bytes;
+use comfy_table::Cell;
+use futures::{StreamExt, future};
+use serde::{Deserialize, Serialize};
+use warp_cli::agent::{Harness, OutputFormat, Prompt, RunCloudArgs};
+use warp_cli::json_filter::JsonOutput;
+use warp_cli::scope::TeamSelection;
+use warp_cli::task::{
+    ArtifactTypeArg, ExecutionLocationArg, ListTasksArgs, MessageCommand, MessageDeliveredArgs,
+    MessageListArgs, MessageReadArgs, MessageSendArgs, MessageWatchArgs, RunSortByArg,
+    RunSourceArg, RunStateArg, TaskGetArgs,
+};
+use warp_cli::{GlobalOptions, SortOrderArg};
+use warp_core::channel::ChannelState;
+use warp_core::features::FeatureFlag;
+use warp_server_client::HttpStatusError;
+use warpui::r#async::{Spawnable, Timer};
+use warpui::platform::TerminationMode;
+use warpui::{AppContext, ModelContext, SingletonEntity};
+
+use super::common::{EnvironmentChoice, ResolveConfigurationError, parse_ambient_task_id};
+use crate::ServerApiProvider;
+use crate::ai::agent::{UserQueryMode, extract_user_query_mode};
+use crate::ai::agent_sdk::driver::attachments::{
+    MAX_ATTACHMENT_COUNT_FOR_CLOUD_QUERY, process_attachment,
+};
 use crate::ai::ambient_agents::spawn::{
-    spawn_task, AmbientAgentEvent, SessionJoinInfo, TASK_STATUS_POLLING_DURATION,
+    AmbientAgentEvent, SessionJoinInfo, TASK_STATUS_POLLING_DURATION, spawn_task,
 };
 use crate::ai::ambient_agents::task::HarnessConfig;
-use crate::ai::ambient_agents::AmbientAgentTaskState;
-use crate::ai::ambient_agents::{AgentConfigSnapshot, AmbientAgentTask};
+use crate::ai::ambient_agents::{
+    AgentConfigSnapshot, AmbientAgentTask, AmbientAgentTaskId, AmbientAgentTaskState,
+};
 use crate::ai::artifacts::Artifact;
 use crate::auth::AuthStateProvider;
+use crate::cloud_object::model::persistence::CloudModel;
+use crate::server::ids::{ServerId, SyncId};
+use crate::server::server_api::ServerApi;
 use crate::server::server_api::ai::{
     AIClient, AgentMessageHeader, AgentRunEvent, AgentSource, ArtifactType, ExecutionLocation,
     ListAgentMessagesRequest, ReadAgentMessageResponse, RunSortBy, RunSortOrder,
     SendAgentMessageRequest, SendAgentMessageResponse, SpawnAgentRequest, TaskListFilter,
 };
-use crate::server::server_api::ServerApi;
-use crate::workspaces::user_workspaces::UserWorkspaces;
-use crate::{
-    terminal::shared_session, util::time_format::format_approx_duration_from_now_utc,
-    ServerApiProvider,
-};
-use anyhow::{anyhow, Context as _};
-use comfy_table::Cell;
-use futures::{future, StreamExt};
-use serde::Serialize;
-
-use warp_cli::{
-    agent::{Harness, OutputFormat, Prompt, RunCloudArgs},
-    json_filter::JsonOutput,
-    task::{
-        ArtifactTypeArg, ExecutionLocationArg, ListTasksArgs, MessageCommand, MessageDeliveredArgs,
-        MessageListArgs, MessageReadArgs, MessageSendArgs, MessageWatchArgs, RunSortByArg,
-        RunSortOrderArg, RunSourceArg, RunStateArg, TaskGetArgs,
-    },
-    GlobalOptions,
-};
-use warp_core::channel::ChannelState;
-use warp_core::features::FeatureFlag;
-use warpui::r#async::Timer;
-use warpui::{
-    platform::TerminationMode, r#async::Spawnable, AppContext, ModelContext, SingletonEntity,
-};
-
-use crate::ai::agent_sdk::driver::attachments::{
-    process_attachment, MAX_ATTACHMENT_COUNT_FOR_CLOUD_QUERY,
-};
-use crate::cloud_object::model::persistence::CloudModel;
-use crate::server::ids::{ServerId, SyncId};
-
-use super::common::{EnvironmentChoice, ResolveConfigurationError};
+use crate::server::team_scope::RequestTeamScope;
+use crate::terminal::shared_session;
+use crate::util::time_format::format_approx_duration_from_now_utc;
+use crate::workspaces::user_workspaces::{HeadlessTeamScope, UserWorkspaces};
 
 const MAX_LINE_WIDTH: usize = 90;
 const STREAM_RETRY_BACKOFF_STEPS: &[u64] = &[1, 2, 5, 10];
+const HTTP_UNPROCESSABLE_ENTITY: u16 = 422;
+#[cfg(not(target_family = "wasm"))]
+const HTTP_NOT_FOUND: u16 = 404;
+const OPERATION_NOT_SUPPORTED_TYPE_URI: &str =
+    "https://docs.warp.dev/errors/operation_not_supported";
 
 /// Singleton model that runs async work for ambient agent CLI commands.
 struct AmbientAgentRunner;
@@ -75,7 +80,14 @@ pub fn list_ambient_agent_tasks(
     let json_output = args.json_output.clone();
     let output_format = global_options.output_format;
     runner.update(ctx, |runner, ctx| {
-        runner.list_tasks(args.limit, filter, output_format, json_output, ctx)
+        runner.list_tasks(
+            args.team_selection,
+            args.limit,
+            filter,
+            output_format,
+            json_output,
+            ctx,
+        )
     })
 }
 
@@ -185,13 +197,38 @@ fn sort_by_from_arg(arg: RunSortByArg) -> RunSortBy {
     }
 }
 
-fn sort_order_from_arg(arg: RunSortOrderArg) -> RunSortOrder {
+fn sort_order_from_arg(arg: SortOrderArg) -> RunSortOrder {
     match arg {
-        RunSortOrderArg::Asc => RunSortOrder::Asc,
-        RunSortOrderArg::Desc => RunSortOrder::Desc,
+        SortOrderArg::Asc => RunSortOrder::Asc,
+        SortOrderArg::Desc => RunSortOrder::Desc,
     }
 }
 
+enum ListTasksOutput {
+    Raw(serde_json::Value),
+    Tasks(Vec<AmbientAgentTask>),
+}
+
+async fn load_tasks_for_output(
+    ai_client: &dyn AIClient,
+    limit: i32,
+    filter: TaskListFilter,
+    request_team_scope: RequestTeamScope,
+    output_format: OutputFormat,
+    json_output: &JsonOutput,
+) -> anyhow::Result<ListTasksOutput> {
+    if matches!(output_format, OutputFormat::Json) || json_output.force_json_output() {
+        let response = ai_client
+            .list_agent_runs_raw(limit, filter, Some(request_team_scope))
+            .await?;
+        Ok(ListTasksOutput::Raw(response))
+    } else {
+        let tasks = ai_client
+            .list_ambient_agent_tasks(limit, filter, Some(request_team_scope))
+            .await?;
+        Ok(ListTasksOutput::Tasks(tasks))
+    }
+}
 /// Run a message-related CLI command.
 pub fn run_message(
     ctx: &mut AppContext,
@@ -266,11 +303,8 @@ impl AmbientAgentRunner {
                 );
                 return;
             }
-
-            // TODO: Consider making the server's prompt field optional when skill is provided,
-            // rather than sending an empty string for skill-only invocations.
-            let prompt_string = match prompt {
-                Some(Prompt::PlainText(text)) => text,
+            let prompt = match prompt {
+                Some(Prompt::PlainText(text)) => Some(text),
                 Some(Prompt::SavedPrompt(id)) => {
                     // Resolve the saved prompt to pass along as the ambient agent query.
                     // We look up the prompt text here, rather than passing along the saved prompt ID,
@@ -294,7 +328,7 @@ impl AmbientAgentRunner {
 
                     match workflow {
                         Some(cloud_workflow) => match cloud_workflow.model().data.prompt() {
-                            Some(prompt_text) => prompt_text.to_string(),
+                            Some(prompt_text) => Some(prompt_text.to_string()),
                             None => {
                                 super::report_fatal_error(
                                     anyhow::anyhow!("'{id}' is not a saved prompt"),
@@ -312,8 +346,7 @@ impl AmbientAgentRunner {
                         }
                     }
                 }
-                // Skill-only invocation: use empty prompt, skill provides instructions
-                None => String::new(),
+                None => None,
             };
 
             let loaded_file = match args.config_file.file.as_deref() {
@@ -326,6 +359,23 @@ impl AmbientAgentRunner {
                 },
                 None => None,
             };
+
+            // The `--runner` CLI flag is gated in `run_agent`, but a config file
+            // can also set `runner_id`, which would otherwise bypass the gate.
+            if loaded_file
+                .as_ref()
+                .and_then(|f| f.file.runner_id.as_ref())
+                .is_some()
+                && !FeatureFlag::CloudRunners.is_enabled()
+            {
+                super::report_fatal_error(
+                    anyhow::anyhow!(
+                        "`runner_id` is set in the config file but runner support is not enabled"
+                    ),
+                    ctx,
+                );
+                return;
+            }
 
             // Validate and process attachments early, before environment selection
             // This ensures users don't have to go through env selection if attachment validation fails
@@ -370,18 +420,28 @@ impl AmbientAgentRunner {
                 vec![]
             };
 
+            let team_scope = match super::common::resolve_object_scope(&args.scope, ctx) {
+                Ok(team_scope) => team_scope,
+                Err(err) => {
+                    super::report_fatal_error(err, ctx);
+                    return;
+                }
+            };
+
             let mut environment_args = args.environment;
-            if environment_args.environment.is_none() && !environment_args.no_environment {
-                if let Some(environment_id) = loaded_file
+            if environment_args.environment.is_none() && !environment_args.no_environment
+                && let Some(environment_id) = loaded_file
                     .as_ref()
                     .and_then(|f| f.file.environment_id.clone())
                 {
                     environment_args.environment = Some(environment_id);
                 }
-            }
 
-            let environment_id = match EnvironmentChoice::resolve_for_create(environment_args, ctx)
-            {
+            let environment_id = match EnvironmentChoice::resolve_for_create(
+                environment_args,
+                &team_scope,
+                ctx,
+            ) {
                 Ok(EnvironmentChoice::None) => {
                     eprintln!("Agent will run without an environment.");
                     None
@@ -414,21 +474,37 @@ impl AmbientAgentRunner {
                     }
                 };
 
+            // When using a third-party harness, --model specifies a harness-specific
+            // model identifier (e.g. "sonnet", "claude-opus-4-8" for Claude Code;
+            // "gpt-5.5" for Codex) rather than an Oz model ID. Route it directly
+            // into HarnessConfig.model_id so it reaches the harness unchanged.
             let harness_override = (args.harness != Harness::Oz).then_some(HarnessConfig {
                 harness_type: args.harness,
+                model_id: args.model.model.clone(),
+                reasoning_level: None,
             });
-            let harness_auth_secrets = args.claude_auth_secret.clone().map(|name| {
-                crate::ai::ambient_agents::task::HarnessAuthSecretsConfig {
-                    claude_auth_secret_name: Some(name),
-                }
+            let harness_auth_secrets = (args.claude_auth_secret.is_some()
+                || args.codex_auth_secret.is_some())
+            .then(|| crate::ai::ambient_agents::task::HarnessAuthSecretsConfig {
+                claude_auth_secret_name: args.claude_auth_secret.clone(),
+                codex_auth_secret_name: args.codex_auth_secret.clone(),
+                pi_auth_secret_name: None,
             });
 
             let merged_config = super::config_file::merge_with_precedence(
                 loaded_file.as_ref(),
                 AgentConfigSnapshot {
+                    experimental: None,
                     name: args.name,
                     environment_id,
-                    model_id: args.model.model.clone(),
+                    runner_id: args.runner,
+                    // For third-party harnesses the model goes into harness config above;
+                    // leave the Oz model_id slot empty so Oz validation is not attempted.
+                    model_id: if args.harness == Harness::Oz {
+                        args.model.model.clone()
+                    } else {
+                        None
+                    },
                     base_prompt: None,
                     mcp_servers: cli_mcp_servers,
                     profile_id: None,
@@ -437,20 +513,34 @@ impl AmbientAgentRunner {
                     computer_use_enabled: args.computer_use.computer_use_override(),
                     harness: harness_override,
                     harness_auth_secrets,
+                    additional_source_repos: None,
                 },
             );
 
             // We must wait until after workspace metadata is refreshed to check available LLMs.
-            let model_id = match merged_config
-                .model_id
-                .as_deref()
-                .map(|model_id| super::common::validate_agent_mode_base_model_id(model_id, ctx))
-                .transpose()
-            {
-                Ok(id) => id.map(|id| id.to_string()),
-                Err(err) => {
-                    super::report_fatal_error(err, ctx);
-                    return;
+            // For third-party harnesses, the model is in harness.model_id and is validated
+            // server-side. Clear the top-level model_id slot to prevent any Oz model ID
+            // that leaked in from a config file from being sent alongside the harness model.
+            let model_id = if merged_config.harness.is_some() {
+                None
+            } else {
+                match merged_config
+                    .model_id
+                    .as_deref()
+                    .map(|model_id| {
+                        super::common::validate_agent_mode_base_model_id_for_scope(
+                            model_id,
+                            &team_scope,
+                            ctx,
+                        )
+                    })
+                    .transpose()
+                {
+                    Ok(id) => id.map(|id| id.to_string()),
+                    Err(err) => {
+                        super::report_fatal_error(err, ctx);
+                        return;
+                    }
                 }
             };
 
@@ -471,28 +561,47 @@ impl AmbientAgentRunner {
                 None
             };
 
+            let (prompt, mode) = match prompt {
+                Some(prompt) => {
+                    let (prompt, mode) = extract_user_query_mode(prompt);
+                    (Some(prompt), mode)
+                }
+                None => (None, UserQueryMode::Normal),
+            };
             let request = SpawnAgentRequest {
-                prompt: prompt_string,
+                metadata: Default::default(),
+                prompt,
+                mode,
                 config,
-                title: None,
-                team: match (args.scope.team, args.scope.personal) {
-                    (true, _) => Some(true),
-                    (_, true) => Some(false),
-                    _ => None,
-                },
+                title: args.title,
+                team: Some(match &team_scope {
+                    HeadlessTeamScope::Personal => false,
+                    HeadlessTeamScope::Team(_) => true,
+                }),
+                agent_identity_uid: args.agent_uid,
                 skill,
                 attachments,
                 interactive: None,
-                parent_run_id: None,
+                parent_run_id: args.parent_run_id,
                 runtime_skills: vec![],
                 referenced_attachments: vec![],
+                conversation_id: args.conversation,
+                initial_snapshot_token: None,
+                snapshot_disabled: None,
+                orchestration_handoff: None,
             };
 
             let should_open = args.open;
             let oz_root_url = ChannelState::oz_root_url();
             let ai_client_clone = ai_client.clone();
+            let request_team_scope = RequestTeamScope::from_scope(&team_scope);
             let spawn_future = async move {
-                let mut stream = Box::pin(spawn_task(request, ai_client_clone, Some(TASK_STATUS_POLLING_DURATION)));
+                let mut stream = Box::pin(spawn_task(
+                    request,
+                    request_team_scope,
+                    ai_client_clone,
+                    Some(TASK_STATUS_POLLING_DURATION),
+                ));
                 let mut session_join_info = None;
                 let mut spawned_task_id = None;
 
@@ -538,7 +647,7 @@ impl AmbientAgentRunner {
                             }
                             AmbientAgentEvent::TimedOut => {
                                 let task_id_str = spawned_task_id.as_ref().map_or_else(|| "unknown".to_string(), |id| id.to_string());
-                                println!("Agent session with run ID {task_id_str} is not ready after {}s. Check for a sharing link in the ambient agent management panel. See https://docs.warp.dev/agent-platform/cloud-agents/managing-cloud-agents for details.", TASK_STATUS_POLLING_DURATION.as_secs());
+                                println!("Agent session with run ID {task_id_str} is not ready after {}s. Check for a sharing link in the ambient agent management panel. See https://docs.warp.dev/platform/managing-cloud-agents for details.", TASK_STATUS_POLLING_DURATION.as_secs());
                             }
                         },
                         Err(err) => {
@@ -552,8 +661,8 @@ impl AmbientAgentRunner {
 
             ctx.spawn(spawn_future, move |_, result, ctx| match result {
                 Ok(session_join_info) => {
-                    if should_open {
-                        if let Some(session_join_info) = session_join_info {
+                    if should_open
+                        && let Some(session_join_info) = session_join_info {
                             let url =
                                 match (super::is_running_in_warp(), session_join_info.session_id) {
                                     (true, Some(session_id)) => {
@@ -564,7 +673,6 @@ impl AmbientAgentRunner {
 
                             ctx.open_url(&url);
                         }
-                    }
                     ctx.terminate_app(TerminationMode::ForceTerminate, None);
                 }
                 Err(err) => {
@@ -578,32 +686,76 @@ impl AmbientAgentRunner {
 
     fn list_tasks(
         &self,
+        team_selection: TeamSelection,
         limit: i32,
         filter: TaskListFilter,
         output_format: OutputFormat,
         json_output: JsonOutput,
         ctx: &mut ModelContext<Self>,
     ) -> anyhow::Result<()> {
-        let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
+        let refresh_future = super::common::refresh_workspace_metadata(ctx);
+        ctx.spawn(refresh_future, move |runner, refresh_result, ctx| {
+            if let Err(err) = refresh_result {
+                super::report_fatal_error(err, ctx);
+                return;
+            }
+            runner.list_tasks_after_workspace_refresh(
+                team_selection,
+                limit,
+                filter,
+                output_format,
+                json_output,
+                ctx,
+            );
+        });
 
-        let list_future = async move {
-            if matches!(output_format, OutputFormat::Json) || json_output.force_json_output() {
-                let response = ai_client.list_agent_runs_raw(limit, filter).await?;
-                super::output::print_raw_json(response, &json_output)?;
-            } else if matches!(output_format, OutputFormat::Ndjson) {
-                let tasks = ai_client.list_ambient_agent_tasks(limit, filter).await?;
-                for task in tasks {
-                    super::output::write_json_line(&task, std::io::stdout())?;
+        Ok(())
+    }
+
+    fn list_tasks_after_workspace_refresh(
+        &self,
+        team_selection: TeamSelection,
+        limit: i32,
+        filter: TaskListFilter,
+        output_format: OutputFormat,
+        json_output: JsonOutput,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let request_team_scope =
+            match UserWorkspaces::as_ref(ctx).team_scope_for_cli(&team_selection) {
+                Ok(scope) => RequestTeamScope::from_scope(&scope),
+                Err(err) => {
+                    super::report_fatal_error(err.into(), ctx);
+                    return;
                 }
-            } else {
-                let tasks = ai_client.list_ambient_agent_tasks(limit, filter).await?;
-                Self::print_tasks_table(&tasks);
+            };
+        let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
+        let list_future = async move {
+            match load_tasks_for_output(
+                ai_client.as_ref(),
+                limit,
+                filter,
+                request_team_scope,
+                output_format,
+                &json_output,
+            )
+            .await?
+            {
+                ListTasksOutput::Raw(response) => {
+                    super::output::print_raw_json(response, &json_output)?;
+                }
+                ListTasksOutput::Tasks(tasks) if matches!(output_format, OutputFormat::Ndjson) => {
+                    for task in tasks {
+                        super::output::write_json_line(&task, std::io::stdout())?;
+                    }
+                }
+                ListTasksOutput::Tasks(tasks) => {
+                    Self::print_tasks_table(&tasks);
+                }
             }
             Ok(())
         };
         self.spawn_command(list_future, ctx);
-
-        Ok(())
     }
 
     fn get_task_status(
@@ -640,17 +792,42 @@ impl AmbientAgentRunner {
         output_format: OutputFormat,
         ctx: &mut ModelContext<Self>,
     ) -> anyhow::Result<()> {
-        let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
+        let provider = ServerApiProvider::as_ref(ctx);
+        let ai_client = provider.get_ai_client();
+        let server_api = provider.get();
+        let scoped_task_id = task_id_for_message_send(&args.sender_run_id)?;
 
         let future = async move {
-            let response = ai_client
-                .send_agent_message(SendAgentMessageRequest {
-                    to: args.to,
-                    subject: args.subject,
-                    body: args.body,
-                    sender_run_id: args.sender_run_id,
-                })
-                .await?;
+            let request = SendAgentMessageRequest {
+                to: args.to,
+                subject: args.subject,
+                body: args.body,
+                sender_run_id: args.sender_run_id,
+            };
+            let log_context = SendAgentMessageLogContext::new(&request, scoped_task_id.as_ref());
+            log_context.log_start();
+            let send_message = async move {
+                match scoped_task_id {
+                    Some(task_id) => {
+                        server_api
+                            .send_agent_message_for_task(&task_id, request)
+                            .await
+                    }
+                    None => ai_client.send_agent_message(request).await,
+                }
+            };
+            let response = match send_message.await {
+                Ok(response) => {
+                    log_context.log_success(&response);
+                    response
+                }
+                Err(err) => {
+                    let err = err.context(log_context.error_context());
+                    log_context.log_error(&err);
+                    eprintln!("{err:#}");
+                    return Err(err);
+                }
+            };
             print_send_message_response(&response, output_format)?;
             Ok(())
         };
@@ -658,25 +835,31 @@ impl AmbientAgentRunner {
 
         Ok(())
     }
+
     fn list_messages(
         &self,
         args: MessageListArgs,
         output_format: OutputFormat,
         ctx: &mut ModelContext<Self>,
     ) -> anyhow::Result<()> {
-        let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
+        let provider = ServerApiProvider::as_ref(ctx);
+        let ai_client = provider.get_ai_client();
+        let server_api = provider.get();
 
         let future = async move {
-            let messages = ai_client
-                .list_agent_messages(
-                    &args.run_id,
-                    ListAgentMessagesRequest {
-                        unread_only: args.unread,
-                        since: args.since,
-                        limit: args.limit,
-                    },
-                )
-                .await?;
+            let request = ListAgentMessagesRequest {
+                unread_only: args.unread,
+                since: args.since,
+                limit: args.limit,
+            };
+            let messages = match task_id_from_run_id(&args.run_id) {
+                Some(task_id) => {
+                    server_api
+                        .list_agent_messages_for_task(&task_id, &args.run_id, request)
+                        .await?
+                }
+                None => ai_client.list_agent_messages(&args.run_id, request).await?,
+            };
             super::output::print_list(messages, output_format);
             Ok(())
         };
@@ -708,10 +891,20 @@ impl AmbientAgentRunner {
         output_format: OutputFormat,
         ctx: &mut ModelContext<Self>,
     ) -> anyhow::Result<()> {
-        let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
+        let provider = ServerApiProvider::as_ref(ctx);
+        let ai_client = provider.get_ai_client();
+        let server_api = provider.get();
+        let scoped_task_id = task_id_from_oz_run_id_env()?;
 
         let future = async move {
-            let message = ai_client.read_agent_message(&args.message_id).await?;
+            let message = match scoped_task_id {
+                Some(task_id) => {
+                    server_api
+                        .read_agent_message_for_task(&task_id, &args.message_id)
+                        .await?
+                }
+                None => ai_client.read_agent_message(&args.message_id).await?,
+            };
             print_read_message_response(&message, output_format)?;
             Ok(())
         };
@@ -726,10 +919,20 @@ impl AmbientAgentRunner {
         output_format: OutputFormat,
         ctx: &mut ModelContext<Self>,
     ) -> anyhow::Result<()> {
-        let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
+        let provider = ServerApiProvider::as_ref(ctx);
+        let ai_client = provider.get_ai_client();
+        let server_api = provider.get();
+        let scoped_task_id = task_id_from_oz_run_id_env()?;
 
         let future = async move {
-            ai_client.mark_message_delivered(&args.message_id).await?;
+            match scoped_task_id {
+                Some(task_id) => {
+                    server_api
+                        .mark_message_delivered_for_task(&task_id, &args.message_id)
+                        .await?
+                }
+                None => ai_client.mark_message_delivered(&args.message_id).await?,
+            }
             print_mark_message_delivered_result(&args.message_id, output_format)?;
             Ok(())
         };
@@ -788,6 +991,10 @@ impl AmbientAgentRunner {
                     MAX_LINE_WIDTH,
                 );
                 table.add_row(vec![title_cell]);
+            }
+
+            if let Some(executor) = task.executor_display_name() {
+                table.add_row(vec![format!("Executed as: {executor}")]);
             }
 
             // Agent config snapshot (if available)
@@ -883,6 +1090,19 @@ impl AmbientAgentRunner {
                         lines.push(format!("    Description: {}", description));
                     }
                 }
+                Artifact::ExternalReference {
+                    reference_type,
+                    url,
+                    title,
+                    metadata,
+                } => {
+                    let title_str = title.as_deref().unwrap_or("Untitled reference");
+                    lines.push(format!("  {reference_type}: {title_str}"));
+                    lines.push(format!("    Link: {url}"));
+                    if let Some(metadata) = metadata {
+                        lines.push(format!("    Metadata: {metadata}"));
+                    }
+                }
             }
         }
 
@@ -933,6 +1153,91 @@ fn write_stream_record<T: Serialize>(record: &T) -> anyhow::Result<()> {
     stdout.flush().context("unable to flush stdout")?;
     Ok(())
 }
+
+fn task_id_from_run_id(run_id: &str) -> Option<AmbientAgentTaskId> {
+    run_id.parse().ok()
+}
+
+fn task_id_from_oz_run_id_env() -> anyhow::Result<Option<AmbientAgentTaskId>> {
+    match std::env::var(warp_cli::OZ_RUN_ID_ENV) {
+        Ok(run_id) => parse_ambient_task_id(&run_id, "Invalid OZ_RUN_ID").map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow!(
+            "{} is set but is not valid Unicode",
+            warp_cli::OZ_RUN_ID_ENV
+        )),
+    }
+}
+
+fn task_id_for_message_send(sender_run_id: &str) -> anyhow::Result<Option<AmbientAgentTaskId>> {
+    match task_id_from_run_id(sender_run_id) {
+        Some(task_id) => Ok(Some(task_id)),
+        None => task_id_from_oz_run_id_env(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SendAgentMessageLogContext {
+    sender_run_id: String,
+    task_id: Option<String>,
+    target_agent_ids: Vec<String>,
+    subject: String,
+    body_len: usize,
+}
+
+impl SendAgentMessageLogContext {
+    fn new(request: &SendAgentMessageRequest, task_id: Option<&AmbientAgentTaskId>) -> Self {
+        Self {
+            sender_run_id: request.sender_run_id.clone(),
+            task_id: task_id.map(|task_id| task_id.to_string()),
+            target_agent_ids: request.to.clone(),
+            subject: request.subject.clone(),
+            body_len: request.body.chars().count(),
+        }
+    }
+
+    fn error_context(&self) -> String {
+        format!(
+            "Failed to send agent message (sender_run_id={:?}, task_id={:?}, target_agent_ids={:?})",
+            self.sender_run_id, self.task_id, self.target_agent_ids
+        )
+    }
+
+    fn log_start(&self) {
+        log::info!(
+            "Sending ambient agent message: sender_run_id={:?} task_id={:?} target_agent_ids={:?} subject={:?} body_len={}",
+            self.sender_run_id,
+            self.task_id,
+            self.target_agent_ids,
+            self.subject,
+            self.body_len
+        );
+    }
+
+    fn log_success(&self, response: &SendAgentMessageResponse) {
+        log::info!(
+            "Sent ambient agent message: sender_run_id={:?} task_id={:?} target_agent_ids={:?} subject={:?} body_len={} message_ids={:?}",
+            self.sender_run_id,
+            self.task_id,
+            self.target_agent_ids,
+            self.subject,
+            self.body_len,
+            response.message_ids
+        );
+    }
+
+    fn log_error(&self, err: &anyhow::Error) {
+        log::warn!(
+            "Failed to send ambient agent message: sender_run_id={:?} task_id={:?} target_agent_ids={:?} subject={:?} body_len={} error={err:#}",
+            self.sender_run_id,
+            self.task_id,
+            self.target_agent_ids,
+            self.subject,
+            self.body_len
+        );
+    }
+}
+
 async fn watch_messages_forever(
     server_api: Arc<ServerApi>,
     ai_client: Arc<dyn AIClient>,
@@ -940,15 +1245,25 @@ async fn watch_messages_forever(
 ) -> anyhow::Result<()> {
     let run_id = args.run_id;
     let watched_run_ids = vec![run_id.clone()];
+    let scoped_task_id = task_id_from_run_id(&run_id);
     let mut last_seen_sequence = args.since_sequence;
     let mut initial_connect = true;
     let mut failures = 0usize;
 
     loop {
-        let mut stream = match server_api
-            .stream_agent_events(&watched_run_ids, last_seen_sequence)
-            .await
-        {
+        let stream_result = match scoped_task_id.as_ref() {
+            Some(task_id) => {
+                server_api
+                    .stream_agent_events_for_task(task_id, &watched_run_ids, last_seen_sequence)
+                    .await
+            }
+            None => {
+                server_api
+                    .stream_agent_events(&watched_run_ids, last_seen_sequence)
+                    .await
+            }
+        };
+        let mut stream = match stream_result {
             Ok(stream) => {
                 if !initial_connect {
                     eprintln!(
@@ -1004,8 +1319,15 @@ async fn watch_messages_forever(
                         last_seen_sequence = event.sequence;
                         continue;
                     };
-
-                    let message = match ai_client.read_agent_message(&message_id).await {
+                    let message_result = match scoped_task_id.as_ref() {
+                        Some(task_id) => {
+                            server_api
+                                .read_agent_message_for_task(task_id, &message_id)
+                                .await
+                        }
+                        None => ai_client.read_agent_message(&message_id).await,
+                    };
+                    let message = match message_result {
                         Ok(message) => message,
                         Err(err) => {
                             failures += 1;
@@ -1202,6 +1524,144 @@ pub fn get_run_conversation(ctx: &mut AppContext, run_id: String) -> anyhow::Res
     runner.update(ctx, |runner, ctx| runner.get_run_conversation(run_id, ctx))
 }
 
+/// Normalized Warp conversation JSON, or a raw third-party harness transcript.
+#[derive(Debug, PartialEq)]
+enum ConversationCliOutput {
+    Normalized(serde_json::Value),
+    RawTranscript(Bytes),
+}
+
+async fn load_run_conversation(
+    ai_client: &dyn AIClient,
+    run_id: &str,
+) -> anyhow::Result<ConversationCliOutput> {
+    match ai_client.get_run_conversation(run_id).await {
+        Ok(conversation) => Ok(ConversationCliOutput::Normalized(conversation)),
+        Err(err) => {
+            #[cfg(not(target_family = "wasm"))]
+            if is_normalized_conversation_unsupported(&err) {
+                return download_raw_run_transcript(ai_client, run_id)
+                    .await
+                    .map(ConversationCliOutput::RawTranscript);
+            }
+            Err(err)
+        }
+    }
+}
+
+async fn load_public_conversation(
+    ai_client: &dyn AIClient,
+    conversation_id: &str,
+) -> anyhow::Result<ConversationCliOutput> {
+    match ai_client.get_public_conversation(conversation_id).await {
+        Ok(conversation) => Ok(ConversationCliOutput::Normalized(conversation)),
+        Err(err) => {
+            #[cfg(not(target_family = "wasm"))]
+            if is_normalized_conversation_unsupported(&err) {
+                return download_raw_conversation_transcript(ai_client, conversation_id)
+                    .await
+                    .map(ConversationCliOutput::RawTranscript);
+            }
+            Err(err)
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn download_raw_run_transcript(
+    ai_client: &dyn AIClient,
+    run_id: &str,
+) -> anyhow::Result<Bytes> {
+    let task_id = parse_ambient_task_id(run_id, "Invalid run ID")?;
+    map_raw_transcript_download(
+        ai_client.download_run_transcript(&task_id).await,
+        format!("Raw transcript not found for run {run_id}. It may not have been uploaded yet."),
+        format!("Failed to download raw transcript for run {run_id}"),
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn download_raw_conversation_transcript(
+    ai_client: &dyn AIClient,
+    conversation_id: &str,
+) -> anyhow::Result<Bytes> {
+    map_raw_transcript_download(
+        ai_client
+            .download_conversation_transcript(conversation_id)
+            .await,
+        format!(
+            "Raw transcript not found for conversation {conversation_id}. It may not have been uploaded yet."
+        ),
+        format!("Failed to download raw transcript for conversation {conversation_id}"),
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn map_raw_transcript_download(
+    result: anyhow::Result<Bytes>,
+    not_found_message: String,
+    failure_context: String,
+) -> anyhow::Result<Bytes> {
+    match result {
+        Ok(bytes) => Ok(bytes),
+        Err(err) if is_http_status(&err, HTTP_NOT_FOUND) => Err(anyhow!(not_found_message)),
+        Err(err) => Err(err.context(failure_context)),
+    }
+}
+
+#[derive(Deserialize)]
+struct Rfc7807Problem {
+    #[serde(default, rename = "type")]
+    problem_type: String,
+}
+
+fn is_normalized_conversation_unsupported(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let Some(status_error) = cause.downcast_ref::<HttpStatusError>() else {
+            return false;
+        };
+        if status_error.status != HTTP_UNPROCESSABLE_ENTITY {
+            return false;
+        }
+        let Ok(problem) = serde_json::from_str::<Rfc7807Problem>(&status_error.body) else {
+            return false;
+        };
+        problem.problem_type == OPERATION_NOT_SUPPORTED_TYPE_URI
+    })
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn is_http_status(err: &anyhow::Error, status: u16) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<HttpStatusError>()
+            .is_some_and(|status_error| status_error.status == status)
+    })
+}
+
+fn print_conversation_cli_output(output: &ConversationCliOutput) -> anyhow::Result<()> {
+    write_conversation_cli_output(output, std::io::stdout())
+}
+
+fn write_conversation_cli_output<W>(
+    output: &ConversationCliOutput,
+    mut writer: W,
+) -> anyhow::Result<()>
+where
+    W: std::io::Write,
+{
+    match output {
+        ConversationCliOutput::Normalized(conversation) => {
+            let pretty = serde_json::to_string_pretty(conversation)?;
+            writeln!(writer, "{pretty}")?;
+        }
+        ConversationCliOutput::RawTranscript(bytes) => {
+            writer.write_all(bytes.as_ref())?;
+        }
+    }
+    Ok(())
+}
+
 impl AmbientAgentRunner {
     fn get_conversation(
         &self,
@@ -1211,9 +1671,8 @@ impl AmbientAgentRunner {
         let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
 
         let future = async move {
-            let conversation = ai_client.get_public_conversation(&conversation_id).await?;
-            let pretty = serde_json::to_string_pretty(&conversation)?;
-            println!("{pretty}");
+            let output = load_public_conversation(ai_client.as_ref(), &conversation_id).await?;
+            print_conversation_cli_output(&output)?;
             Ok(())
         };
         self.spawn_command(future, ctx);
@@ -1229,9 +1688,8 @@ impl AmbientAgentRunner {
         let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
 
         let future = async move {
-            let conversation = ai_client.get_run_conversation(&run_id).await?;
-            let pretty = serde_json::to_string_pretty(&conversation)?;
-            println!("{pretty}");
+            let output = load_run_conversation(ai_client.as_ref(), &run_id).await?;
+            print_conversation_cli_output(&output)?;
             Ok(())
         };
         self.spawn_command(future, ctx);

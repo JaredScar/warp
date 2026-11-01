@@ -1,150 +1,29 @@
-use serde::{Deserialize, Serialize};
-use std::fmt;
-use warp_server_client::cloud_object::Owner;
-
-use crate::{
-    auth::AuthStateProvider,
-    cloud_object::{
-        model::{
-            generic_string_model::{GenericStringModel, GenericStringObjectId, StringModel},
-            json_model::{JsonModel, JsonSerializer},
-            persistence::CloudModel,
-        },
-        GenericCloudObject, GenericStringObjectFormat, GenericStringObjectUniqueKey,
-        JsonObjectType, Revision, ServerCloudObject,
-    },
-    server::{ids::SyncId, sync_queue::QueueItem},
-    workspaces::user_workspaces::UserWorkspaces,
+mod catalog;
+pub use catalog::CloudEnvironmentCatalog;
+#[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
+pub(crate) use catalog::sort_environments_by_recency;
+#[cfg(feature = "tui")]
+pub use catalog::{CloudEnvironment, CloudEnvironmentCatalogEvent};
+#[cfg_attr(target_family = "wasm", expect(unused_imports))]
+pub use cloud_object_models::{
+    AmbientAgentEnvironment, AwsProviderConfig, BaseImage, CloudAmbientAgentEnvironment,
+    CloudAmbientAgentEnvironmentModel, GcpProviderConfig, GithubRepo, ProvidersConfig, SourceRepo,
 };
-use warpui::{AppContext, SingletonEntity as _};
+use cloud_objects::cloud_object::Owner;
+use warpui::{AppContext, Entity, SingletonEntity as _, ViewContext};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct GithubRepo {
-    /// Repository owner (e.g. "warpdotdev")
-    pub owner: String,
-    /// Repository name (e.g. "warp-internal")
-    pub repo: String,
-}
+use crate::auth::AuthStateProvider;
+use crate::cloud_object::model::generic_string_model::StringModel;
+use crate::cloud_object::model::json_model::JsonModel;
+use crate::cloud_object::{
+    CloudObject, GenericStringObjectFormat, GenericStringObjectUniqueKey, JsonObjectType, Revision,
+};
+use crate::server::sync_queue::QueueItem;
+use crate::workspaces::user_workspaces::{TeamScope, UserWorkspaces};
 
-impl GithubRepo {
-    pub fn new(owner: String, repo: String) -> Self {
-        Self { owner, repo }
-    }
-}
-
-impl fmt::Display for GithubRepo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.owner, self.repo)
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum BaseImage {
-    DockerImage(String),
-}
-
-impl fmt::Display for BaseImage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BaseImage::DockerImage(s) => s.fmt(f),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct GcpProviderConfig {
-    pub project_number: String,
-    pub workload_identity_federation_pool_id: String,
-    pub workload_identity_federation_provider_id: String,
-    /// Service account email for impersonation. When set, the federated token
-    /// is exchanged for a service account access token.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_account_email: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct AwsProviderConfig {
-    pub role_arn: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
-pub struct ProvidersConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gcp: Option<GcpProviderConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aws: Option<AwsProviderConfig>,
-}
-
-impl ProvidersConfig {
-    pub fn is_empty(&self) -> bool {
-        self.gcp.is_none() && self.aws.is_none()
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-/// An AmbientAgentEnvironment represents an environment that we would run a Warp agent in.
-pub struct AmbientAgentEnvironment {
-    /// Environment name
-    #[serde(default)]
-    pub name: String,
-    /// Optional description of the environment (max 240 characters)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// List of GitHub repositories
-    #[serde(default)]
-    pub github_repos: Vec<GithubRepo>,
-    /// Base image specification
-    #[serde(flatten)]
-    pub base_image: BaseImage,
-    /// List of setup commands to run after cloning
-    #[serde(default)]
-    pub setup_commands: Vec<String>,
-    /// Optional cloud provider configurations for automatic auth.
-    #[serde(default, skip_serializing_if = "ProvidersConfig::is_empty")]
-    pub providers: ProvidersConfig,
-}
-
-pub type CloudAmbientAgentEnvironment =
-    GenericCloudObject<GenericStringObjectId, CloudAmbientAgentEnvironmentModel>;
-pub type CloudAmbientAgentEnvironmentModel =
-    GenericStringModel<AmbientAgentEnvironment, JsonSerializer>;
-
-impl CloudAmbientAgentEnvironment {
-    pub fn get_all(app: &AppContext) -> Vec<CloudAmbientAgentEnvironment> {
-        CloudModel::as_ref(app)
-            .get_all_objects_of_type::<GenericStringObjectId, CloudAmbientAgentEnvironmentModel>()
-            .cloned()
-            .collect()
-    }
-
-    pub fn get_by_id<'a>(
-        sync_id: &'a SyncId,
-        app: &'a AppContext,
-    ) -> Option<&'a CloudAmbientAgentEnvironment> {
-        CloudModel::as_ref(app)
-            .get_object_of_type::<GenericStringObjectId, CloudAmbientAgentEnvironmentModel>(sync_id)
-    }
-}
-
-impl AmbientAgentEnvironment {
-    pub fn new(
-        name: String,
-        description: Option<String>,
-        github_repos: Vec<GithubRepo>,
-        docker_image: String,
-        setup_commands: Vec<String>,
-    ) -> Self {
-        Self {
-            name,
-            description,
-            github_repos,
-            base_image: BaseImage::DockerImage(docker_image),
-            setup_commands,
-            providers: ProvidersConfig::default(),
-        }
-    }
-}
+/// Oz web app page for viewing and creating cloud environments.
+#[cfg(feature = "tui")]
+pub const OZ_ENVIRONMENTS_URL: &str = "https://oz.warp.dev/environments";
 
 impl StringModel for AmbientAgentEnvironment {
     type CloudObjectType = CloudAmbientAgentEnvironment;
@@ -173,19 +52,11 @@ impl StringModel for AmbientAgentEnvironment {
         QueueItem::UpdateCloudEnvironment {
             model: object.model().clone().into(),
             id: object.id,
-            revision: revision_ts.or_else(|| object.metadata.revision.clone()),
+            revision: revision_ts.or(object.metadata.revision),
         }
     }
 
     fn uniqueness_key(&self) -> Option<GenericStringObjectUniqueKey> {
-        None
-    }
-
-    fn new_from_server_update(&self, server_cloud_object: &ServerCloudObject) -> Option<Self> {
-        if let ServerCloudObject::AmbientAgentEnvironment(server_environment) = server_cloud_object
-        {
-            return Some(server_environment.model.clone().string_model);
-        }
         None
     }
 
@@ -204,13 +75,11 @@ impl JsonModel for AmbientAgentEnvironment {
     }
 }
 
-/// Resolves the current owner for creating new environments.
-///
-/// If the user is on a team, returns `Owner::Team`. Otherwise, returns
-/// `Owner::User` with the current user's ID. Returns `None` if the user
-/// is not logged in.
-pub fn owner_for_new_environment(ctx: &AppContext) -> Option<Owner> {
-    if let Some(team_uid) = UserWorkspaces::as_ref(ctx).current_team_uid() {
+pub fn owner_for_new_environment<T: Entity>(ctx: &ViewContext<T>) -> Option<Owner> {
+    if let Some(team_uid) = UserWorkspaces::as_ref(ctx)
+        .team_for_view(ctx)
+        .map(|team| team.uid)
+    {
         Some(Owner::Team { team_uid })
     } else {
         let user_id = AuthStateProvider::as_ref(ctx).get().user_id()?;
@@ -227,6 +96,14 @@ pub fn owner_for_new_personal_environment(ctx: &AppContext) -> Option<Owner> {
     Some(Owner::User { user_uid: user_id })
 }
 
-#[cfg(test)]
-#[path = "mod_tests.rs"]
-mod tests;
+pub(crate) fn environment_matches_scope(
+    environment: &CloudAmbientAgentEnvironment,
+    team_scope: &(impl TeamScope + ?Sized),
+    include_user_owned_for_team_scope: bool,
+) -> bool {
+    let selected_team_uid = team_scope.team_uid();
+    match environment.permissions().owner {
+        Owner::User { .. } => selected_team_uid.is_none() || include_user_owned_for_team_scope,
+        Owner::Team { team_uid } => selected_team_uid == Some(team_uid),
+    }
+}

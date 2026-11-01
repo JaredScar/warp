@@ -1,8 +1,10 @@
-#[cfg(test)]
-use super::*;
-use ai::index::Symbol;
 use std::collections::HashSet;
 use std::path::PathBuf;
+
+use ai::index::Symbol;
+
+#[cfg(test)]
+use super::*;
 
 fn create_test_symbol(name: &str, type_prefix: Option<&str>) -> CodeSymbol {
     CodeSymbol {
@@ -109,21 +111,27 @@ fn test_search_code_symbols_basic_functionality() {
 
     let results = search_code_symbols(&symbols, "function");
     assert!(!results.is_empty());
-    assert!(results
-        .iter()
-        .any(|r| r.code_symbol.symbol.name == "my_function"));
+    assert!(
+        results
+            .iter()
+            .any(|r| r.code_symbol.symbol.name == "my_function")
+    );
 
     let results = search_code_symbols(&symbols, "fn");
     assert!(!results.is_empty());
-    assert!(results
-        .iter()
-        .any(|r| r.code_symbol.symbol.name == "my_function"));
+    assert!(
+        results
+            .iter()
+            .any(|r| r.code_symbol.symbol.name == "my_function")
+    );
 
     let results = search_code_symbols(&symbols, "fn function");
     assert!(!results.is_empty());
-    assert!(results
-        .iter()
-        .any(|r| r.code_symbol.symbol.name == "my_function"));
+    assert!(
+        results
+            .iter()
+            .any(|r| r.code_symbol.symbol.name == "my_function")
+    );
 }
 
 #[test]
@@ -180,9 +188,11 @@ fn test_search_code_symbols_untyped_symbols() {
 
     let results = search_code_symbols(&symbols, "variable");
     assert!(!results.is_empty());
-    assert!(results
-        .iter()
-        .any(|r| r.code_symbol.symbol.name == "my_variable"));
+    assert!(
+        results
+            .iter()
+            .any(|r| r.code_symbol.symbol.name == "my_variable")
+    );
 }
 
 #[cfg(not(target_family = "wasm"))]

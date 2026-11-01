@@ -15,7 +15,7 @@ on:
 
 jobs:
   sync:
-    if: github.event_name == 'push' || inputs.action == 'sync'
+    if: (github.event_name == 'push' || inputs.action == 'sync') && github.repository_owner == 'warpdotdev'
     uses: warpdotdev/repo-sync/.github/workflows/sync.yml@main
     with:
       repo_sync_ref: main
@@ -35,8 +35,12 @@ jobs:
       (
        github.event.pull_request.merged == true ||
        (github.event.action == 'labeled' && github.event.label.name == 'repo-sync:needs-restack')
-      )
+      ) &&
+      github.repository_owner == 'warpdotdev'
     uses: warpdotdev/repo-sync/.github/workflows/restack.yml@main
+    permissions:
+      contents: write # repo-sync's restack workflow rebases and force-pushes the sync branches
+      pull-requests: write # it retargets the sync PRs and enables auto-merge on them
     with:
       repo_sync_ref: main
       app_id: ${{ vars.REPO_SYNC_APP_ID }}
@@ -50,8 +54,12 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       github.event.action != 'closed' &&
-      startsWith(github.event.pull_request.head.ref, 'repo-sync/')
+      startsWith(github.event.pull_request.head.ref, 'repo-sync/') &&
+      github.repository_owner == 'warpdotdev'
     uses: warpdotdev/repo-sync/.github/workflows/approve.yml@main
+    permissions:
+      contents: write # repo-sync's approve workflow pushes conflict resolutions to the sync branch
+      pull-requests: write # it approves the sync PR and enables auto-merge
     with:
       repo_sync_ref: main
       approver_app_id: ${{ vars.REPO_SYNC_APPROVER_APP_ID }}
@@ -61,8 +69,12 @@ jobs:
       approver_app_private_key: ${{ secrets.REPO_SYNC_APPROVER_APP_PRIVATE_KEY }}
 
   escalation:
-    if: inputs.action == 'escalation'
+    if: inputs.action == 'escalation' && github.repository_owner == 'warpdotdev'
     uses: warpdotdev/repo-sync/.github/workflows/escalation.yml@main
+    permissions:
+      actions: write # repo-sync's escalation workflow re-dispatches the restack workflow for stuck sync stacks
+      contents: read # it clones the repo to inspect the stack
+      pull-requests: write # it requests reviewers and disables auto-merge on the stuck sync PRs
     with:
       repo_sync_ref: main
       app_id: ${{ vars.REPO_SYNC_APP_ID }}

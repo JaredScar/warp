@@ -1,35 +1,28 @@
-use crate::index::{
-    THREADPOOL, {DirectoryEntry, Entry, FileMetadata},
-};
-use anyhow::anyhow;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 
+use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use repo_metadata::entry::is_file_parsable;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use string_offset::ByteOffset;
+use warp_errors::report_error;
 use warp_util::standardized_path::StandardizedPath;
 
-use std::{
-    collections::{HashMap, HashSet},
-    ops::Range,
-    path::{Path, PathBuf},
+use super::hash::MerkleHash;
+use super::serialized_tree::{SerializedFilesystemInfo, SerializedMerkleNode};
+use super::tree::UpdateFileResult;
+use super::{ContentHash, DirEntryOrFragment, NodeHash};
+use crate::index::full_source_code_embedding::Error;
+use crate::index::full_source_code_embedding::chunker::chunk_code;
+use crate::index::full_source_code_embedding::fragment_metadata::{
+    FragmentMetadata, LeafToFragmentMetadataUpdates,
 };
-use string_offset::ByteOffset;
-
-use crate::index::full_source_code_embedding::{
-    chunker::chunk_code,
-    fragment_metadata::{FragmentMetadata, LeafToFragmentMetadataUpdates},
-    Error,
-};
-
-use super::{
-    hash::MerkleHash,
-    serialized_tree::{SerializedFilesystemInfo, SerializedMerkleNode},
-    tree::UpdateFileResult,
-    ContentHash, DirEntryOrFragment, NodeHash,
-};
+use crate::index::{DirectoryEntry, Entry, FileMetadata, THREADPOOL};
 
 /// ID that uniquely identifies a node in the merkle tree. It contains the node type
 /// as well as metadata that distinguishes nodes of the same type.
@@ -277,7 +270,7 @@ impl MerkleNode {
                 self.hash = MerkleHash::from_hashes(self.children.iter().map(|child| &child.hash));
             }
             NodeId::Fragment { .. } => {
-                log::error!("Shouldn't need to recompute hash for fragments");
+                report_error!("Shouldn't need to recompute hash for fragments");
             }
         }
     }
@@ -350,7 +343,7 @@ impl MerkleNode {
                 }
 
                 if !updated_idx.is_empty() {
-                    log::error!("Updated index should be empty after an upsert request!");
+                    report_error!("Updated index should be empty after an upsert request!");
                 }
 
                 // Otherwise, update the cache.
@@ -495,17 +488,17 @@ impl MerkleNode {
                 dir_paths.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
 
                 for dir_path in dir_paths {
-                    if let Some(parent_path) = dir_path.parent() {
-                        if let Some(child_dir) = created_dirs.remove(&dir_path) {
-                            // Skip if parent is the root directory
-                            if parent_path != absolute_path {
-                                if let Some(parent_dir) = created_dirs.get_mut(parent_path) {
-                                    // Now we have the completed child directory with all its children
-                                    parent_dir.children.push(Entry::Directory(child_dir));
-                                }
-                            } else {
-                                entries_to_create.push(Entry::Directory(child_dir));
+                    if let Some(parent_path) = dir_path.parent()
+                        && let Some(child_dir) = created_dirs.remove(&dir_path)
+                    {
+                        // Skip if parent is the root directory
+                        if parent_path != absolute_path {
+                            if let Some(parent_dir) = created_dirs.get_mut(parent_path) {
+                                // Now we have the completed child directory with all its children
+                                parent_dir.children.push(Entry::Directory(child_dir));
                             }
+                        } else {
+                            entries_to_create.push(Entry::Directory(child_dir));
                         }
                     }
                 }
@@ -545,7 +538,7 @@ impl MerkleNode {
                 }
 
                 if !updated_idx.is_empty() {
-                    log::error!("Updated index should be empty after an upsert request!");
+                    report_error!("Updated index should be empty after an upsert request!");
                 }
                 self.recompute_hash();
                 UpdateFileResult::Updated
@@ -707,5 +700,5 @@ impl NodeMask {
 }
 
 #[cfg(test)]
-#[path = "node_test.rs"]
+#[path = "node_tests.rs"]
 mod tests;

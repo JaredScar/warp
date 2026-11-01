@@ -2,33 +2,32 @@ use std::rc::Rc;
 
 use strum::IntoEnumIterator;
 use strum_macros::{EnumIter, IntoStaticStr};
-use warp_core::{features::FeatureFlag, ui::appearance::Appearance};
+use warp_core::features::FeatureFlag;
+use warp_core::ui::appearance::Appearance;
 use warp_editor::editor::NavigationKey;
+use warpui::elements::{
+    Border, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container, CornerRadius,
+    CrossAxisAlignment, Empty, Fill, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle,
+    ParentElement, Radius, ScrollbarWidth, Shrinkable,
+};
+use warpui::ui_components::button::ButtonVariant;
+use warpui::ui_components::components::{UiComponent, UiComponentStyles};
+use warpui::ui_components::toggle_menu::{ToggleMenuItem, ToggleMenuStateHandle};
 use warpui::{
-    elements::{
-        Border, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
-        CornerRadius, CrossAxisAlignment, Empty, Fill, Flex, MainAxisAlignment, MainAxisSize,
-        MouseStateHandle, ParentElement, Radius, ScrollbarWidth, Shrinkable,
-    },
-    ui_components::{
-        button::ButtonVariant,
-        components::{UiComponent, UiComponentStyles},
-        toggle_menu::{ToggleMenuItem, ToggleMenuStateHandle},
-    },
     AppContext, Element, Entity, FocusContext, SingletonEntity, TypedActionView, View, ViewContext,
     ViewHandle,
 };
 
-use crate::{
-    cloud_object::{model::persistence::CloudModel, Revision},
-    editor::{
-        EditorOptions, EditorView, Event, PropagateAndNoOpNavigationKeys, SingleLineEditorOptions,
-        TextOptions,
-    },
-    server::ids::{ClientId, SyncId},
-    ui_components::{buttons::icon_button, icons::Icon},
-    workflows::workflow_enum::EnumVariants,
+use crate::cloud_object::Revision;
+use crate::cloud_object::model::persistence::CloudModel;
+use crate::editor::{
+    EditorOptions, EditorView, Event, PropagateAndNoOpNavigationKeys, SingleLineEditorOptions,
+    TextOptions,
 };
+use crate::server::ids::{ClientId, SyncId};
+use crate::ui_components::buttons::icon_button;
+use crate::ui_components::icons::Icon;
+use crate::workflows::workflow_enum::EnumVariants;
 
 const CONTAINER_PADDING: f32 = 16.;
 const CORE_WIDTH: f32 = 400.;
@@ -192,6 +191,7 @@ impl EnumCreationDialog {
                         PropagateAndNoOpNavigationKeys::Always,
                     soft_wrap: true,
                     placeholder_soft_wrap: true,
+                    supports_vim_mode: true,
                     ..Default::default()
                 };
 
@@ -295,7 +295,7 @@ impl EnumCreationDialog {
         let cloud_model = CloudModel::as_ref(ctx);
         let workflow_enum_model = cloud_model.get_workflow_enum(&enum_id);
 
-        self.revision_ts = workflow_enum_model.and_then(|model| model.metadata.revision.clone());
+        self.revision_ts = workflow_enum_model.and_then(|model| model.metadata.revision);
 
         let workflow_enum =
             workflow_enum_model.map(|workflow_enum| workflow_enum.model().string_model.clone());
@@ -495,7 +495,7 @@ impl EnumCreationDialog {
                             id,
                             name: self.name_editor.as_ref(ctx).buffer_text(ctx),
                             is_shared: true,
-                            revision_ts: self.revision_ts.clone(),
+                            revision_ts: self.revision_ts,
                             new_data: Some(variants),
                         },
                         false,
@@ -508,7 +508,7 @@ impl EnumCreationDialog {
                     id: SyncId::ClientId(ClientId::default()),
                     name: self.name_editor.as_ref(ctx).buffer_text(ctx),
                     is_shared: true,
-                    revision_ts: self.revision_ts.clone(),
+                    revision_ts: self.revision_ts,
                     new_data: Some(variants),
                 }));
             }

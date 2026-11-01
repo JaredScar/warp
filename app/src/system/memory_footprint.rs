@@ -28,7 +28,7 @@ mod platform {
 
     use mach2::kern_return::KERN_SUCCESS;
     use mach2::task::task_info;
-    use mach2::task_info::{task_vm_info, TASK_VM_INFO};
+    use mach2::task_info::{TASK_VM_INFO, task_vm_info};
     use mach2::traps::mach_task_self;
 
     /// Calls `task_info(TASK_VM_INFO)` and returns the populated struct on
@@ -46,11 +46,7 @@ mod platform {
                 &mut info as *mut _ as *mut i32,
                 &mut count,
             );
-            if kr == KERN_SUCCESS {
-                Some(info)
-            } else {
-                None
-            }
+            if kr == KERN_SUCCESS { Some(info) } else { None }
         }
     }
 
@@ -148,6 +144,37 @@ mod platform {
             );
         }
         serde_json::Value::Object(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FreeBSD
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "freebsd")]
+mod platform {
+    /// FreeBSD has no `/proc/self/status` by default (linprocfs is optional and
+    /// rarely mounted), so we use `getrusage(RUSAGE_SELF)`. `ru_maxrss` is
+    /// reported in kilobytes and represents the maximum resident set size, not
+    /// the current value, but it's the closest portable signal we have without
+    /// pulling in `kvm`/`sysctl(KERN_PROC_PID)` plumbing for one telemetry
+    /// number.
+    pub fn memory_footprint_bytes() -> u64 {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+            return 0;
+        }
+        (usage.ru_maxrss as u64).saturating_mul(1024)
+    }
+
+    pub fn memory_breakdown() -> serde_json::Value {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+            return serde_json::json!({});
+        }
+        serde_json::json!({
+            "ru_maxrss": (usage.ru_maxrss as u64).saturating_mul(1024),
+        })
     }
 }
 

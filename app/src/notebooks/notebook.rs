@@ -1,120 +1,97 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::Context;
 use async_channel::Sender;
 use futures_util::stream::AbortHandle;
 use lazy_static::lazy_static;
 use regex::Regex;
 use settings::Setting as _;
-use std::{sync::Arc, time::Duration};
 use url::Url;
 use warp_core::context_flag::ContextFlag;
-
-#[cfg(target_family = "wasm")]
-use crate::uri::web_intent_parser::open_url_on_desktop;
-
-use warp_editor::{
-    editor::NavigationKey,
-    model::{CoreEditorModel, RichTextEditorModel},
+use warp_editor::editor::NavigationKey;
+use warp_editor::model::{CoreEditorModel, RichTextEditorModel};
+use warp_errors::{report_error, report_if_error};
+use warpui::accessibility::{AccessibilityContent, WarpA11yRole};
+use warpui::r#async::{SpawnedFutureHandle, Timer};
+use warpui::clipboard::ClipboardContent;
+use warpui::elements::{
+    Align, Clipped, ConstrainedBox, Container, CrossAxisAlignment, DispatchEventResult, Empty,
+    EventHandler, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement,
+    SavePosition, Shrinkable, Stack,
 };
+use warpui::keymap::{EditableBinding, FixedBinding};
+use warpui::presenter::ChildView;
+use warpui::ui_components::button::ButtonVariant;
+use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::{
-    accessibility::{AccessibilityContent, WarpA11yRole},
-    clipboard::ClipboardContent,
-    elements::{
-        Align, Clipped, ConstrainedBox, Container, CrossAxisAlignment, DispatchEventResult, Empty,
-        EventHandler, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement,
-        SavePosition, Shrinkable, Stack,
-    },
-    keymap::{EditableBinding, FixedBinding},
-    presenter::ChildView,
-    r#async::{SpawnedFutureHandle, Timer},
-    ui_components::{
-        button::ButtonVariant,
-        components::{UiComponent, UiComponentStyles},
-    },
     AppContext, BlurContext, Element, Entity, FocusContext, ModelAsRef, ModelHandle,
     SingletonEntity, TypedActionView, View, ViewContext, ViewHandle, WindowId,
 };
 
-use crate::{
-    ai::{
-        blocklist::secret_redaction::find_secrets_in_text,
-        document::ai_document_model::AIDocumentId,
-    },
-    appearance::Appearance,
-    cloud_object::{
-        grab_edit_access_modal::{GrabEditAccessModal, GrabEditAccessModalEvent},
-        model::{
-            persistence::{CloudModel, CloudModelEvent, UpdateSource},
-            view::{Editor, EditorState},
-        },
-        CloudObject, CloudObjectEventEntrypoint, ObjectType, Owner, Space,
-    },
-    cmd_or_ctrl_shift,
-    drive::{
-        drive_helpers::has_feature_gated_anonymous_user_reached_notebook_limit,
-        export::ExportManager, items::WarpDriveItemId, sharing::ShareableObject,
-        CloudObjectTypeAndId, OpenWarpDriveObjectSettings,
-    },
-    editor::{
-        EditOrigin, EditorView, Event as EditorEvent, InteractionState,
-        PropagateAndNoOpNavigationKeys, SingleLineEditorOptions, TextColors, TextOptions,
-    },
-    features::FeatureFlag,
-    menu::{MenuItem, MenuItemFields},
-    network::{NetworkStatus, NetworkStatusEvent},
-    notebooks::{
-        editor::{model::NotebooksEditorModel, rich_text_styles},
-        CloudNotebook,
-    },
-    pane_group::{
-        focus_state::{PaneFocusHandle, PaneGroupFocusEvent},
-        pane::view,
-        BackingView, PaneConfiguration, PaneEvent,
-    },
-    report_if_error, safe_info, send_telemetry_from_ctx,
-    server::{
-        cloud_objects::update_manager::{FetchSingleObjectOption, UpdateManager},
-        ids::{ClientId, ServerId, SyncId},
-        telemetry::{
-            CloudObjectTelemetryMetadata, NotebookActionEvent, NotebookTelemetryMetadata,
-            SharingDialogSource, TelemetryCloudObjectType, TelemetryEvent,
-        },
-    },
-    settings::{
-        app_installation_detection::{UserAppInstallDetectionSettings, UserAppInstallStatus},
-        decrease_notebook_font_size, increase_notebook_font_size, FontSettings,
-        FontSettingsChangedEvent, NotebookFontSize,
-    },
-    terminal::safe_mode_settings::get_secret_obfuscation_mode,
-    throttle::throttle,
-    ui_components::icons::{self, Icon},
-    util::bindings::{self, CustomAction},
-    view_components::{DismissibleToast, ToastType},
-    workflows::{WorkflowSource, WorkflowType},
-    workspace::ToastStack,
-    workspaces::user_workspaces::UserWorkspaces,
-};
-
 use self::details_bar::DetailsBar;
-
-use super::{
-    active_notebook_data::{
-        ActiveNotebook, ActiveNotebookData, ActiveNotebookDataEvent, Mode, SavingStatus,
-        TrashStatus,
-    },
-    context_menu::{
-        show_rich_editor_context_menu, show_text_editor_context_menu, ContextMenuAction,
-        ContextMenuState,
-    },
-    editor::{
-        view::{EditorViewEvent, RichTextEditorConfig, RichTextEditorView},
-        NotebookWorkflow,
-    },
-    link::{NotebookLinks, SessionSource},
-    manager::NotebookManager,
-    styles,
-    telemetry::NotebookTelemetryAction,
-    CloudNotebookModel, NotebookId, NotebookLocation,
+use super::active_notebook_data::{
+    ActiveNotebook, ActiveNotebookData, ActiveNotebookDataEvent, Mode, SavingStatus, TrashStatus,
 };
+use super::context_menu::{
+    ContextMenuAction, ContextMenuState, show_rich_editor_context_menu,
+    show_text_editor_context_menu,
+};
+use super::editor::NotebookWorkflow;
+use super::editor::view::{EditorViewEvent, RichTextEditorConfig, RichTextEditorView};
+use super::link::{NotebookLinks, SessionSource};
+use super::manager::NotebookManager;
+use super::telemetry::NotebookTelemetryAction;
+use super::{CloudNotebookModel, NotebookId, NotebookLocation, styles};
+use crate::ai::blocklist::secret_redaction::find_secrets_in_text;
+use crate::ai::document::ai_document_model::AIDocumentId;
+use crate::appearance::Appearance;
+use crate::cloud_object::grab_edit_access_modal::{GrabEditAccessModal, GrabEditAccessModalEvent};
+use crate::cloud_object::model::persistence::{CloudModel, CloudModelEvent, UpdateSource};
+use crate::cloud_object::model::view::{Editor, EditorState};
+use crate::cloud_object::{CloudObject, CloudObjectEventEntrypoint, ObjectType, Owner, Space};
+use crate::drive::drive_helpers::has_feature_gated_anonymous_user_reached_notebook_limit;
+use crate::drive::export::ExportManager;
+use crate::drive::items::WarpDriveItemId;
+use crate::drive::sharing::ShareableObject;
+use crate::drive::{CloudObjectTypeAndId, OpenWarpDriveObjectSettings};
+use crate::editor::{
+    EditOrigin, EditorView, Event as EditorEvent, InteractionState, PropagateAndNoOpNavigationKeys,
+    SingleLineEditorOptions, TextColors, TextOptions,
+};
+use crate::features::FeatureFlag;
+use crate::menu::{MenuItem, MenuItemFields};
+use crate::network::{NetworkStatus, NetworkStatusEvent};
+use crate::notebooks::CloudNotebook;
+use crate::notebooks::editor::model::NotebooksEditorModel;
+use crate::notebooks::editor::rich_text_styles;
+use crate::pane_group::focus_state::{PaneFocusHandle, PaneGroupFocusEvent};
+use crate::pane_group::pane::view;
+use crate::pane_group::{BackingView, PaneConfiguration, PaneEvent};
+use crate::server::cloud_objects::update_manager::{FetchSingleObjectOption, UpdateManager};
+use crate::server::ids::{ClientId, ServerId, SyncId};
+use crate::server::telemetry::{
+    CloudObjectTelemetryMetadata, NotebookActionEvent, NotebookTelemetryMetadata,
+    SharingDialogSource, TelemetryCloudObjectType, TelemetryEvent,
+};
+use crate::settings::app_installation_detection::{
+    UserAppInstallDetectionSettings, UserAppInstallStatus,
+};
+use crate::settings::{
+    FontSettings, FontSettingsChangedEvent, NotebookFontSize, decrease_notebook_font_size,
+    increase_notebook_font_size,
+};
+use crate::terminal::safe_mode_settings::get_secret_obfuscation_mode;
+use crate::throttle::throttle;
+use crate::ui_components::icons::{self, Icon};
+#[cfg(target_family = "wasm")]
+use crate::uri::web_intent_parser::open_url_on_desktop;
+use crate::util::bindings::{self, CustomAction};
+use crate::view_components::{DismissibleToast, ToastType};
+use crate::workflows::{WorkflowSource, WorkflowType};
+use crate::workspace::ToastStack;
+use crate::workspaces::user_workspaces::UserWorkspaces;
+use crate::{cmd_or_ctrl_shift, safe_info, send_telemetry_from_ctx};
 
 mod details_bar;
 
@@ -126,8 +103,7 @@ const EDIT_BUTTON_MARGIN: f32 = 6.;
 const HEADER_MARGIN: f32 = 15.;
 const BANNER_VERTICAL_MARGIN: f32 = 10.;
 
-const CONFLICT_RESOLUTION_MESSAGE: &str =
-    "This notebook could not be saved because changes were made while you were editing. Please copy your work and refresh.";
+const CONFLICT_RESOLUTION_MESSAGE: &str = "This notebook could not be saved because changes were made while you were editing. Please copy your work and refresh.";
 const REFRESH_BUTTON_TEXT: &str = "Refresh";
 
 const FEATURE_NOT_AVAILABLE_MESSAGE: &str = "This notebook could not be saved to the server because the feature is temporarily unavailable. The changes are saved locally. Please retry later.";
@@ -784,11 +760,11 @@ impl NotebookView {
                 }
             }
             CloudModelEvent::ObjectMoved { type_and_id, .. } => {
-                if self.as_active_notebook_id(type_and_id, ctx).is_some() {
-                    if let Some(space) = self.active_notebook_data.as_ref(ctx).space(ctx) {
-                        self.input
-                            .update(ctx, |editor, ctx| editor.set_space(space, ctx));
-                    }
+                if self.as_active_notebook_id(type_and_id, ctx).is_some()
+                    && let Some(space) = self.active_notebook_data.as_ref(ctx).space(ctx)
+                {
+                    self.input
+                        .update(ctx, |editor, ctx| editor.set_space(space, ctx));
                 }
             }
             CloudModelEvent::ObjectCreated { type_and_id, .. } => {
@@ -869,7 +845,9 @@ impl NotebookView {
                     });
                 }
             }
-            ActiveNotebook::None => log::error!("Tried to save notebook, but none were active"),
+            ActiveNotebook::None => {
+                report_error!("Tried to save notebook, but none were active")
+            }
         }
     }
 
@@ -949,10 +927,11 @@ impl NotebookView {
     /// Enqueue a save of the notebook's content.
     fn enqueue_content_update(&mut self, ctx: &mut ViewContext<Self>) {
         self.content_is_dirty = true;
-        report_if_error!(self
-            .save_tx
-            .try_send(NotebookUpdateRequestDebounceArg {})
-            .context("Error enqueing content save"));
+        report_if_error!(
+            self.save_tx
+                .try_send(NotebookUpdateRequestDebounceArg {})
+                .context("Error enqueuing content save")
+        );
         self.active_notebook_data.update(ctx, |data, ctx| {
             // Mark the notebook as saving as soon as there are changes to be saved. It won't be
             // marked as Saved until we get a response from the server.
@@ -965,10 +944,11 @@ impl NotebookView {
     /// Enqueue a save of the notebook's title.
     fn enqueue_title_update(&mut self) {
         self.title_is_dirty = true;
-        report_if_error!(self
-            .save_tx
-            .try_send(NotebookUpdateRequestDebounceArg {})
-            .context("Error enqueing title save"));
+        report_if_error!(
+            self.save_tx
+                .try_send(NotebookUpdateRequestDebounceArg {})
+                .context("Error enqueuing title save")
+        );
     }
 
     fn handle_input_editor_event(&mut self, event: &EditorViewEvent, ctx: &mut ViewContext<Self>) {
@@ -1207,9 +1187,11 @@ impl NotebookView {
 
     fn apply_font_size_to_setting(&mut self, new_font_size: f32, ctx: &mut ViewContext<Self>) {
         FontSettings::handle(ctx).update(ctx, |font_settings, ctx| {
-            report_if_error!(font_settings
-                .notebook_font_size
-                .set_value(new_font_size, ctx))
+            report_if_error!(
+                font_settings
+                    .notebook_font_size
+                    .set_value(new_font_size, ctx)
+            )
         });
     }
 
@@ -1449,17 +1431,15 @@ impl NotebookView {
                 .user_app_installation_detected
                 .value()
                 == UserAppInstallStatus::Detected
+            && let Some(link) = self.notebook_link(ctx)
+            && let Ok(url) = Url::parse(&link)
         {
-            if let Some(link) = self.notebook_link(ctx) {
-                if let Ok(url) = Url::parse(&link) {
-                    menu_items.push(
-                        MenuItemFields::new("Open on Desktop")
-                            .with_on_select_action(NotebookAction::OpenLinkOnDesktop(url))
-                            .with_icon(icons::Icon::Laptop)
-                            .into_item(),
-                    );
-                }
-            }
+            menu_items.push(
+                MenuItemFields::new("Open on Desktop")
+                    .with_on_select_action(NotebookAction::OpenLinkOnDesktop(url))
+                    .with_icon(icons::Icon::Laptop)
+                    .into_item(),
+            );
         }
 
         // Add "Duplicate" to menu
@@ -1796,7 +1776,9 @@ impl NotebookView {
                     });
                 }
             }
-            ActiveNotebook::None => log::error!("Tried to save notebook, but none were active"),
+            ActiveNotebook::None => {
+                report_error!("Tried to save notebook, but none were active")
+            }
         }
     }
 
@@ -1880,7 +1862,7 @@ impl NotebookView {
         let saved_position = self.view_position_id.clone();
 
         EventHandler::new(styles::wrap_body(ChildView::new(&self.input).finish()))
-            .on_right_mouse_down(move |ctx, _, position| {
+            .on_right_mouse_down(move |ctx, _, position, _| {
                 show_rich_editor_context_menu::<NotebookAction>(
                     ctx,
                     position,
@@ -1897,7 +1879,7 @@ impl NotebookView {
         let saved_position = self.view_position_id.clone();
         let appearance = Appearance::as_ref(app);
         let title = EventHandler::new(Clipped::new(ChildView::new(&self.title).finish()).finish())
-            .on_right_mouse_down(move |ctx, _, position| {
+            .on_right_mouse_down(move |ctx, _, position, _| {
                 show_text_editor_context_menu::<NotebookAction>(
                     ctx,
                     position,

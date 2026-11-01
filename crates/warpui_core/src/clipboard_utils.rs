@@ -1,10 +1,9 @@
-#[allow(unused_imports)]
-use crate::clipboard::{Clipboard, ClipboardContent};
-
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+use itertools::Itertools;
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 use {arboard, image::ImageEncoder};
 
-use itertools::Itertools;
+#[allow(unused_imports)]
+use crate::clipboard::{Clipboard, ClipboardContent};
 
 /// Supported image file extensions for clipboard operations.
 pub const IMAGE_EXTENSIONS: &[&str] = &[".png", ".jpg", ".jpeg", ".gif", ".webp"];
@@ -19,7 +18,7 @@ pub const CLIPBOARD_IMAGE_MIME_TYPES: &[&str] = &[
 ];
 
 /// Minimum bytes needed for image format detection.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 const MIN_IMAGE_HEADER_SIZE: usize = 8;
 
 /// Check if a string has an image file extension.
@@ -113,17 +112,19 @@ fn extract_filename_from_html_tags(html: &str) -> Option<String> {
     }
 
     // 2. Check title attribute
-    if let Some(title_content) = extract_quoted_value(html, "title=\"") {
-        if title_content.contains('.') && has_image_extension(&title_content) {
-            return Some(title_content);
-        }
+    if let Some(title_content) = extract_quoted_value(html, "title=\"")
+        && title_content.contains('.')
+        && has_image_extension(&title_content)
+    {
+        return Some(title_content);
     }
 
     // 3. Check alt attribute
-    if let Some(alt_content) = extract_quoted_value(html, "alt=\"") {
-        if alt_content.contains('.') && has_image_extension(&alt_content) {
-            return Some(alt_content);
-        }
+    if let Some(alt_content) = extract_quoted_value(html, "alt=\"")
+        && alt_content.contains('.')
+        && has_image_extension(&alt_content)
+    {
+        return Some(alt_content);
     }
 
     // 4. Look for any filename-like strings with image extensions in the entire HTML
@@ -270,7 +271,7 @@ pub fn strip_html_to_plain_text(html: &str) -> String {
 }
 
 /// Process clipboard image data, preserving original format or converting to PNG.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 pub fn process_clipboard_image(
     arboard_image: &arboard::ImageData,
     filename: Option<String>,
@@ -295,7 +296,7 @@ pub fn process_clipboard_image(
 }
 
 /// Read image data from clipboard, checking for images before expensive filename extraction.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 pub fn read_images_from_clipboard(
     clipboard: &mut arboard::Clipboard,
     html_content: &Option<String>,
@@ -312,7 +313,9 @@ pub fn read_images_from_clipboard(
             match process_clipboard_image(&arboard_image, filename) {
                 Some(image_data) => Some(vec![image_data]),
                 None => {
-                    log::warn!("Failed to process clipboard image: format detection and conversion both failed");
+                    log::warn!(
+                        "Failed to process clipboard image: format detection and conversion both failed"
+                    );
                     None
                 }
             }
@@ -326,7 +329,7 @@ pub fn read_images_from_clipboard(
 }
 
 /// Try to preserve original image format using infer crate for detection.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 pub fn try_preserve_original_format(
     bytes: &[u8],
     filename: Option<String>,
@@ -353,7 +356,7 @@ pub fn try_preserve_original_format(
 }
 
 /// Converts RGBA bitmap data to PNG format, returns None on invalid dimensions/encoding.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 pub fn convert_raw_bitmap_to_png(
     width: usize,
     height: usize,

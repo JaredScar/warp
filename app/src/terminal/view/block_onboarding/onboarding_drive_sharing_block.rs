@@ -1,26 +1,19 @@
 use pathfinder_geometry::vector::vec2f;
 use warp_core::ui::appearance::Appearance;
-use warpui::{
-    elements::{
-        Border, Container, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement,
-        Text,
-    },
-    fonts::{Properties, Weight},
-    platform::Cursor,
-    ui_components::{
-        button::{ButtonVariant, TextAndIcon, TextAndIconAlignment},
-        components::{UiComponent, UiComponentStyles},
-    },
-    AppContext, Element, Entity, SingletonEntity, View, ViewContext,
+use warpui::elements::{
+    Border, Container, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Text,
 };
+use warpui::fonts::{Properties, Weight};
+use warpui::platform::Cursor;
+use warpui::ui_components::button::{ButtonVariant, TextAndIcon, TextAndIconAlignment};
+use warpui::ui_components::components::{UiComponent, UiComponentStyles};
+use warpui::{AppContext, Element, Entity, SingletonEntity, View, ViewContext};
 
-use crate::{
-    cloud_object::model::persistence::{CloudModel, CloudModelEvent},
-    drive::CloudObjectTypeAndId,
-    terminal::view::telemetry::SharingDialogSource,
-    ui_components::icons::Icon,
-    workspace::WorkspaceAction,
-};
+use crate::cloud_object::model::persistence::{CloudModel, CloudModelEvent};
+use crate::drive::CloudObjectTypeAndId;
+use crate::terminal::view::telemetry::SharingDialogSource;
+use crate::ui_components::icons::Icon;
+use crate::workspace::WorkspaceAction;
 
 /// A rich onboarding block that prompts the user to share a newly-created personal Warp Drive
 /// object.
@@ -33,10 +26,10 @@ impl OnboardingDriveSharingBlock {
     pub fn new(object_id: CloudObjectTypeAndId, ctx: &mut ViewContext<Self>) -> Self {
         // Re-render if the object in the block is renamed.
         ctx.subscribe_to_model(&CloudModel::handle(ctx), |me, _, event, ctx| {
-            if let CloudModelEvent::ObjectUpdated { type_and_id, .. } = event {
-                if &me.object_id == type_and_id {
-                    ctx.notify();
-                }
+            if let CloudModelEvent::ObjectUpdated { type_and_id, .. } = event
+                && &me.object_id == type_and_id
+            {
+                ctx.notify();
             }
         });
 

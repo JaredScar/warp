@@ -7,13 +7,15 @@ cfg_if::cfg_if! {
     }
 }
 
-use crate::index::{Entry, FileId};
-use ignore::gitignore::Gitignore;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use ignore::gitignore::Gitignore;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+
+use crate::index::{Entry, FileId};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileSymbols {
@@ -31,7 +33,7 @@ pub struct Outline {
     file_id_to_outline: HashMap<FileId, FileOutline>,
 
     /// List of gitignore patterns.
-    gitignores: Vec<Gitignore>,
+    gitignores: Vec<Arc<Gitignore>>,
 }
 
 impl Outline {
@@ -43,7 +45,7 @@ impl Outline {
         let mut queue = VecDeque::from([&self.root]);
         let mut repo_map = Vec::new();
 
-        // Iteratively print the files while perserving their traversal order.
+        // Iteratively print the files while preserving their traversal order.
         while let Some(entry) = queue.pop_front() {
             match entry {
                 Entry::Directory(directory) => {
@@ -91,7 +93,7 @@ impl Outline {
         let mut queue = VecDeque::from([&self.root]);
         let mut file_to_symbols = HashMap::new();
 
-        // Iteratively print the files while perserving their traversal order.
+        // Iteratively print the files while preserving their traversal order.
         while let Some(entry) = queue.pop_front() {
             match entry {
                 Entry::Directory(directory) => {
@@ -126,7 +128,7 @@ impl Outline {
         self.file_id_to_outline.len()
     }
 
-    pub fn gitignores(&self) -> Vec<Gitignore> {
+    pub fn gitignores(&self) -> Vec<Arc<Gitignore>> {
         self.gitignores.clone()
     }
 }

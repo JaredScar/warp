@@ -3,7 +3,7 @@ use std::path::Path;
 use arborium::tree_sitter::{Language, Node, Parser, TreeCursor};
 use itertools::Itertools;
 
-use super::{coalesce_fragments, Fragment};
+use super::{Fragment, coalesce_fragments};
 
 /// Maximum depth for recursive tree traversal to prevent infinite recursion
 /// or excessive depth in malformed/deeply nested code.
@@ -48,7 +48,11 @@ pub(super) fn chunk_code<'a>(
     // of the allocator).
     //
     // See: https://github.com/tree-sitter/tree-sitter/issues/3129
-    #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "jemalloc")))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "freebsd"),
+        target_env = "gnu",
+        not(feature = "jemalloc")
+    ))]
     unsafe {
         nix::libc::malloc_trim(0);
     }

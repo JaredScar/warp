@@ -5,19 +5,23 @@ mod fragment_metadata;
 pub mod manager;
 mod merkle_tree;
 mod priority_queue;
+pub mod search_shaping;
 mod snapshot;
 pub mod store_client;
 mod sync_client;
 
-use std::{ops::Range, path::PathBuf, time::Duration};
-pub use sync_client::SyncTask;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub use codebase_index::{CodebaseIndex, RetrievalID, SyncProgress};
+pub use fragment_metadata::{FragmentLocation as FragmentMetadataLocation, FragmentMetadata};
 pub use merkle_tree::{ContentHash, NodeHash};
-
-use fragment_metadata::FragmentMetadata;
+pub use snapshot::SnapshotStorage;
 use string_offset::ByteOffset;
+pub use sync_client::SyncTask;
 use thiserror::Error;
+use warp_errors::{AnyhowErrorExt, ErrorExt, register_error};
 use warp_graphql::queries::rerank_fragments::FragmentLocationInput;
 
 #[derive(Error, Debug)]
@@ -54,6 +58,38 @@ pub enum Error {
     SnapshotParsingFailed,
 }
 
+impl ErrorExt for Error {
+    fn is_actionable(&self) -> bool {
+        match self {
+            Self::Io(_)
+            | Self::NotAGitRepository
+            | Self::BuildTreeError(_)
+            | Self::UnsupportedPlatform
+            | Self::FailedToGetMetadata(_)
+            | Self::FileSizeExceeded
+            | Self::FileSystemStateChanged
+            | Self::DiffMerkleTreeError(
+                DiffMerkleTreeError::Ignored
+                | DiffMerkleTreeError::Symlink
+                | DiffMerkleTreeError::MaxDepthExceeded
+                | DiffMerkleTreeError::ExceededMaxFileLimit,
+            ) => false,
+            Self::InvalidHash(_)
+            | Self::EmptyNodeContent
+            | Self::InconsistentState(_)
+            | Self::FailedToGenerateEmbeddings(_)
+            | Self::FailedToSyncIntermediateNodes(_)
+            | Self::DiffMerkleTreeError(
+                DiffMerkleTreeError::CurrentNodeMismatch(_) | DiffMerkleTreeError::Fragment(_),
+            )
+            | Self::SnapshotParsingFailed => true,
+            Self::Other(error) => error.is_actionable(),
+        }
+    }
+}
+
+register_error!(Error);
+
 // Based off of BuildTreeError in entry.rs
 #[derive(Debug, Error)]
 pub enum DiffMerkleTreeError {
@@ -87,6 +123,7 @@ pub enum EmbeddingConfig {
     Voyage3_5_Lite_512,
     #[default]
     Voyage3_5_512,
+    Voyage4_512,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +152,9 @@ impl From<EmbeddingConfig> for warp_graphql::full_source_code_embedding::Embeddi
             EmbeddingConfig::Voyage3_5_Lite_512 => {
                 warp_graphql::full_source_code_embedding::EmbeddingConfig::Voyage35Lite512
             }
+            EmbeddingConfig::Voyage4_512 => {
+                warp_graphql::full_source_code_embedding::EmbeddingConfig::Voyage4512
+            }
         }
     }
 }
@@ -138,6 +178,9 @@ impl TryFrom<warp_graphql::full_source_code_embedding::EmbeddingConfig> for Embe
             warp_graphql::full_source_code_embedding::EmbeddingConfig::Voyage35512 => {
                 Ok(Self::Voyage3_5_512)
             }
+            warp_graphql::full_source_code_embedding::EmbeddingConfig::Voyage4512 => {
+                Ok(Self::Voyage4_512)
+            }
         }
     }
 }
@@ -159,6 +202,36 @@ pub struct Fragment {
     content: String,
     content_hash: ContentHash,
     location: FragmentLocation,
+}
+
+impl Fragment {
+    pub fn from_byte_range(
+        content: String,
+        content_hash: ContentHash,
+        absolute_path: PathBuf,
+        byte_range: Range<ByteOffset>,
+    ) -> Self {
+        Self {
+            content,
+            content_hash,
+            location: FragmentLocation {
+                absolute_path,
+                byte_range,
+            },
+        }
+    }
+
+    pub fn content_hash(&self) -> &ContentHash {
+        &self.content_hash
+    }
+
+    pub fn absolute_path(&self) -> &Path {
+        &self.location.absolute_path
+    }
+
+    pub fn byte_range(&self) -> Range<ByteOffset> {
+        self.location.byte_range.clone()
+    }
 }
 
 impl From<Fragment> for warp_graphql::full_source_code_embedding::Fragment {

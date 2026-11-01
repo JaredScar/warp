@@ -1,18 +1,12 @@
 use itertools::Itertools;
 use sum_tree::SumTree;
-
-use warpui::{
-    SizeConstraint,
-    geometry::vector::vec2f,
-    units::{IntoPixels, Pixels},
-};
-
-use crate::render::model::{
-    RenderState,
-    test_utils::{TEST_STYLES, mock_paragraph},
-};
+use warpui_core::SizeConstraint;
+use warpui_core::geometry::vector::vec2f;
+use warpui_core::units::{IntoPixels, Pixels};
 
 use super::ViewportState;
+use crate::render::model::RenderState;
+use crate::render::model::test_utils::{TEST_STYLES, mock_paragraph};
 
 #[test]
 fn test_viewport_offsets() {
@@ -26,7 +20,7 @@ fn test_viewport_offsets() {
     content.push(mock_paragraph(80., 100., 1));
     render_state.set_content(content);
 
-    // Double-check the heights with margins+padding, as later tests rely on them.
+    // Double-check the heights, as later tests rely on them.
     let heights = render_state
         .content
         .borrow()
@@ -34,7 +28,7 @@ fn test_viewport_offsets() {
         .iter()
         .map(|item| item.height().as_f32())
         .collect_vec();
-    assert_eq!(heights, vec![32., 68., 108., 38., 88., 32.]);
+    assert_eq!(heights, vec![24., 60., 100., 30., 80., 24.]);
 
     let content = render_state.content();
     let offsets = content
@@ -53,12 +47,14 @@ fn test_viewport_offsets() {
         vec![
             // The first item is fully above the viewport.
             // The second item is slightly above the viewport.
-            (-8., 1),
+            (-16., 1),
             // The third is fully within the viewport
-            (60., 2),
+            (44., 2),
             // The fourth is slightly past the viewport, and cut off.
-            (168., 4)
-        ] // The fifth item is fully after the viewport.
+            (144., 4),
+            // The fifth is slightly past the viewport, and cut off.
+            (174., 7)
+        ]
     );
 }
 
@@ -115,6 +111,36 @@ fn test_viewport_item_to_block() {
             .block_at_offset(viewport_items[1].block_offset())
             .is_none()
     );
+}
+
+#[test]
+fn test_scroll_fraction() {
+    // Viewport 100px tall over 300px of content => 200px of scrollable range.
+    let mut viewport = ViewportState::new(100.0.into_pixels(), 100.0.into_pixels());
+    let content_height = 300.0.into_pixels();
+
+    assert_eq!(viewport.scroll_fraction(content_height), 0.0);
+
+    viewport.set_scroll_top(100.0.into_pixels());
+    assert_eq!(viewport.scroll_fraction(content_height), 0.5);
+
+    // Fraction -> scroll_top maps onto the scrollable range.
+    viewport.scroll_to_fraction(0.25, content_height);
+    assert_eq!(viewport.scroll_top().as_f32(), 50.0);
+
+    // Out-of-range fractions are clamped to the ends.
+    viewport.scroll_to_fraction(2.0, content_height);
+    assert_eq!(viewport.scroll_top().as_f32(), 200.0);
+    assert_eq!(viewport.scroll_fraction(content_height), 1.0);
+
+    viewport.scroll_to_fraction(-1.0, content_height);
+    assert_eq!(viewport.scroll_top().as_f32(), 0.0);
+
+    // When content fits within the viewport there is no scrollable range.
+    let short_content = 80.0.into_pixels();
+    assert_eq!(viewport.scroll_fraction(short_content), 0.0);
+    viewport.scroll_to_fraction(1.0, short_content);
+    assert_eq!(viewport.scroll_top().as_f32(), 0.0);
 }
 
 #[test]

@@ -1,10 +1,8 @@
-use crate::{
-    ai::RequestLimitInfo,
-    billing::{BonusGrant, BonusGrantsInfo},
-    error::UserFacingError,
-    request_context::RequestContext,
-    schema,
-};
+use crate::ai::RequestLimitInfo;
+use crate::billing::{BonusGrant, BonusGrantsInfo};
+use crate::error::UserFacingError;
+use crate::request_context::RequestContext;
+use crate::schema;
 
 /*
 query GetRequestLimitInfo($requestContext: RequestContext!) {
@@ -19,6 +17,7 @@ query GetRequestLimitInfo($requestContext: RequestContext!) {
               costCents
               expiration
               grantType
+              scope
               reason
               userFacingMessage
               requestCreditsGranted
@@ -43,6 +42,7 @@ query GetRequestLimitInfo($requestContext: RequestContext!) {
           costCents
           expiration
           grantType
+          scope
           reason
           userFacingMessage
           requestCreditsGranted

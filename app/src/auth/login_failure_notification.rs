@@ -1,17 +1,14 @@
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
-use warpui::{
-    elements::{
-        Border, ConstrainedBox, Container, CrossAxisAlignment, Flex, FormattedTextElement,
-        HighlightedHyperlink, Icon, MouseStateHandle, ParentElement, Shrinkable,
-    },
-    ui_components::components::UiComponent,
-    Action, AppContext, Element, SingletonEntity,
+use warpui::elements::{
+    Border, ConstrainedBox, Container, CrossAxisAlignment, Flex, FormattedTextElement,
+    HighlightedHyperlink, Icon, MouseStateHandle, ParentElement, Shrinkable,
 };
+use warpui::ui_components::components::UiComponent;
+use warpui::{Action, AppContext, Element, SingletonEntity};
 
 use crate::appearance::Appearance;
 
-const LOGIN_TROUBLESHOOTING_DOCS_URL: &str =
-    "https://docs.warp.dev/support-and-community/troubleshooting-and-support/troubleshooting-login-issues";
+const LOGIN_TROUBLESHOOTING_DOCS_URL: &str = "https://docs.warp.dev/support-and-community/troubleshooting-and-support/troubleshooting-login-issues";
 
 /// Represents reasons why login failed.
 pub enum LoginFailureReason {
@@ -58,7 +55,8 @@ impl LoginFailureReason {
                     "Request to sign up failed.",
                 )])
             }
-            LoginFailureReason::InvalidStateParameter | LoginFailureReason::MissingStateParameter => {
+            LoginFailureReason::InvalidStateParameter
+            | LoginFailureReason::MissingStateParameter => {
                 with_troubleshooting_text(vec![FormattedTextFragment::plain_text(
                     "The redirect URL pasted did not originate from this app. Please click the button below to try again.",
                 )])

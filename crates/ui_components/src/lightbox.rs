@@ -1,13 +1,15 @@
 use std::sync::Arc;
 
 use pathfinder_geometry::vector::{Vector2F, vec2f};
-use warp_core::ui::{Icon, appearance::Appearance};
-use warpui::{
-    assets::asset_cache::AssetSource,
-    elements::{CacheOption, Dismiss, DispatchEventResult, EventHandler, Image, Shrinkable},
-    keymap::Keystroke,
-    prelude::{stack::*, *},
+use warp_core::ui::Icon;
+use warp_core::ui::appearance::Appearance;
+use warpui_core::assets::asset_cache::AssetSource;
+use warpui_core::elements::{
+    CacheOption, Dismiss, DispatchEventResult, EventHandler, Image, Shrinkable,
 };
+use warpui_core::keymap::Keystroke;
+use warpui_core::prelude::stack::*;
+use warpui_core::prelude::*;
 
 use crate::{Component, Options as _, button};
 
@@ -31,6 +33,20 @@ pub enum LightboxImageSource {
     /// The image source has been resolved.
     /// Note: the actual image bytes may still be loading via the `AssetCache`.
     Resolved { asset_source: AssetSource },
+}
+
+/// The load state of the currently displayed image's bytes.
+#[derive(Clone, Copy, Debug)]
+pub enum CurrentImageState {
+    /// The image bytes are still being fetched or decoded.
+    Loading,
+    /// The image is fully loaded and decoded.
+    Loaded {
+        /// The native pixel dimensions of the image.
+        native_size: Vector2F,
+    },
+    /// The image bytes failed to load or decode.
+    Failed,
 }
 
 /// A single image entry in the lightbox.
@@ -74,11 +90,10 @@ pub struct Params<'a> {
     /// Handler to invoke when the lightbox is dismissed.
     pub on_dismiss: DismissHandler,
 
-    /// The native pixel dimensions of the currently displayed image, if known.
-    /// When `Some`, the image is fully loaded and the lightbox renders it with a
-    /// `ConstrainedBox` plus description. When `None`, the lightbox shows a loading
-    /// indicator instead.
-    pub current_image_native_size: Option<Vector2F>,
+    /// The load state of the currently displayed image. When `Loaded`, the
+    /// lightbox renders the image with a `ConstrainedBox` plus description;
+    /// otherwise it shows a loading indicator or an error message.
+    pub current_image_state: CurrentImageState,
 
     /// Optional configuration for the lightbox.
     pub options: Options,
@@ -130,7 +145,7 @@ impl Component for Lightbox {
             appearance,
             button::Params {
                 content: button::Content::Icon(Icon::X),
-                theme: &button::themes::Secondary,
+                theme: &ButtonTheme,
                 options: button::Options {
                     size: button::Size::Small,
                     on_click: Some(Box::new(move |ctx, app, _| {
@@ -142,53 +157,64 @@ impl Component for Lightbox {
             },
         );
 
-        // Build the central content based on the image source and whether the
-        // native size is known (i.e. the image data has been loaded).
-        let central_content: Box<dyn Element> =
-            match (current_source, params.current_image_native_size) {
-                // Image source resolved AND native size known → render the image.
-                (Some(LightboxImageSource::Resolved { asset_source }), Some(native_size)) => {
-                    let image = ConstrainedBox::new(
-                        Image::new(asset_source.clone(), CacheOption::Original)
-                            .contain()
-                            .before_load(Align::new(loading_element(appearance)).finish())
-                            .finish(),
-                    )
-                    .with_max_width(native_size.x())
-                    .with_max_height(native_size.y())
-                    .finish();
-
-                    EventHandler::new(image)
-                        .on_left_mouse_down(|_, _, _| DispatchEventResult::StopPropagation)
-                        .finish()
-                }
-                // No images provided at all.
-                _ if image_count == 0 => {
-                    Text::new("No images", appearance.ui_font_family(), text_size)
-                        .with_color(ColorU::white())
-                        .finish()
-                }
-                // Still loading (either metadata or image bytes).
-                _ => loading_element(appearance),
-            };
-
-        // Show the description only when the image is fully loaded (native size known).
-        let content_with_description = if let (Some(description), Some(_)) =
-            (current_description, params.current_image_native_size)
-        {
-            let description_text = Text::new(description, appearance.ui_font_family(), text_size)
-                .with_color(ColorU::white())
+        // Build the central content based on the image source and the load
+        // state of the current image's bytes.
+        let central_content: Box<dyn Element> = match (current_source, params.current_image_state) {
+            // Image source resolved AND bytes loaded → render the image.
+            (
+                Some(LightboxImageSource::Resolved { asset_source }),
+                CurrentImageState::Loaded { native_size },
+            ) => {
+                let image = ConstrainedBox::new(
+                    Image::new(asset_source.clone(), CacheOption::Original)
+                        .contain()
+                        .layout_using_paint_bounds()
+                        .before_load(Align::new(loading_element(appearance)).finish())
+                        .finish(),
+                )
+                .with_max_width(native_size.x())
+                .with_max_height(native_size.y())
                 .finish();
 
-            Flex::column()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(DESCRIPTION_SPACING)
-                .with_child(Shrinkable::new(1.0, central_content).finish())
-                .with_child(description_text)
-                .finish()
-        } else {
-            central_content
+                EventHandler::new(image)
+                    .on_left_mouse_down(|_, _, _| DispatchEventResult::StopPropagation)
+                    .finish()
+            }
+            // No images provided at all.
+            _ if image_count == 0 => Text::new("No images", appearance.ui_font_family(), text_size)
+                .with_color(ColorU::white())
+                .finish(),
+            // The image bytes failed to load or decode.
+            (_, CurrentImageState::Failed) => Text::new(
+                "Failed to load image",
+                appearance.ui_font_family(),
+                text_size,
+            )
+            .with_color(ColorU::white())
+            .finish(),
+            // Still loading (either metadata or image bytes).
+            _ => loading_element(appearance),
         };
+
+        // Show the description only when the image is fully loaded.
+        let content_with_description =
+            if let (Some(description), CurrentImageState::Loaded { .. }) =
+                (current_description, params.current_image_state)
+            {
+                let description_text =
+                    Text::new(description, appearance.ui_font_family(), text_size)
+                        .with_color(ColorU::white())
+                        .finish();
+
+                Flex::column()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(DESCRIPTION_SPACING)
+                    .with_child(Shrinkable::new(1.0, central_content).finish())
+                    .with_child(description_text)
+                    .finish()
+            } else {
+                central_content
+            };
 
         let centered_content = Align::new(content_with_description).finish();
 
@@ -225,7 +251,7 @@ impl Component for Lightbox {
                     appearance,
                     button::Params {
                         content: button::Content::Icon(Icon::ChevronLeft),
-                        theme: &button::themes::Secondary,
+                        theme: &ButtonTheme,
                         options: button::Options {
                             size: button::Size::Small,
                             on_click: Some(Box::new(move |ctx, app, _| {
@@ -253,7 +279,7 @@ impl Component for Lightbox {
                     appearance,
                     button::Params {
                         content: button::Content::Icon(Icon::ChevronRight),
-                        theme: &button::themes::Secondary,
+                        theme: &ButtonTheme,
                         options: button::Options {
                             size: button::Size::Small,
                             on_click: Some(Box::new(move |ctx, app, _| {
@@ -293,4 +319,39 @@ fn loading_element(appearance: &Appearance) -> Box<dyn Element> {
 
 fn lightbox_text_size(appearance: &Appearance) -> f32 {
     appearance.ui_font_size() + LIGHTBOX_TEXT_SIZE_DELTA
+}
+
+/// A custom button theme for lightbox buttons to force colors to match
+/// a Dark theme button, as these buttons always appear on top of a near-black
+/// scrim, independent of application theme.
+struct ButtonTheme;
+
+impl button::Theme for ButtonTheme {
+    fn background(
+        &self,
+        button_state: button::State,
+        _appearance: &Appearance,
+    ) -> Option<warp_core::ui::theme::Fill> {
+        match button_state {
+            button::State::Default => None,
+            button::State::Hovered => Some(warp_core::ui::theme::Fill::white().with_opacity(10)),
+            button::State::Pressed => Some(warp_core::ui::theme::Fill::white().with_opacity(15)),
+        }
+    }
+
+    fn text_color(
+        &self,
+        _background: Option<warp_core::ui::theme::Fill>,
+        _appearance: &Appearance,
+    ) -> ColorU {
+        ColorU::new(255, 255, 255, 255)
+    }
+
+    fn border(&self, _appearance: &Appearance) -> Option<ColorU> {
+        Some(ColorU::new(51, 51, 51, 255))
+    }
+
+    fn keyboard_shortcut_background(&self, _appearance: &Appearance) -> Option<ColorU> {
+        Some(ColorU::new(38, 38, 38, 255))
+    }
 }

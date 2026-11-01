@@ -1,18 +1,17 @@
-use crate::appearance::Appearance;
-use crate::drive::DriveObjectType;
-use crate::ui_components::blended_colors;
-use crate::workspaces::workspace::{BillingMetadata, CustomerType};
 use warpui::elements::{
     Container, CornerRadius, CrossAxisAlignment, Flex, MainAxisSize, MouseStateHandle,
     ParentElement, Radius, Shrinkable, Text,
 };
 use warpui::fonts::Weight;
+use warpui::platform::Cursor;
 use warpui::ui_components::button::ButtonVariant;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
-use warpui::{
-    platform::Cursor, AppContext, Element, Entity, SingletonEntity, TypedActionView, View,
-    ViewContext,
-};
+use warpui::{AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext};
+
+use crate::appearance::Appearance;
+use crate::drive::DriveObjectType;
+use crate::ui_components::blended_colors;
+use crate::workspaces::workspace::{BillingMetadata, CustomerType};
 
 const BUTTON_PADDING: f32 = 12.;
 const BUTTON_FONT_SIZE: f32 = 14.;
@@ -94,23 +93,41 @@ impl View for SharedObjectsCreationDeniedBody {
 
         let sub_header = match self.object_type {
             Some(object_type) => {
-                match (self.is_delinquent_due_to_payment_issue, self.has_admin_permissions, self.customer_type) {
+                match (
+                    self.is_delinquent_due_to_payment_issue,
+                    self.has_admin_permissions,
+                    self.customer_type,
+                ) {
                     (true, true, _) => {
                         if is_stripe_paid_plan {
-                            format!("Shared {object_type}s have been restricted due to a subscription payment issue.\n\nPlease update your payment information to restore access.")
+                            format!(
+                                "Shared {object_type}s have been restricted due to a subscription payment issue.\n\nPlease update your payment information to restore access."
+                            )
                         } else {
-                            format!("Shared {object_type}s have been restricted due to a subscription payment issue.\n\nPlease contact support@warp.dev to restore access.")
+                            format!(
+                                "Shared {object_type}s have been restricted due to a subscription payment issue.\n\nPlease contact support@warp.dev to restore access."
+                            )
                         }
-                    },
-                    (true, false, _) => format!("Shared {object_type}s have been restricted due to a subscription payment issue.\n\nPlease contact a team admin to restore access."),
+                    }
+                    (true, false, _) => format!(
+                        "Shared {object_type}s have been restricted due to a subscription payment issue.\n\nPlease contact a team admin to restore access."
+                    ),
                     (false, true, CustomerType::Prosumer) => {
-                        format!("Warp's Pro plan comes with a limited number of shared {object_type}s.\n\nFor access to unlimited shared {object_type}s, upgrade to the Build plan.")
+                        format!(
+                            "Warp's Pro plan comes with a limited number of shared {object_type}s.\n\nFor access to unlimited shared {object_type}s, upgrade to the Build plan."
+                        )
                     }
                     (false, false, CustomerType::Prosumer) => {
-                        format!("Warp's Pro plan comes with a limited number of shared {object_type}s.\n\nFor access to unlimited shared {object_type}s, contact a team admin to upgrade to the Build plan.")
+                        format!(
+                            "Warp's Pro plan comes with a limited number of shared {object_type}s.\n\nFor access to unlimited shared {object_type}s, contact a team admin to upgrade to the Build plan."
+                        )
                     }
-                    (false, true, _) => format!("Warp's free plan comes with a limited number of shared {object_type}s.\n\nFor access to unlimited shared {object_type}s, upgrade to a paid plan."),
-                    (false, false, _) => format!("Warp's free plan comes with a limited number of shared {object_type}s.\n\nFor access to unlimited shared {object_type}s, contact a team admin to upgrade to a paid plan."),
+                    (false, true, _) => format!(
+                        "Warp's free plan comes with a limited number of shared {object_type}s.\n\nFor access to unlimited shared {object_type}s, upgrade to a paid plan."
+                    ),
+                    (false, false, _) => format!(
+                        "Warp's free plan comes with a limited number of shared {object_type}s.\n\nFor access to unlimited shared {object_type}s, contact a team admin to upgrade to a paid plan."
+                    ),
                 }
             }
             _ => match (

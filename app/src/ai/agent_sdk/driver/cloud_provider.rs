@@ -1,4 +1,7 @@
-use std::{collections::HashMap, ffi::OsString, future::Future, pin::Pin};
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::future::Future;
+use std::pin::Pin;
 
 use anyhow::Error;
 use warpui::ModelSpawner;
@@ -53,7 +56,7 @@ pub(crate) trait CloudProvider: Send {
 /// Build the set of cloud providers from an environment's provider configuration.
 pub(crate) fn load_providers(
     providers: &ProvidersConfig,
-    run_id: &str,
+    run_id: Option<&str>,
 ) -> Result<Vec<Box<dyn CloudProvider>>> {
     let mut result: Vec<Box<dyn CloudProvider>> = Vec::new();
 

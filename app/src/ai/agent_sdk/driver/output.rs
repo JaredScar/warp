@@ -1,25 +1,21 @@
 pub mod text {
-    use std::{
-        collections::HashSet,
-        fmt,
-        io::{self, Write},
-    };
+    use std::collections::HashSet;
+    use std::fmt;
+    use std::io::{self, Write};
 
     const CANCELLED_MESSAGE: &str = "<cancelled>";
 
     use ai::agent::action_result::{FetchConversationResult, ReadSkillResult, UseComputerResult};
     use itertools::Itertools;
 
-    use crate::{
-        ai::agent::{
-            AIAgentActionType, AIAgentInput, AIAgentOutput, AIAgentOutputMessageType, AIAgentTodo,
-            ArtifactCreatedData, CallMCPToolResult, FileGlobResult, FileGlobV2Result, GrepResult,
-            ReadFilesResult, ReadMCPResourceResult, RequestCommandOutputResult,
-            RequestFileEditsResult, SearchCodebaseResult, SuggestNewConversationResult,
-            SuggestPromptResult, TodoOperation, UploadArtifactResult, WebFetchStatus,
-            WebSearchStatus, WriteToLongRunningShellCommandResult,
-        },
-        AIAgentActionResultType,
+    use crate::AIAgentActionResultType;
+    use crate::ai::agent::{
+        AIAgentActionType, AIAgentInput, AIAgentOutput, AIAgentOutputMessageType, AIAgentTodo,
+        ArtifactCreatedData, CallMCPToolResult, FileGlobResult, FileGlobV2Result, GrepResult,
+        ReadFilesResult, ReadMCPResourceResult, RequestCommandOutputResult, RequestFileEditsResult,
+        SearchCodebaseResult, SuggestNewConversationResult, SuggestPromptResult, TodoOperation,
+        UploadArtifactResult, WebFetchStatus, WebSearchStatus,
+        WriteToLongRunningShellCommandResult,
     };
 
     /// Format an agent input as a human-readable string. For action results, it's assumed that
@@ -35,14 +31,15 @@ pub mod text {
             | AIAgentInput::CloneRepository { .. }
             | AIAgentInput::InitProjectRules { .. }
             | AIAgentInput::CodeReview { .. }
-            | AIAgentInput::FetchReviewComments { .. }
             | AIAgentInput::CreateEnvironment { .. }
             | AIAgentInput::SummarizeConversation { .. }
             | AIAgentInput::InvokeSkill { .. }
             | AIAgentInput::StartFromAmbientRunPrompt { .. }
             | AIAgentInput::MessagesReceivedFromAgents { .. }
             | AIAgentInput::PassiveSuggestionResult { .. }
-            | AIAgentInput::EventsFromAgents { .. } => {
+            | AIAgentInput::EventsFromAgents { .. }
+            | AIAgentInput::OrchestrationConfigUpdate { .. }
+            | AIAgentInput::AgentWake => {
                 // Do not include the user query, since it's already provided as input to the agent.
                 Ok(())
             }
@@ -57,12 +54,22 @@ pub mod text {
                         exit_code,
                         ..
                     } => writeln!(w, "{output}\n\n (`{command}` exited with code {exit_code})"),
+                    RequestCommandOutputResult::ShellRecovered {
+                        command,
+                        output,
+                        status,
+                        ..
+                    } => writeln!(
+                        w,
+                        "{output}\n\n (`{command}` terminated the persistent shell: {status})"
+                    ),
                     RequestCommandOutputResult::LongRunningCommandSnapshot { command, .. } => {
                         writeln!(w, "`{command}` is still running...")
                     }
                     RequestCommandOutputResult::CancelledBeforeExecution => {
                         writeln!(w, "{CANCELLED_MESSAGE}")
                     }
+                    RequestCommandOutputResult::TerminalBusy { .. } => writeln!(w, "{result}"),
                     RequestCommandOutputResult::Denylisted { .. } => {
                         writeln!(
                             w,
@@ -190,6 +197,7 @@ pub mod text {
                                     "{uri} ({})",
                                     mime_type.as_deref().unwrap_or("text/plain")
                                 )?,
+                                _ => writeln!(w, "unsupported resource contents")?,
                             }
                         }
                         Ok(())
@@ -204,14 +212,14 @@ pub mod text {
                         CallMCPToolResult::Success { result } => {
                             for content in &result.content {
                                 write!(w, "- ")?;
-                                match &content.raw {
-                                    rmcp::model::RawContent::Text(text_content) => {
+                                match content {
+                                    rmcp::model::ContentBlock::Text(text_content) => {
                                         writeln!(w, "{}", text_content.text)?;
                                     }
-                                    rmcp::model::RawContent::Image(image_content) => {
+                                    rmcp::model::ContentBlock::Image(image_content) => {
                                         writeln!(w, "{} image", image_content.mime_type)?;
                                     }
-                                    rmcp::model::RawContent::Resource(embedded_resource) => {
+                                    rmcp::model::ContentBlock::Resource(embedded_resource) => {
                                         match &embedded_resource.resource {
                                         rmcp::model::ResourceContents::TextResourceContents {
                                             uri,
@@ -228,23 +236,29 @@ pub mod text {
                                         } => {
                                             writeln!(w, "{uri} ({})", mime_type.as_deref().unwrap_or("text/plain"))?;
                                         }
+                                        _ => {
+                                            writeln!(w, "unsupported resource contents")?;
+                                        }
                                     };
                                     }
-                                    rmcp::model::RawContent::Audio(audio_content) => {
+                                    rmcp::model::ContentBlock::Audio(audio_content) => {
                                         writeln!(w, "{} audio", audio_content.mime_type)?;
                                     }
-                                    rmcp::model::RawContent::ResourceLink(raw_resource) => {
-                                        let rmcp::model::RawResource {
+                                    rmcp::model::ContentBlock::ResourceLink(resource) => {
+                                        let rmcp::model::Resource {
                                             uri,
                                             mime_type,
                                             name,
                                             ..
-                                        } = raw_resource;
+                                        } = resource;
                                         writeln!(
                                             w,
                                             "{name}: {uri} ({})",
                                             mime_type.as_deref().unwrap_or("unknown")
                                         )?;
+                                    }
+                                    _ => {
+                                        writeln!(w, "unsupported content block")?;
                                     }
                                 }
                             }
@@ -283,12 +297,14 @@ pub mod text {
                 AIAgentActionResultType::TransferShellCommandControlToUser { .. } => Ok(()),
                 AIAgentActionResultType::UseComputer(result) => match result {
                     // TODO(AGENT-2281): implement
-                    UseComputerResult::Success(_result) => Ok(()),
+                    UseComputerResult::Success { .. } => Ok(()),
                     UseComputerResult::Error(error) => writeln!(w, "Use computer error: {error}"),
                     UseComputerResult::Cancelled => writeln!(w, "{CANCELLED_MESSAGE}"),
                 },
                 // TODO(AGENT-2281): implement
                 AIAgentActionResultType::RequestComputerUse(_result) => Ok(()),
+                AIAgentActionResultType::StartRecording(_)
+                | AIAgentActionResultType::StopRecording(_) => Ok(()),
                 AIAgentActionResultType::FetchConversation(result) => match result {
                     FetchConversationResult::Success { directory_path } => {
                         writeln!(w, "Fetched conversation to {directory_path}")
@@ -298,11 +314,13 @@ pub mod text {
                     }
                     FetchConversationResult::Cancelled => writeln!(w, "{CANCELLED_MESSAGE}"),
                 },
-                // StartAgent is a client-side orchestration action, not used in SDK
-                AIAgentActionResultType::StartAgent(_) => Ok(()),
                 // SendMessageToAgent is a client-side orchestration action, not used in SDK
                 AIAgentActionResultType::SendMessageToAgent(_) => Ok(()),
                 AIAgentActionResultType::AskUserQuestion(_) => Ok(()),
+                // RunAgents is a desktop-client-only action; not used in the SDK.
+                AIAgentActionResultType::RunAgents(_) => Ok(()),
+                // No user-visible payload to emit.
+                AIAgentActionResultType::WaitForEvents(_) => Ok(()),
             },
         }
     }
@@ -408,14 +426,24 @@ pub mod text {
                     AIAgentActionType::RequestComputerUse(request) => {
                         writeln!(w, "Requesting computer use: {}", request.task_summary)?;
                     }
+                    AIAgentActionType::StartRecording { .. } => {
+                        writeln!(w, "Starting recording")?;
+                    }
+                    AIAgentActionType::StopRecording {
+                        recording_id,
+                        should_persist,
+                    } => {
+                        if *should_persist {
+                            writeln!(w, "Stopping recording {recording_id}")?;
+                        } else {
+                            writeln!(w, "Stopping recording {recording_id} and discarding result")?;
+                        }
+                    }
                     AIAgentActionType::ReadSkill(request) => {
                         writeln!(w, "Reading skill: {}", request.skill)?;
                     }
                     AIAgentActionType::FetchConversation { conversation_id } => {
                         writeln!(w, "Fetching conversation {conversation_id}")?;
-                    }
-                    AIAgentActionType::StartAgent { name, .. } => {
-                        writeln!(w, "Starting agent: {name}")?;
                     }
                     AIAgentActionType::SendMessageToAgent {
                         addresses, subject, ..
@@ -427,6 +455,9 @@ pub mod text {
                         )?;
                     }
                     AIAgentActionType::AskUserQuestion { .. } => (),
+                    // RunAgents is desktop-client-only; SDK driver renders nothing.
+                    AIAgentActionType::RunAgents(_) => (),
+                    AIAgentActionType::WaitForEvents { .. } => (),
                 },
                 AIAgentOutputMessageType::TodoOperation(operation) => match operation {
                     TodoOperation::UpdateTodos { todos } => {
@@ -559,26 +590,23 @@ pub mod text {
 }
 
 pub mod json {
-    use crate::{
-        ai::agent::{
-            AIAgentActionType, AIAgentInput, AIAgentOutput, AIAgentOutputMessage,
-            AIAgentOutputMessageType, AIAgentTodo, ArtifactCreatedData, CallMCPToolResult,
-            FileContext, FileGlobResult, FileGlobV2Result, GrepResult, ReadFilesResult,
-            ReadMCPResourceResult, RequestCommandOutputResult, RequestFileEditsResult,
-            SearchCodebaseResult, SubagentCall, TodoOperation, UploadArtifactResult,
-            WriteToLongRunningShellCommandResult,
-        },
-        AIAgentActionResultType,
-    };
+    use std::borrow::Cow;
+    use std::io::{self, Write};
+    use std::ops::Range;
 
-    use crate::ai::agent::comment::ReviewComment;
     use serde::Serialize;
-    use std::path::Path;
-    use std::{
-        borrow::Cow,
-        io::{self, Write},
-        ops::Range,
+
+    use crate::AIAgentActionResultType;
+    use crate::ai::agent::comment::ReviewComment;
+    use crate::ai::agent::{
+        AIAgentActionType, AIAgentInput, AIAgentOutput, AIAgentOutputMessage,
+        AIAgentOutputMessageType, AIAgentTodo, ArtifactCreatedData, CallMCPToolResult, FileContext,
+        FileGlobResult, FileGlobV2Result, GrepResult, ReadFilesFailedFile, ReadFilesResult,
+        ReadMCPResourceResult, RequestCommandOutputResult, RequestFileEditsResult,
+        SearchCodebaseResult, SubagentCall, TodoOperation, UploadArtifactResult,
+        WriteToLongRunningShellCommandResult,
     };
+    use crate::code::buffer_location::LocalOrRemotePath;
 
     /// JSON representation of messages in an agent conversation. This is intentionally not 1:1 with our internal `AIAgent*` types - it's
     /// a stable interface for callers.
@@ -680,7 +708,7 @@ pub mod json {
     enum JsonToolResult<'a> {
         RunCommand(JsonRunCommandResult<'a>),
         EditFiles(JsonEditFilesResult<'a>),
-        ReadFiles(JsonFileCollectionResult<'a>),
+        ReadFiles(JsonReadFilesResult<'a>),
         UploadArtifact(JsonUploadArtifactResult<'a>),
         SearchCodebase(JsonFileCollectionResult<'a>),
         Grep(JsonFileCollectionResult<'a>),
@@ -692,13 +720,39 @@ pub mod json {
     #[derive(Serialize)]
     #[serde(tag = "status", rename_all = "snake_case")]
     enum JsonRunCommandResult<'a> {
-        Complete { exit_code: i32, output: &'a str },
+        Complete {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            exit_code: Option<i32>,
+            output: &'a str,
+        },
         Running,
     }
 
     #[derive(Serialize)]
     struct JsonEditFilesResult<'a> {
         diff: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct JsonReadFilesResult<'a> {
+        files: Vec<JsonFile<'a>>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        failed_files: Vec<JsonFailedFile<'a>>,
+    }
+
+    #[derive(Serialize)]
+    struct JsonFailedFile<'a> {
+        path: &'a str,
+        message: &'a str,
+    }
+
+    impl<'a> From<&'a ReadFilesFailedFile> for JsonFailedFile<'a> {
+        fn from(f: &'a ReadFilesFailedFile) -> Self {
+            Self {
+                path: f.path.as_str(),
+                message: f.message.as_str(),
+            }
+        }
     }
 
     #[derive(Serialize)]
@@ -742,7 +796,7 @@ pub mod json {
     #[derive(Serialize)]
     struct JsonComment<'a> {
         comment_text: &'a str,
-        file_path: Option<&'a Path>,
+        file_path: Option<String>,
         line_number: Option<usize>,
         head_title: Option<&'a str>,
     }
@@ -784,14 +838,15 @@ pub mod json {
                 | AIAgentInput::CloneRepository { .. }
                 | AIAgentInput::InitProjectRules { .. }
                 | AIAgentInput::CodeReview { .. }
-                | AIAgentInput::FetchReviewComments { .. }
                 | AIAgentInput::CreateEnvironment { .. }
                 | AIAgentInput::SummarizeConversation { .. }
                 | AIAgentInput::InvokeSkill { .. }
                 | AIAgentInput::StartFromAmbientRunPrompt { .. }
                 | AIAgentInput::MessagesReceivedFromAgents { .. }
                 | AIAgentInput::EventsFromAgents { .. }
-                | AIAgentInput::PassiveSuggestionResult { .. } => None,
+                | AIAgentInput::PassiveSuggestionResult { .. }
+                | AIAgentInput::OrchestrationConfigUpdate { .. }
+                | AIAgentInput::AgentWake => None,
                 // These input types should not occur in a SDK-run agent.
                 AIAgentInput::ResumeConversation { .. }
                 | AIAgentInput::TriggerPassiveSuggestion { .. } => None,
@@ -808,10 +863,18 @@ pub mod json {
                         output, exit_code, ..
                     } => Some(JsonMessage::ToolResult(JsonToolResult::RunCommand(
                         JsonRunCommandResult::Complete {
-                            exit_code: exit_code.value(),
+                            exit_code: Some(exit_code.value()),
                             output,
                         },
                     ))),
+                    RequestCommandOutputResult::ShellRecovered { output, status, .. } => {
+                        Some(JsonMessage::ToolResult(JsonToolResult::RunCommand(
+                            JsonRunCommandResult::Complete {
+                                exit_code: status.code(),
+                                output,
+                            },
+                        )))
+                    }
                     RequestCommandOutputResult::LongRunningCommandSnapshot { .. } => {
                         Some(JsonMessage::ToolResult(JsonToolResult::RunCommand(
                             JsonRunCommandResult::Running,
@@ -825,6 +888,11 @@ pub mod json {
                             "Command was not allowed to run due to presence on denylist",
                         ),
                     }),
+                    RequestCommandOutputResult::TerminalBusy { .. } => {
+                        Some(JsonMessage::ToolError {
+                            error: Cow::Owned(result.to_string()),
+                        })
+                    }
                 },
                 AIAgentActionResultType::WriteToLongRunningShellCommand(result) => match result {
                     WriteToLongRunningShellCommandResult::Snapshot { .. } => {
@@ -838,7 +906,7 @@ pub mod json {
                         ..
                     } => Some(JsonMessage::ToolResult(JsonToolResult::RunCommand(
                         JsonRunCommandResult::Complete {
-                            exit_code: exit_code.value(),
+                            exit_code: Some(exit_code.value()),
                             output,
                         },
                     ))),
@@ -863,11 +931,15 @@ pub mod json {
                     RequestFileEditsResult::Cancelled => Some(JsonMessage::ToolCanceled),
                 },
                 AIAgentActionResultType::ReadFiles(result) => match result {
-                    ReadFilesResult::Success { files } => Some(JsonMessage::ToolResult(
-                        JsonToolResult::ReadFiles(JsonFileCollectionResult {
+                    ReadFilesResult::Success {
+                        files,
+                        failed_files,
+                    } => Some(JsonMessage::ToolResult(JsonToolResult::ReadFiles(
+                        JsonReadFilesResult {
                             files: JsonFile::from_file_contexts(files),
-                        }),
-                    )),
+                            failed_files: failed_files.iter().map(JsonFailedFile::from).collect(),
+                        },
+                    ))),
                     ReadFilesResult::Error(error) => Some(JsonMessage::ToolError {
                         error: Cow::Borrowed(error.as_str()),
                     }),
@@ -1093,7 +1165,9 @@ pub mod json {
                     // TODO(AGENT-2281): implement
                     AIAgentActionType::RequestComputerUse(_) => None,
                     // Internal or non-CLI tool calls: skip them
-                    AIAgentActionType::SuggestNewConversation { .. }
+                    AIAgentActionType::StartRecording { .. }
+                    | AIAgentActionType::StopRecording { .. }
+                    | AIAgentActionType::SuggestNewConversation { .. }
                     | AIAgentActionType::SuggestPrompt { .. }
                     | AIAgentActionType::InitProject
                     | AIAgentActionType::OpenCodeReview
@@ -1104,10 +1178,13 @@ pub mod json {
                     | AIAgentActionType::ReadShellCommandOutput { .. }
                     | AIAgentActionType::ReadSkill(_)
                     | AIAgentActionType::FetchConversation { .. }
-                    | AIAgentActionType::StartAgent { .. }
                     | AIAgentActionType::SendMessageToAgent { .. }
                     | AIAgentActionType::TransferShellCommandControlToUser { .. } => None,
                     AIAgentActionType::AskUserQuestion { .. } => None,
+                    // RunAgents is desktop-client-only; SDK has no JSON
+                    // representation for it.
+                    AIAgentActionType::RunAgents(_) => None,
+                    AIAgentActionType::WaitForEvents { .. } => None,
                 },
                 AIAgentOutputMessageType::TodoOperation(operation) => match operation {
                     TodoOperation::UpdateTodos { todos } => Some(JsonMessage::UpdateTodos {
@@ -1169,7 +1246,11 @@ pub mod json {
         fn from(review_comment: &'a ReviewComment) -> Self {
             Self {
                 comment_text: review_comment.content.as_str(),
-                file_path: review_comment.diff.file_path.as_deref(),
+                file_path: review_comment
+                    .diff
+                    .file_path
+                    .as_ref()
+                    .map(LocalOrRemotePath::display_path),
                 line_number: review_comment.diff.line_number,
                 head_title: review_comment.head_title.as_deref(),
             }
@@ -1286,10 +1367,12 @@ pub mod json {
     }
 }
 
+use std::io::{self, BufWriter, Write};
+
+use warp_core::channel::ChannelState;
+
 use crate::ai::agent::{AIAgentText, AIAgentTextSection};
 use crate::code::editor_management::CodeSource;
-use std::io::{self, BufWriter, Write};
-use warp_core::channel::ChannelState;
 
 /// Constructs the Oz dashboard URL for a given run ID.
 fn run_url(run_id: &str) -> String {
@@ -1328,8 +1411,8 @@ fn format_agent_text<W: Write>(text: &AIAgentText, w: &mut W) -> io::Result<()> 
                 }
 
                 match source {
-                    Some(CodeSource::ProjectRules { path }) => {
-                        writeln!(w, " rules_path={}", path.display())?;
+                    Some(CodeSource::ProjectRules { location }) => {
+                        writeln!(w, " rules_path={}", location.display_path())?;
                     }
                     Some(CodeSource::Link {
                         path,
@@ -1348,12 +1431,13 @@ fn format_agent_text<W: Write>(text: &AIAgentText, w: &mut W) -> io::Result<()> 
 
                         writeln!(w)?;
                     }
-                    Some(CodeSource::Skill { path, .. }) => {
-                        writeln!(w, " skill_path={}", path.display())?;
+                    Some(CodeSource::Skill { location, .. }) => {
+                        writeln!(w, " skill_path={}", location.display_path())?;
                     }
                     Some(CodeSource::AIAction { .. })
                     | Some(CodeSource::New { .. })
                     | Some(CodeSource::FileTree { .. })
+                    | Some(CodeSource::CommandPalette { .. })
                     | Some(CodeSource::Finder { .. })
                     | None => {}
                 }

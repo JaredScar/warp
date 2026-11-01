@@ -1,11 +1,14 @@
 use std::collections::BTreeSet;
 
-use crate::ai::agent_sdk::output::{self, TableFormat};
-use crate::ai::llms::LLMPreferences;
 use comfy_table::Cell;
 use serde::Serialize;
-use warp_cli::{model::ModelCommand, GlobalOptions};
-use warpui::{platform::TerminationMode, AppContext, ModelContext, SingletonEntity};
+use warp_cli::GlobalOptions;
+use warp_cli::model::{ListModelsArgs, ModelCommand};
+use warpui::platform::TerminationMode;
+use warpui::{AppContext, ModelContext, SingletonEntity};
+
+use crate::ai::agent_sdk::output::{self, TableFormat};
+use crate::ai::llms::LLMPreferences;
 
 /// Handle model-related CLI commands.
 pub fn run(
@@ -15,8 +18,8 @@ pub fn run(
 ) -> anyhow::Result<()> {
     let runner = ctx.add_singleton_model(|_ctx| ModelCommandRunner);
     match command {
-        ModelCommand::List => {
-            runner.update(ctx, |runner, ctx| runner.list(global_options, ctx));
+        ModelCommand::List(args) => {
+            runner.update(ctx, |runner, ctx| runner.list(global_options, args, ctx));
             Ok(())
         }
     }
@@ -26,7 +29,12 @@ pub fn run(
 struct ModelCommandRunner;
 
 impl ModelCommandRunner {
-    fn list(&self, global_options: GlobalOptions, ctx: &mut ModelContext<Self>) {
+    fn list(
+        &self,
+        global_options: GlobalOptions,
+        args: ListModelsArgs,
+        ctx: &mut ModelContext<Self>,
+    ) {
         let output_format = global_options.output_format;
 
         // Ensure workspace metadata is refreshed so LLM preferences are up-to-date.
@@ -40,10 +48,17 @@ impl ModelCommandRunner {
                 );
                 return;
             }
+            let team_scope = match super::common::resolve_team_scope(&args.team_selection, ctx) {
+                Ok(scope) => scope,
+                Err(error) => {
+                    super::report_fatal_error(error, ctx);
+                    return;
+                }
+            };
 
             let llm_prefs = LLMPreferences::as_ref(ctx);
             let mut ids = BTreeSet::new();
-            for info in llm_prefs.get_base_llm_choices_for_agent_mode() {
+            for info in llm_prefs.get_base_llm_choices_for_agent_mode(&team_scope, ctx) {
                 ids.insert(info.id.to_string());
             }
 

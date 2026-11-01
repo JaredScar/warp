@@ -1,29 +1,30 @@
-use crate::ai::execution_profiles::{AIExecutionProfile, ActionPermission};
-use crate::editor::EditorView;
-use crate::settings::AISettings;
-use crate::ui_components::icons::Icon;
-use crate::view_components::FilterableDropdown;
-use crate::view_components::{Dropdown, SubmittableTextInput};
-use crate::Appearance;
-use crate::TemplatableMCPServerManager;
 use pathfinder_geometry::vector::vec2f;
+use thousands::Separable;
 use uuid::Uuid;
 use warp_core::features::FeatureFlag;
-use warpui::elements::Dismiss;
-use warpui::elements::Hoverable;
-use warpui::elements::MouseStateHandle;
 use warpui::elements::{
-    ChildAnchor, ChildView, ConstrainedBox, Container, CrossAxisAlignment, Flex, MainAxisAlignment,
-    MainAxisSize, OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Shrinkable,
-    Stack, Text,
+    ChildAnchor, ChildView, ConstrainedBox, Container, CrossAxisAlignment, Dismiss, Flex,
+    Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
+    ParentElement, ParentOffsetBounds, Shrinkable, Stack, Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
-use warpui::AppContext;
-use warpui::{Element, SingletonEntity, ViewHandle};
+use warpui::{AppContext, Element, SingletonEntity, ViewHandle};
 
-use super::ExecutionProfileEditorView;
-use super::ExecutionProfileEditorViewAction;
+use super::{ExecutionProfileEditorView, ExecutionProfileEditorViewAction};
+use crate::ai::blocklist::BlocklistAIPermissions;
+use crate::ai::execution_profiles::{
+    AIExecutionProfile, AIExecutionProfileAppExt as _, ActionPermission,
+    long_context_pricing_warning_title,
+};
+use crate::editor::EditorView;
+use crate::settings::AISettings;
+use crate::ui_components::icons::Icon;
+use crate::view_components::{
+    Dropdown, DropdownItemAction, FilterableDropdown, SubmittableTextInput, WarningBoxConfig,
+    render_warning_box,
+};
+use crate::{Appearance, TemplatableMCPServerManager};
 
 const CONTEXT_WINDOW_SLIDER_WIDTH: f32 = 220.;
 const CONTEXT_WINDOW_INPUT_BOX_WIDTH: f32 = 120.;
@@ -64,7 +65,7 @@ fn nice_step(raw: f64) -> f64 {
     nice * magnitude
 }
 
-use crate::settings_view::{render_input_list, render_separator, InputListItem};
+use crate::settings_view::{InputListItem, render_input_list, render_separator};
 
 pub const WORKSPACE_OVERRIDE_TOOLTIP_MESSAGE: &str =
     "This option is enforced by your organization's settings and cannot be customized.";
@@ -130,7 +131,7 @@ pub fn render_section_label(label: &str, appearance: &Appearance) -> Box<dyn Ele
     .finish()
 }
 
-fn render_filterable_dropdown_row<T: Clone + 'static + std::fmt::Debug + Send + Sync>(
+fn render_filterable_dropdown_row<T: DropdownItemAction>(
     appearance: &Appearance,
     label: &str,
     desc: &str,
@@ -201,8 +202,14 @@ fn render_info_section(
         .finish();
     Container::new(description).with_margin_bottom(12.).finish()
 }
+fn render_long_context_pricing_warning(appearance: &Appearance) -> Box<dyn Element> {
+    render_warning_box(
+        WarningBoxConfig::formatted_title(long_context_pricing_warning_title()),
+        appearance,
+    )
+}
 
-fn render_permission_row<T: Clone + 'static + std::fmt::Debug + Send + Sync>(
+fn render_permission_row<T: DropdownItemAction>(
     appearance: &Appearance,
     icon: Icon,
     label: &str,
@@ -291,16 +298,12 @@ pub fn render_models_section(
 
 /// Renders a `[min — slider — max] [input]` row beneath the base model
 /// dropdown. Returns `None` if the active base model doesn't advertise a
-/// configurable context window, global AI is disabled, or the
-/// [`FeatureFlag::ConfigurableContextWindow`] flag is disabled.
+/// configurable context window or global AI is disabled.
 fn render_context_window_row(
     appearance: &Appearance,
     view: &ExecutionProfileEditorView,
     app: &AppContext,
 ) -> Option<Box<dyn Element>> {
-    if !FeatureFlag::ConfigurableContextWindow.is_enabled() {
-        return None;
-    }
     if !AISettings::as_ref(app).is_any_ai_enabled(app) {
         return None;
     }
@@ -315,8 +318,8 @@ fn render_context_window_row(
     )
     .with_color(appearance.theme().active_ui_text_color().into())
     .finish();
-    let min_label_text = min.to_string();
-    let max_label_text = max.to_string();
+    let min_label_text = min.separate_with_commas();
+    let max_label_text = max.separate_with_commas();
     let desc = Text::new(
         "The base model's working memory — how many tokens of your conversation, code, and documents it can consider at once. Larger windows enable longer conversations and more coherent responses over bigger codebases, at the cost of higher latency and compute usage.".to_string(),
         appearance.ui_font_family(),
@@ -415,20 +418,26 @@ fn render_context_window_row(
     let slider_row = Flex::row()
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
         .with_child(min_label)
-        .with_child(slider)
+        .with_child(Shrinkable::new(1., slider).finish())
         .with_child(max_label)
         .with_child(input_box)
         .finish();
 
+    let mut column = Flex::column()
+        .with_child(Container::new(label_desc).with_margin_bottom(4.).finish())
+        .with_child(slider_row);
+    let scope = view.team_context(app);
+    if BlocklistAIPermissions::as_ref(app)
+        .permissions_profile_for_id(view.profile_id(), &scope, app)
+        .should_show_long_context_pricing_warning(view.dragged_context_window_value, app)
+    {
+        column.add_child(render_long_context_pricing_warning(appearance));
+    }
+
     Some(
-        Container::new(
-            Flex::column()
-                .with_child(Container::new(label_desc).with_margin_bottom(4.).finish())
-                .with_child(slider_row)
-                .finish(),
-        )
-        .with_margin_bottom(12.)
-        .finish(),
+        Container::new(column.finish())
+            .with_margin_bottom(12.)
+            .finish(),
     )
 }
 
@@ -439,6 +448,7 @@ pub fn render_permissions_section(
     app: &warpui::AppContext,
 ) -> Box<dyn Element> {
     let ai_settings = AISettings::as_ref(app);
+    let scope = view.team_context(app);
     let mut column = Flex::column().with_children([
         render_separator(appearance),
         render_section_label("PERMISSIONS", appearance),
@@ -448,7 +458,7 @@ pub fn render_permissions_section(
             "Apply code diffs",
             &view.apply_code_diffs_dropdown,
             profile_data.apply_code_diffs.description(),
-            !ai_settings.is_code_diffs_permissions_editable(app),
+            !ai_settings.is_code_diffs_permissions_editable(&scope, app),
             view.tooltip_mouse_state_handles
                 .apply_code_diffs_tooltip_mouse_state
                 .clone(),
@@ -459,7 +469,7 @@ pub fn render_permissions_section(
             "Read files",
             &view.read_files_dropdown,
             profile_data.read_files.description(),
-            !ai_settings.is_read_files_permissions_editable(app),
+            !ai_settings.is_read_files_permissions_editable(&scope, app),
             view.tooltip_mouse_state_handles
                 .read_files_tooltip_mouse_state
                 .clone(),
@@ -483,7 +493,7 @@ pub fn render_permissions_section(
         "Execute commands",
         &view.execute_commands_dropdown,
         profile_data.execute_commands.description(),
-        !ai_settings.is_execute_commands_permissions_editable(app),
+        !ai_settings.is_execute_commands_permissions_editable(&scope, app),
         view.tooltip_mouse_state_handles
             .execute_commands_tooltip_mouse_state
             .clone(),
@@ -520,7 +530,7 @@ pub fn render_permissions_section(
         "Interact with running commands",
         &view.write_to_pty_dropdown,
         profile_data.write_to_pty.description(),
-        !ai_settings.is_write_to_pty_permissions_editable(app),
+        !ai_settings.is_write_to_pty_permissions_editable(&scope, app),
         view.tooltip_mouse_state_handles
             .write_to_pty_tooltip_mouse_state
             .clone(),
@@ -533,7 +543,7 @@ pub fn render_permissions_section(
             "Computer use",
             &view.computer_use_dropdown,
             profile_data.computer_use.description(),
-            !ai_settings.is_computer_use_permissions_editable(app),
+            !ai_settings.is_computer_use_permissions_editable(&scope, app),
             view.tooltip_mouse_state_handles
                 .computer_use_tooltip_mouse_state
                 .clone(),
@@ -549,6 +559,17 @@ pub fn render_permissions_section(
         !ai_settings.is_ask_user_question_permissions_editable(app),
         view.tooltip_mouse_state_handles
             .ask_user_question_tooltip_mouse_state
+            .clone(),
+    ));
+    column.add_child(render_permission_row(
+        appearance,
+        Icon::Atom,
+        "Run orchestrated agents",
+        &view.run_agents_dropdown,
+        profile_data.run_agents.description(),
+        !ai_settings.is_run_agents_permissions_editable(app),
+        view.tooltip_mouse_state_handles
+            .run_agents_tooltip_mouse_state
             .clone(),
     ));
 
@@ -664,10 +685,12 @@ where
             item: display_fn(&item),
             mouse_state_handle,
             on_remove_action: on_remove_action(item),
+            is_disabled: !is_editable,
+            tooltip_mouse_state: None,
         })
         .collect();
 
-    let list = render_input_list(None, input_items, editor, !is_editable, appearance);
+    let list = render_input_list(None, input_items, editor, appearance);
     let list_element = if !is_editable {
         wrap_disabled_with_workspace_override_tooltip(list, tooltip_mouse_state, appearance)
     } else {
@@ -697,7 +720,8 @@ fn render_directory_allowlist_section(
     app: &warpui::AppContext,
 ) -> Box<dyn Element> {
     let ai_settings = AISettings::as_ref(app);
-    let is_editable = ai_settings.is_directory_allowlist_editable(app);
+    let scope = view.team_context(app);
+    let is_editable = ai_settings.is_directory_allowlist_editable(&scope, app);
 
     render_list_section(
         "Directory allowlist",
@@ -722,7 +746,8 @@ fn render_command_allowlist_section(
     app: &warpui::AppContext,
 ) -> Box<dyn Element> {
     let ai_settings = AISettings::as_ref(app);
-    let is_editable = ai_settings.is_command_allowlist_editable(app);
+    let scope = view.team_context(app);
+    let is_editable = ai_settings.is_command_allowlist_editable(&scope, app);
 
     render_list_section(
         "Command allowlist",
@@ -747,24 +772,60 @@ fn render_command_denylist_section(
     appearance: &Appearance,
     app: &warpui::AppContext,
 ) -> Box<dyn Element> {
-    let ai_settings = AISettings::as_ref(app);
-    let is_editable = ai_settings.is_command_denylist_editable(app);
+    use crate::ai::blocklist::BlocklistAIPermissions;
 
-    render_list_section(
+    let ai_disabled = !AISettings::as_ref(app).is_any_ai_enabled(app);
+    let scope = view.team_context(app);
+    let org_denylist = BlocklistAIPermissions::get_org_execute_commands_denylist(&scope, app);
+    let mut tooltip_idx = 0usize;
+
+    let input_items: Vec<InputListItem<ExecutionProfileEditorViewAction>> = profile_data
+        .command_denylist
+        .iter()
+        .cloned()
+        .zip(view.command_denylist_mouse_state_handles.iter().cloned())
+        .rev()
+        .map(|(predicate, mouse_state_handle)| {
+            let is_org = org_denylist.contains(&predicate);
+            let tooltip_mouse_state = if is_org {
+                let handle = view
+                    .command_denylist_tooltip_mouse_state_handles
+                    .get(tooltip_idx)
+                    .cloned();
+                tooltip_idx += 1;
+                handle
+            } else {
+                None
+            };
+            InputListItem {
+                item: predicate.to_string(),
+                mouse_state_handle,
+                on_remove_action: ExecutionProfileEditorViewAction::RemoveFromCommandDenylist {
+                    predicate,
+                },
+                is_disabled: is_org || ai_disabled,
+                tooltip_mouse_state,
+            }
+        })
+        .collect();
+
+    let list = render_input_list(
+        None,
+        input_items,
+        Some(&view.command_denylist_editor),
+        appearance,
+    );
+
+    let mut column = Flex::column().with_child(create_section_header(
         "Command denylist",
         "Regular expressions to match commands that Oz should always ask permission to execute.",
-        &profile_data.command_denylist,
-        &view.command_denylist_mouse_state_handles,
-        Some(&view.command_denylist_editor),
-        None,
-        |predicate| ExecutionProfileEditorViewAction::RemoveFromCommandDenylist { predicate },
-        |item| item.to_string(),
         appearance,
-        is_editable,
-        view.tooltip_mouse_state_handles
-            .command_denylist_editor_tooltip_mouse_state
-            .clone(),
-    )
+    ));
+    column = column.with_child(list);
+
+    Container::new(column.finish())
+        .with_margin_bottom(16.)
+        .finish()
 }
 
 fn display_mcp_name(uuid: &Uuid, app: &AppContext) -> String {

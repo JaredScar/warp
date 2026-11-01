@@ -1,20 +1,16 @@
-use crate::index::Entry;
+use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
+
 use anyhow::anyhow;
 use cfg_if::cfg_if;
-use std::{
-    collections::{HashSet, VecDeque},
-    path::PathBuf,
-};
 
+use super::DirEntryOrFragment;
+use super::node::{ChildrenPath, MerkleNode, NodeLens, NodeMask};
+use super::serialized_tree::SerializedMerkleTree;
+use crate::index::Entry;
+use crate::index::full_source_code_embedding::Error;
 use crate::index::full_source_code_embedding::fragment_metadata::{
     LeafToFragmentMetadata, LeafToFragmentMetadataUpdates,
-};
-use crate::index::full_source_code_embedding::Error;
-
-use super::{
-    node::{ChildrenPath, MerkleNode, NodeLens, NodeMask},
-    serialized_tree::SerializedMerkleTree,
-    DirEntryOrFragment,
 };
 
 pub(super) enum UpdateFileResult {
@@ -210,5 +206,5 @@ impl MerkleTree {
 }
 
 #[cfg(test)]
-#[path = "tree_test.rs"]
+#[path = "tree_tests.rs"]
 mod tests;

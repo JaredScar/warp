@@ -1,13 +1,14 @@
 use std::cmp::Ordering;
 
-use crate::completer::SessionContext;
-use crate::ui_components::icons::Icon;
-use typed_path::TypedPathBuf;
-use warp_completer::completer::{EngineDirEntry, EngineFileType, PathCompletionContext};
+use warp_completer::completer::{EngineDirEntry, EngineFileType};
 use warp_util::file_type::is_binary_file;
-use warpui::{r#async::SpawnedFutureHandle, AppContext, Entity, ModelContext};
+use warp_util::path::expand_session_home;
+use warpui::r#async::SpawnedFutureHandle;
+use warpui::{AppContext, Entity, ModelContext};
 
 use super::display_menu::GenericMenuItem;
+use crate::completer::SessionContext;
+use crate::ui_components::icons::Icon;
 
 /// DirectoryFetcher model that caches directory state and provides an explicit refetch API
 pub struct DirectoryFetcher {
@@ -55,25 +56,28 @@ impl DirectoryFetcher {
         }
 
         // Always use async method - SessionContext works for both local and remote sessions
-        if let Some(session_ctx) = self.session_context.clone() {
-            let dir_path = self.current_directory.clone();
+        match self.session_context.clone() {
+            Some(session_ctx) => {
+                let dir_path = self.current_directory.clone();
 
-            self.fetch_handle = Some(ctx.spawn(
-                async move { Self::fetch_files_async(&session_ctx, &dir_path).await },
-                |fetcher, files, ctx| {
-                    fetcher.cached_files = files;
-                    fetcher.fetch_handle = None;
-                    ctx.emit(DirectoryFetcherEvent::DirectoryContentsUpdated);
-                    ctx.emit(DirectoryFetcherEvent::FetchCompleted { success: true });
-                    ctx.notify();
-                },
-            ));
-            ctx.emit(DirectoryFetcherEvent::FetchStarted);
-        } else {
-            // If no session context, we can't fetch directory contents
-            log::warn!("No SessionContext available for directory fetching");
-            ctx.emit(DirectoryFetcherEvent::FetchCompleted { success: false });
-            ctx.notify();
+                self.fetch_handle = Some(ctx.spawn(
+                    async move { Self::fetch_files_async(&session_ctx, &dir_path).await },
+                    |fetcher, files, ctx| {
+                        fetcher.cached_files = files;
+                        fetcher.fetch_handle = None;
+                        ctx.emit(DirectoryFetcherEvent::DirectoryContentsUpdated);
+                        ctx.emit(DirectoryFetcherEvent::FetchCompleted { success: true });
+                        ctx.notify();
+                    },
+                ));
+                ctx.emit(DirectoryFetcherEvent::FetchStarted);
+            }
+            _ => {
+                // If no session context, we can't fetch directory contents
+                log::warn!("No SessionContext available for directory fetching");
+                ctx.emit(DirectoryFetcherEvent::FetchCompleted { success: false });
+                ctx.notify();
+            }
         }
     }
 
@@ -82,16 +86,15 @@ impl DirectoryFetcher {
         session_context: &SessionContext,
         dir_path: &str,
     ) -> Vec<DirectoryItem> {
-        // Convert the directory path to TypedPathBuf, expanding ~ if needed
-        let expanded_path = shellexpand::tilde(dir_path).into_owned();
-        let typed_path = if expanded_path != dir_path {
-            TypedPathBuf::from(expanded_path)
-        } else {
-            TypedPathBuf::from(dir_path)
-        };
+        let typed_path = expand_session_home(
+            dir_path,
+            session_context.session.home_dir(),
+            session_context.session.path_separators().all,
+        );
 
-        // Use SessionContext to get directory entries (works for both local and remote sessions)
-        let entries = session_context.list_directory_entries(typed_path).await;
+        // Force re-read the directory from disk so the chip reflects its current contents rather
+        // than serving the possibly-stale entry from the shared `SessionContext` cache.
+        let entries = session_context.refresh_directory_entries(typed_path).await;
 
         // Convert EngineDirEntry to GenericMenuItem, filtering out hidden files
         let mut items: Vec<DirectoryItem> = entries
@@ -147,6 +150,14 @@ impl DirectoryFetcher {
 
 impl Entity for DirectoryFetcher {
     type Event = DirectoryFetcherEvent;
+}
+
+impl Drop for DirectoryFetcher {
+    fn drop(&mut self) {
+        if let Some(handle) = self.fetch_handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialOrd, PartialEq)]

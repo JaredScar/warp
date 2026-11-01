@@ -1,13 +1,16 @@
 //! Commands to interact with available agents via the public API.
 
-use crate::ai::agent_sdk::oauth_flow::poll_oauth_until_terminal;
-use crate::ai::cloud_environments::GithubRepo;
-use crate::server::server_api::ai::AgentListItem;
-use crate::server::server_api::ServerApiProvider;
-use warp_cli::agent::ListAgentConfigsArgs;
+use warp_cli::agent::ListAgentSkillsArgs;
 use warp_graphql::queries::get_oauth_connect_tx_status::OauthConnectTxStatus;
 use warp_graphql::queries::user_repo_auth_status::UserRepoAuthStatusEnum;
-use warpui::{platform::TerminationMode, AppContext, ModelContext, SingletonEntity};
+use warpui::platform::TerminationMode;
+use warpui::{AppContext, ModelContext, SingletonEntity};
+
+use crate::ai::agent_sdk::oauth_flow::poll_oauth_until_terminal;
+use crate::ai::cloud_environments::GithubRepo;
+use crate::server::server_api::ServerApiProvider;
+use crate::server::server_api::ai::AgentSkillItem;
+use crate::server::team_scope::RequestTeamScope;
 
 const MAX_LINE_WIDTH: usize = 90;
 const MAX_AUTH_ATTEMPTS: u32 = 8;
@@ -15,10 +18,10 @@ const MAX_AUTH_ATTEMPTS: u32 = 8;
 /// Singleton model that runs async work for agent CLI commands.
 struct AgentConfigRunner;
 
-/// List all available agents.
-pub fn list_agents(ctx: &mut AppContext, args: ListAgentConfigsArgs) -> anyhow::Result<()> {
+/// List all available agent skills.
+pub fn list_skills(ctx: &mut AppContext, args: ListAgentSkillsArgs) -> anyhow::Result<()> {
     let runner = ctx.add_singleton_model(|_ctx| AgentConfigRunner);
-    runner.update(ctx, |runner, ctx| runner.list(args.repo.clone(), ctx))
+    runner.update(ctx, |runner, ctx| runner.list(args, ctx))
 }
 
 /// Parse a repo spec string (owner/repo or GitHub URL) into a GithubRepo.
@@ -52,14 +55,34 @@ fn parse_repo_spec(spec: &str) -> anyhow::Result<GithubRepo> {
 }
 
 impl AgentConfigRunner {
-    fn list(&self, repo: Option<String>, ctx: &mut ModelContext<Self>) -> anyhow::Result<()> {
+    fn list(&self, args: ListAgentSkillsArgs, ctx: &mut ModelContext<Self>) -> anyhow::Result<()> {
+        let refresh = super::common::refresh_workspace_metadata(ctx);
+        ctx.spawn(refresh, move |runner, result, ctx| {
+            if let Err(error) = result {
+                super::report_fatal_error(error, ctx);
+                return;
+            }
+            if let Err(error) = runner.list_after_refresh(args, ctx) {
+                super::report_fatal_error(error, ctx);
+            }
+        });
+        Ok(())
+    }
+
+    fn list_after_refresh(
+        &self,
+        args: ListAgentSkillsArgs,
+        ctx: &mut ModelContext<Self>,
+    ) -> anyhow::Result<()> {
+        let team_scope = super::common::request_team_scope_for_cli(&args.team_selection, ctx)?;
+        let repo = args.repo;
         // If a repo is specified, check auth first
         if let Some(ref repo_spec) = repo {
             let github_repo = parse_repo_spec(repo_spec)?;
-            self.auth_then_list(vec![github_repo], 1, repo, ctx);
+            self.auth_then_list(vec![github_repo], 1, repo, team_scope, ctx);
         } else {
             // No repo specified - just list from environments
-            self.fetch_and_display_agents(repo, ctx);
+            self.fetch_and_display_agents(repo, team_scope, ctx);
         }
         Ok(())
     }
@@ -70,6 +93,7 @@ impl AgentConfigRunner {
         repos: Vec<GithubRepo>,
         attempt: u32,
         repo_spec: Option<String>,
+        team_scope: RequestTeamScope,
         ctx: &mut ModelContext<Self>,
     ) {
         if attempt > MAX_AUTH_ATTEMPTS {
@@ -126,7 +150,7 @@ impl AgentConfigRunner {
 
                     if !has_blocking_private_issues {
                         // No blocking issues - proceed with listing
-                        runner.fetch_and_display_agents(repo_spec, ctx);
+                        runner.fetch_and_display_agents(repo_spec, team_scope, ctx);
                         return;
                     }
 
@@ -149,7 +173,13 @@ impl AgentConfigRunner {
                                 match poll_result {
                                     Ok(OauthConnectTxStatus::Completed) => {
                                         // OAuth completed, retry
-                                        runner.auth_then_list(repos, next_attempt, repo_spec, ctx);
+                                        runner.auth_then_list(
+                                            repos,
+                                            next_attempt,
+                                            repo_spec,
+                                            team_scope,
+                                            ctx,
+                                        );
                                     }
                                     Ok(OauthConnectTxStatus::Failed) => {
                                         ctx.terminate_app(
@@ -211,7 +241,12 @@ impl AgentConfigRunner {
         });
     }
 
-    fn fetch_and_display_agents(&self, repo: Option<String>, ctx: &mut ModelContext<Self>) {
+    fn fetch_and_display_agents(
+        &self,
+        repo: Option<String>,
+        team_scope: RequestTeamScope,
+        ctx: &mut ModelContext<Self>,
+    ) {
         let ai_client = ServerApiProvider::handle(ctx).as_ref(ctx).get_ai_client();
 
         if repo.is_some() {
@@ -220,7 +255,7 @@ impl AgentConfigRunner {
             println!("Fetching agent skills from your Warp environments...");
         }
 
-        let list_future = async move { ai_client.list_agents(repo).await };
+        let list_future = async move { ai_client.list_skills(repo, team_scope).await };
 
         ctx.spawn(list_future, |_, result, ctx| match result {
             Ok(agents) => {
@@ -234,9 +269,9 @@ impl AgentConfigRunner {
     }
 
     /// Print a list of agents in a card-style format.
-    fn print_agents_table(agents: &[AgentListItem]) {
+    fn print_agents_table(agents: &[AgentSkillItem]) {
         if agents.is_empty() {
-            println!("No agents found.");
+            println!("No skills found.");
             return;
         }
 

@@ -1,5 +1,5 @@
 pub mod app;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod mac;
@@ -14,7 +14,7 @@ pub mod current {
     cfg_if::cfg_if! {
         if #[cfg(target_family = "wasm")] {
             pub use super::wasm::*;
-        } else if #[cfg(target_os = "linux")] {
+        } else if #[cfg(any(target_os = "linux", target_os = "freebsd"))] {
             pub use super::linux::*;
         } else if #[cfg(target_os = "macos")] {
             pub use super::mac::*;
@@ -26,9 +26,25 @@ pub mod current {
     }
 }
 
+pub use app::AppBuilder;
 pub use warpui_core::platform::*;
 
-pub use app::AppBuilder;
+/// Creates the native system clipboard implementation used by the GUI
+/// platform delegate without requiring a graphical event loop.
+#[cfg(not(target_family = "wasm"))]
+pub fn create_system_clipboard() -> anyhow::Result<Box<dyn crate::Clipboard + Send>> {
+    cfg_if::cfg_if! {
+        if #[cfg(target_os = "macos")] {
+            Ok(Box::new(mac::clipboard::Clipboard::new()?))
+        } else if #[cfg(any(target_os = "linux", target_os = "freebsd"))] {
+            Ok(Box::new(crate::windowing::winit::linux::LinuxClipboard::new()?))
+        } else if #[cfg(target_os = "windows")] {
+            Ok(Box::new(crate::windowing::winit::windows::WindowsClipboard::new()?))
+        } else {
+            anyhow::bail!("System clipboard is unavailable on this platform")
+        }
+    }
+}
 
 /// Returns whether the current device is a mobile device with touch input.
 ///

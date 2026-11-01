@@ -4,29 +4,23 @@ pub mod util;
 #[cfg_attr(target_family = "wasm", path = "wasm.rs")]
 mod imp;
 
-use crate::actions::model::{Action, Runbook, SavedWorkspace, Trigger};
-use crate::tab_configs::{TabConfig, TabConfigError};
-use crate::themes::theme::WarpThemeConfig;
-use crate::{
-    launch_configs::launch_config::LaunchConfig, themes::theme::ThemeKind,
-    workflows::workflow::Workflow,
-};
-use lazy_static::lazy_static;
 #[cfg(feature = "local_fs")]
 use std::path::Path;
 use std::path::PathBuf;
-use warp_core::ui::theme::WarpTheme;
-use warpui::{Entity, ModelContext, SingletonEntity};
 
-#[cfg(test)]
 pub(crate) use imp::load_tab_configs;
 #[cfg(feature = "local_fs")]
 pub use imp::load_workflows;
 pub use imp::{load_launch_configs, load_theme_configs};
-#[cfg(feature = "local_fs")]
-pub use imp::save_naming_rules;
-#[cfg(feature = "local_fs")]
-pub use imp::save_color_rules;
+use lazy_static::lazy_static;
+use warp_core::ui::theme::WarpTheme;
+use warpui::{Entity, ModelContext, SingletonEntity};
+
+use crate::ai::custom_model_routers::{CustomModelRouter, ModelConfigError};
+use crate::launch_configs::launch_config::LaunchConfig;
+use crate::tab_configs::{TabConfig, TabConfigError};
+use crate::themes::theme::{ThemeKind, WarpThemeConfig};
+use crate::workflows::workflow::Workflow;
 
 lazy_static! {
     pub static ref LAUNCH_CONFIG_COMMENT: String = format!(
@@ -57,44 +51,7 @@ lazy_static! {
     );
 }
 
-/// A rule that auto-colors a tab when the working directory matches a prefix.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
-pub struct TabColorRule {
-    pub id: uuid::Uuid,
-    /// Path prefix to match (e.g. `~/projects/frontend`).
-    pub path_prefix: String,
-    /// The ANSI color to assign to the tab when the rule matches.
-    pub color: warp_core::ui::theme::AnsiColorIdentifier,
-    /// Whether the rule is enabled.
-    #[serde(default = "tab_color_rule_enabled_default")]
-    pub enabled: bool,
-}
-
-fn tab_color_rule_enabled_default() -> bool {
-    true
-}
-
-/// A rule that auto-renames a tab when the working directory matches a prefix.
-#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
-pub struct TabNamingRule {
-    pub id: uuid::Uuid,
-    /// Path prefix to match (e.g. `~/projects/frontend`).
-    pub path_prefix: String,
-    /// The name to assign to the tab when the rule matches. Empty means no rename.
-    #[serde(default)]
-    pub tab_name: String,
-    /// An optional color to assign to the tab when the rule matches.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub color: Option<warp_core::ui::theme::AnsiColorIdentifier>,
-    /// Whether the rule is enabled.
-    #[serde(default = "tab_naming_rule_enabled_default")]
-    pub enabled: bool,
-}
-
-fn tab_naming_rule_enabled_default() -> bool {
-    true
-}
-
+#[derive(Clone)]
 pub enum WarpConfigUpdateEvent {
     Themes,
     #[cfg_attr(not(feature = "local_fs"), expect(dead_code))]
@@ -105,6 +62,12 @@ pub enum WarpConfigUpdateEvent {
     /// Emitted when one or more tab config files failed to parse.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     TabConfigErrors(Vec<TabConfigError>),
+    /// The local `custom_model_routers/` custom model routers were created, modified, or deleted.
+    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+    ModelConfigs,
+    /// Emitted when one or more `custom_model_routers/` files failed to parse.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    ModelConfigErrors(Vec<ModelConfigError>),
     /// The settings file (`settings.toml`) was created, modified, or deleted.
     #[cfg_attr(not(feature = "local_fs"), expect(dead_code))]
     Settings,
@@ -114,18 +77,6 @@ pub enum WarpConfigUpdateEvent {
     /// A previously-errored settings reload succeeded with no errors.
     #[cfg_attr(not(feature = "local_fs"), expect(dead_code))]
     SettingsErrorsCleared,
-    /// Actions, triggers, or saved workspaces on disk changed.
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    ActionsAndTriggers,
-    /// Tab naming rules on disk changed.
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    TabNamingRules,
-    /// Runbooks on disk changed.
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    Runbooks,
-    /// Tab color rules on disk changed.
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    TabColorRules,
 }
 
 /// Singleton model containing user configurable file entities like themes, launch configs, and
@@ -143,18 +94,12 @@ pub struct WarpConfig {
     tab_config_errors: Vec<TabConfigError>,
     theme_config: WarpThemeConfig,
     local_user_workflows: Vec<Workflow>,
-    /// User-authored actions loaded from `~/.warp/actions/*.toml`.
-    actions: Vec<Action>,
-    /// User-authored triggers loaded from `~/.warp/triggers/*.toml`.
-    triggers: Vec<Trigger>,
-    /// User-saved workspace snapshots loaded from `~/.warp/workspaces/*.toml`.
-    saved_workspaces: Vec<SavedWorkspace>,
-    /// User-authored tab naming rules loaded from `~/.warp/naming_rules.toml`.
-    tab_naming_rules: Vec<TabNamingRule>,
-    /// User-authored runbooks loaded from `~/.warp/runbooks/*.toml`.
-    runbooks: Vec<Runbook>,
-    /// User-authored tab color rules loaded from `~/.warp/color_rules.toml`.
-    tab_color_rules: Vec<TabColorRule>,
+    /// User-defined custom model routers loaded from `~/.warp/custom_model_routers/`.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    custom_model_routers: Vec<CustomModelRouter>,
+    /// Errors for `custom_model_routers/` files that failed to parse.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    custom_model_router_errors: Vec<ModelConfigError>,
 }
 
 /// Platform-independent parts of WarpConfig.
@@ -162,7 +107,7 @@ pub struct WarpConfig {
 /// Additional platform-dependent functionality can be found in impl blocks
 /// in native.rs and wasm.rs.
 impl WarpConfig {
-    #[cfg(test)]
+    #[cfg(any(test, all(feature = "tui", feature = "test-util")))]
     pub fn mock(_ctx: &mut ModelContext<Self>) -> Self {
         Self {
             theme_config: WarpThemeConfig::new(),
@@ -186,173 +131,16 @@ impl WarpConfig {
         &self.local_user_workflows
     }
 
-    pub fn actions(&self) -> &[Action] {
-        &self.actions
+    /// The local (YAML-sourced) custom model routers.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub fn custom_model_routers(&self) -> &Vec<CustomModelRouter> {
+        &self.custom_model_routers
     }
 
-    pub fn triggers(&self) -> &[Trigger] {
-        &self.triggers
-    }
-
-    pub fn saved_workspaces(&self) -> &[SavedWorkspace] {
-        &self.saved_workspaces
-    }
-
-    pub fn tab_naming_rules(&self) -> &[TabNamingRule] {
-        &self.tab_naming_rules
-    }
-
-    /// Find the first matching naming rule for the given working directory.
-    pub fn apply_naming_rules(&self, working_directory: &str) -> Option<&TabNamingRule> {
-        // Expand `~` for comparison
-        let home_prefix = dirs::home_dir()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let expanded_wd = if working_directory.starts_with('~') {
-            working_directory.replacen('~', &home_prefix, 1)
-        } else {
-            working_directory.to_string()
-        };
-
-        self.tab_naming_rules.iter().find(|r| {
-            if !r.enabled {
-                return false;
-            }
-            let expanded_prefix = if r.path_prefix.starts_with('~') {
-                r.path_prefix.replacen('~', &home_prefix, 1)
-            } else {
-                r.path_prefix.clone()
-            };
-            expanded_wd.starts_with(&expanded_prefix)
-        })
-    }
-
-    /// Add a new naming rule in-memory and emit an update event.
-    pub fn add_naming_rule(&mut self, rule: TabNamingRule, ctx: &mut ModelContext<Self>) {
-        self.tab_naming_rules.push(rule);
-        ctx.emit(WarpConfigUpdateEvent::TabNamingRules);
-    }
-
-    /// Replace a naming rule in-memory by ID and emit an update event.
-    pub fn update_naming_rule(&mut self, rule: TabNamingRule, ctx: &mut ModelContext<Self>) {
-        if let Some(existing) = self.tab_naming_rules.iter_mut().find(|r| r.id == rule.id) {
-            *existing = rule;
-        }
-        ctx.emit(WarpConfigUpdateEvent::TabNamingRules);
-    }
-
-    /// Remove a naming rule in-memory by ID and emit an update event.
-    pub fn remove_naming_rule(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
-        self.tab_naming_rules.retain(|r| r.id != id);
-        ctx.emit(WarpConfigUpdateEvent::TabNamingRules);
-    }
-
-    pub fn runbooks(&self) -> &[Runbook] {
-        &self.runbooks
-    }
-
-    pub fn add_runbook(&mut self, runbook: Runbook, ctx: &mut ModelContext<Self>) {
-        self.runbooks.push(runbook);
-        self.runbooks.sort_by(|a, b| a.name.cmp(&b.name));
-        ctx.emit(WarpConfigUpdateEvent::Runbooks);
-    }
-
-    pub fn update_runbook(&mut self, runbook: Runbook, ctx: &mut ModelContext<Self>) {
-        if let Some(existing) = self.runbooks.iter_mut().find(|r| r.id == runbook.id) {
-            *existing = runbook;
-        }
-        self.runbooks.sort_by(|a, b| a.name.cmp(&b.name));
-        ctx.emit(WarpConfigUpdateEvent::Runbooks);
-    }
-
-    pub fn remove_runbook(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
-        self.runbooks.retain(|r| r.id != id);
-        ctx.emit(WarpConfigUpdateEvent::Runbooks);
-    }
-
-    pub fn tab_color_rules(&self) -> &[TabColorRule] {
-        &self.tab_color_rules
-    }
-
-    pub fn add_tab_color_rule(&mut self, rule: TabColorRule, ctx: &mut ModelContext<Self>) {
-        self.tab_color_rules.push(rule);
-        ctx.emit(WarpConfigUpdateEvent::TabColorRules);
-    }
-
-    pub fn update_tab_color_rule(&mut self, rule: TabColorRule, ctx: &mut ModelContext<Self>) {
-        if let Some(existing) = self.tab_color_rules.iter_mut().find(|r| r.id == rule.id) {
-            *existing = rule;
-        }
-        ctx.emit(WarpConfigUpdateEvent::TabColorRules);
-    }
-
-    pub fn remove_tab_color_rule(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
-        self.tab_color_rules.retain(|r| r.id != id);
-        ctx.emit(WarpConfigUpdateEvent::TabColorRules);
-    }
-
-    /// Add a new action to the in-memory list and emit an update event.
-    pub fn add_action(&mut self, action: Action, ctx: &mut ModelContext<Self>) {
-        self.actions.push(action);
-        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
-    }
-
-    /// Replace the action with the same ID in-memory and emit an update event.
-    pub fn update_action(&mut self, action: Action, ctx: &mut ModelContext<Self>) {
-        if let Some(existing) = self.actions.iter_mut().find(|a| a.id == action.id) {
-            *existing = action;
-        }
-        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
-    }
-
-    /// Remove an action from the in-memory list by ID and emit an update event.
-    /// Built-in actions cannot be removed and will be silently ignored.
-    pub fn remove_action(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
-        if crate::actions::model::is_builtin_action(&id) {
-            return;
-        }
-        self.actions.retain(|a| a.id != id);
-        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
-    }
-
-    /// Add a new trigger to the in-memory list and emit an update event.
-    pub fn add_trigger(&mut self, trigger: Trigger, ctx: &mut ModelContext<Self>) {
-        self.triggers.push(trigger);
-        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
-    }
-
-    /// Replace the trigger with the same ID in-memory and emit an update event.
-    pub fn update_trigger(&mut self, trigger: Trigger, ctx: &mut ModelContext<Self>) {
-        if let Some(existing) = self.triggers.iter_mut().find(|t| t.id == trigger.id) {
-            *existing = trigger;
-        }
-        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
-    }
-
-    /// Remove a trigger from the in-memory list by ID and emit an update event.
-    pub fn remove_trigger(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
-        self.triggers.retain(|t| t.id != id);
-        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
-    }
-
-    /// Add a new workspace to the in-memory list and emit an update event.
-    pub fn add_saved_workspace(&mut self, workspace: SavedWorkspace, ctx: &mut ModelContext<Self>) {
-        self.saved_workspaces.push(workspace);
-        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
-    }
-
-    /// Replace a saved workspace in the in-memory list and emit an update event.
-    pub fn update_saved_workspace(&mut self, workspace: SavedWorkspace, ctx: &mut ModelContext<Self>) {
-        if let Some(existing) = self.saved_workspaces.iter_mut().find(|w| w.id == workspace.id) {
-            *existing = workspace;
-            ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
-        }
-    }
-
-    /// Remove a saved workspace from the in-memory list by ID and emit an update event.
-    pub fn remove_saved_workspace(&mut self, id: uuid::Uuid, ctx: &mut ModelContext<Self>) {
-        self.saved_workspaces.retain(|w| w.id != id);
-        ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
+    /// Parse errors for `custom_model_routers/` files that failed to load.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub fn custom_model_router_errors(&self) -> &Vec<ModelConfigError> {
+        &self.custom_model_router_errors
     }
 
     /// Saving the newly created launch configuration to the WarpConfig that we currently
@@ -424,45 +212,15 @@ pub fn launch_configs_dir() -> PathBuf {
 }
 
 /// Returns the path to the directory containing the user's tab configs.
-#[cfg_attr(target_family = "wasm", expect(dead_code))]
 pub fn tab_configs_dir() -> PathBuf {
     base_dir().join("tab_configs")
 }
 
-/// Returns the path to the directory containing the user's actions.
+/// Returns the path to the directory containing the user's custom model router
+/// configs (`~/.warp/custom_model_routers/`). Each file defines a single router.
 #[cfg_attr(target_family = "wasm", expect(dead_code))]
-pub fn actions_dir() -> PathBuf {
-    base_dir().join("actions")
-}
-
-/// Returns the path to the directory containing the user's triggers.
-#[cfg_attr(target_family = "wasm", expect(dead_code))]
-pub fn triggers_dir() -> PathBuf {
-    base_dir().join("triggers")
-}
-
-/// Returns the path to the directory containing the user's saved workspaces.
-#[cfg_attr(target_family = "wasm", expect(dead_code))]
-pub fn saved_workspaces_dir() -> PathBuf {
-    base_dir().join("workspaces")
-}
-
-/// Returns the path to the directory containing the user's runbooks.
-#[cfg_attr(target_family = "wasm", expect(dead_code))]
-pub fn runbooks_dir() -> PathBuf {
-    base_dir().join("runbooks")
-}
-
-/// Returns the path to the user's tab color rules file.
-#[cfg_attr(target_family = "wasm", expect(dead_code))]
-pub fn color_rules_file() -> PathBuf {
-    base_dir().join("color_rules.toml")
-}
-
-/// Returns the path to the user's tab naming rules file.
-#[cfg_attr(target_family = "wasm", expect(dead_code))]
-pub fn naming_rules_file() -> PathBuf {
-    base_dir().join("naming_rules.toml")
+pub fn custom_model_routers_dir() -> PathBuf {
+    base_dir().join("custom_model_routers")
 }
 
 /// Returns the path to the directory containing the built-in default tab configs.
@@ -536,13 +294,13 @@ pub(crate) fn materialize_default_worktree_config(
 
     replace_default_worktree_placeholders(&mut toml_value, repo_path, pane_type, &worktree_path);
 
-    if let Some(doc) = toml_value.as_table_mut() {
-        if let Some(params) = doc.get_mut("params").and_then(toml::Value::as_table_mut) {
-            params.remove("repo");
-            params.remove("pane_type");
-            if params.is_empty() {
-                doc.remove("params");
-            }
+    if let Some(doc) = toml_value.as_table_mut()
+        && let Some(params) = doc.get_mut("params").and_then(toml::Value::as_table_mut)
+    {
+        params.remove("repo");
+        params.remove("pane_type");
+        if params.is_empty() {
+            doc.remove("params");
         }
     }
 
@@ -671,5 +429,5 @@ impl Entity for WarpConfig {
 impl SingletonEntity for WarpConfig {}
 
 #[cfg(test)]
-#[path = "mod_test.rs"]
+#[path = "mod_tests.rs"]
 mod tests;

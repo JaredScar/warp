@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
-use warpui::{Entity, ModelContext, SingletonEntity};
+
+use warpui_core::{Entity, ModelContext, SingletonEntity};
 
 // Global execution mode, for logic that runs outside the UI framework.
 static GLOBAL_EXECUTION_MODE: OnceLock<ExecutionMode> = OnceLock::new();
@@ -9,8 +10,12 @@ static GLOBAL_EXECUTION_MODE: OnceLock<ExecutionMode> = OnceLock::new();
 pub enum ExecutionMode {
     /// Warp is running as a normal desktop app.
     App,
+    /// Warp is running as the headless terminal UI.
+    Tui,
     /// Warp is running as a CLI.
     Sdk,
+    /// Warp is running as the remote server daemon.
+    RemoteServerDaemon,
 }
 
 impl ExecutionMode {
@@ -19,7 +24,29 @@ impl ExecutionMode {
     pub fn client_id(&self) -> &'static str {
         match self {
             ExecutionMode::App => "warp-app",
+            ExecutionMode::Tui => "warp-tui",
             ExecutionMode::Sdk => "warp-cli",
+            ExecutionMode::RemoteServerDaemon => "warp-remote-server-daemon",
+        }
+    }
+
+    /// Whether a CLI-based MCP server can fall back to inheriting this process's PATH when
+    /// no explicit `mcp_execution_path` setting is available.
+    ///
+    /// The desktop app keeps requiring a shell-derived path, so a failed MCP spawn surfaces
+    /// as an actionable toast instead of silently launching with the wrong PATH. The SDK CLI
+    /// and the TUI receive an authoritative PATH from their own launcher (an interactive shell
+    /// or a CLI invocation) before Warp starts, so inheriting it is safe and is the only PATH
+    /// available to a fresh SDK process before terminal bootstrap populates
+    /// `mcp_execution_path`. The remote server daemon is headless and long-lived with no user
+    /// present to open a terminal and populate that setting, and no window to show the
+    /// alternative's failure toast in, so it also inherits; since inheritance only ever fills
+    /// in a missing path rather than overriding a configured one, that's a better failure mode
+    /// than refusing to start the server.
+    pub fn can_inherit_process_path_for_mcp(&self) -> bool {
+        match self {
+            ExecutionMode::App => false,
+            ExecutionMode::Tui | ExecutionMode::Sdk | ExecutionMode::RemoteServerDaemon => true,
         }
     }
 }
@@ -40,14 +67,18 @@ impl AppExecutionMode {
         Self { mode, is_sandboxed }
     }
 
-    /// True if running as the full desktop app.
+    /// True if running as an interactive app client.
     fn is_app(&self) -> bool {
-        matches!(self.mode, ExecutionMode::App)
+        matches!(self.mode, ExecutionMode::App | ExecutionMode::Tui)
+    }
+    /// Whether Warp is running as the headless terminal UI.
+    pub fn is_tui(&self) -> bool {
+        matches!(self.mode, ExecutionMode::Tui)
     }
 
     /// Whether Active AI features are allowed in this execution mode.
     ///
-    /// Active AI should only run in the desktop app, where there's a user
+    /// Active AI should only run in interactive clients, where there's a user
     /// to engage with it.
     pub fn allows_active_ai(&self) -> bool {
         self.is_app()
@@ -66,7 +97,7 @@ impl AppExecutionMode {
 
     /// Whether the app can *automatically* update. This does not prevent manual updates.
     pub fn can_autoupdate(&self) -> bool {
-        self.is_app()
+        self.is_app() && cfg!(not(target_family = "wasm"))
     }
 
     /// Whether the app can automatically start MCP servers from the previous session.
@@ -88,22 +119,34 @@ impl AppExecutionMode {
     }
 
     /// Whether telemetry should be sent synchronously at shutdown.
-    /// In CLI mode, we synchronously send events at shutdown because there's a higher likelihood
-    /// that they will be lost otherwise.
+    /// In TUI, CLI, and daemon modes, we synchronously send events at shutdown because there's
+    /// a higher likelihood that they will be lost otherwise.
     pub fn send_telemetry_at_shutdown(&self) -> bool {
-        matches!(self.mode, ExecutionMode::Sdk)
+        matches!(
+            self.mode,
+            ExecutionMode::Tui | ExecutionMode::Sdk | ExecutionMode::RemoteServerDaemon
+        )
     }
 
     /// If true, the app is running autonomously, without a user present.
     /// Wherever possible, prefer more targeted capability checks like
     /// [`Self::can_autostart_mcp_servers`].
     pub fn is_autonomous(&self) -> bool {
-        matches!(self.mode, ExecutionMode::Sdk)
+        matches!(
+            self.mode,
+            ExecutionMode::Sdk | ExecutionMode::RemoteServerDaemon
+        )
     }
 
     /// Returns the client ID to report to the server.
     pub fn client_id(&self) -> &'static str {
         self.mode.client_id()
+    }
+
+    /// Whether a CLI-based MCP server can fall back to inheriting this process's PATH when
+    /// no explicit `mcp_execution_path` setting is available.
+    pub fn can_inherit_process_path_for_mcp(&self) -> bool {
+        self.mode.can_inherit_process_path_for_mcp()
     }
 
     /// If true, Warp is running in a sandbox like a Docker container or VM, rather than directly
@@ -119,7 +162,7 @@ impl Entity for AppExecutionMode {
 
 impl SingletonEntity for AppExecutionMode {}
 
-/// Returns the current global client ID string ("warp-app" or "warp-cli").
+/// Returns the current global client ID string.
 /// This is set when AppExecutionMode is constructed during application start.
 /// Returns None if the execution mode has not been set yet.
 pub fn current_client_id() -> Option<&'static str> {

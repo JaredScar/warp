@@ -12,7 +12,8 @@ use crate::{
         },
         blocklist::BlocklistAIPermissions,
         get_relevant_files::controller::{
-            GetRelevantFilesController, GetRelevantFilesError, GetRelevantFilesStatus,
+            GetRelevantFilesController, GetRelevantFilesError, GetRelevantFilesRequestTarget,
+            GetRelevantFilesStatus,
         },
         paths::host_native_absolute_path,
     },
@@ -20,8 +21,8 @@ use crate::{
 };
 
 use super::{
-    read_local_file_context, ActionExecution, AnyActionExecution, ExecuteActionInput,
-    PreprocessActionInput,
+    describe_failed_files, read_local_file_context, ActionExecution, AnyActionExecution,
+    ExecuteActionInput, PreprocessActionInput,
 };
 
 pub struct GetFilesExecutor {
@@ -199,7 +200,9 @@ impl GetFilesExecutor {
                             .get_relevant_files_controller
                             .update(ctx, |controller, ctx| {
                                 controller.send_request(
-                                    &current_working_directory,
+                                    GetRelevantFilesRequestTarget::Local {
+                                        directory: current_working_directory.clone(),
+                                    },
                                     query.clone(),
                                     partial_paths.as_ref(),
                                     id.clone(),
@@ -308,16 +311,16 @@ impl GetFilesExecutor {
         ActionExecution::Async {
             execute_future: Box::pin(async move {
                 let result =
-                    read_local_file_context(&files, current_working_directory, shell, None, None).await?;
-                if result.missing_files.is_empty() {
+                    read_local_file_context(&files, current_working_directory, shell, None, None)
+                        .await?;
+                if result.failed_files.is_empty() {
                     Ok(GetFilesResult::Success {
                         files: result.file_contexts,
                     })
                 } else {
-                    let missing_files = result.missing_files.join(", ");
+                    let failed_files = describe_failed_files(&result.failed_files);
                     Ok(GetFilesResult::Error(format!(
-                        "These files do not exist: {}",
-                        missing_files
+                        "Failed to read files: {failed_files}"
                     )))
                 }
             }),

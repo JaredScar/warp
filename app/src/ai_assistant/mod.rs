@@ -1,24 +1,22 @@
 //! AI Assistant has since been renamed to "Warp AI" in the product.
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
+use std::sync::Arc;
 
-use crate::{
-    ai::{RequestLimitInfo, RequestLimitRefreshDuration},
-    server::telemetry::OpenedWarpAISource,
-    terminal::model::terminal_model::BlockIndex,
-    workflows::workflow::{Argument, Workflow},
-};
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use pathfinder_color::ColorU;
 use serde::{Deserialize, Serialize};
 use warp_core::command::ExitCode;
-use warp_graphql::{
-    ai::{
-        RequestLimitInfo as RequestLimitInfoGraphql,
-        RequestLimitRefreshDuration as RequestLimitRefreshDurationGraphql,
-    },
-    mutations::generate_commands::{GenerateCommandsFailureType, GeneratedCommand},
+use warp_graphql::ai::{
+    RequestLimitInfo as RequestLimitInfoGraphql,
+    RequestLimitRefreshDuration as RequestLimitRefreshDurationGraphql,
 };
+use warp_graphql::mutations::generate_commands::{GenerateCommandsFailureType, GeneratedCommand};
+
+use crate::ai::{RequestLimitInfo, RequestLimitRefreshDuration};
+use crate::server::telemetry::OpenedWarpAISource;
+use crate::terminal::model::terminal_model::BlockIndex;
+use crate::workflows::workflow::{Argument, Workflow};
 
 pub mod execution_context;
 pub mod panel;
@@ -164,6 +162,8 @@ impl From<RequestLimitInfoGraphql> for RequestLimitInfo {
             is_unlimited: value.is_unlimited,
             limit: value.request_limit as usize,
             num_requests_used_since_refresh: value.requests_used_since_last_refresh as usize,
+            included_usage_cents: value.included_usage_cents,
+            usage_cents_used_since_last_refresh: value.usage_cents_used_since_last_refresh,
             next_refresh_time: value.next_refresh_time,
             request_limit_refresh_duration: value.request_limit_refresh_duration.into(),
             is_unlimited_voice: value.is_unlimited_voice,

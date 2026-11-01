@@ -1,52 +1,55 @@
-use std::{
-    borrow::Cow,
-    env,
-    ffi::OsStr,
-    path::{self, Path},
-};
+use warp_util::local_or_remote_path::LocalOrRemotePath;
+pub use warp_util::path::*;
+use warpui::{AppContext, SingletonEntity};
 
-use is_executable::IsExecutable as _;
-use itertools::Itertools as _;
+use crate::remote_server::manager::RemoteServerManager;
 
-pub fn file_exists_and_is_executable(path: &Path) -> bool {
-    // We need to check that the file exists, as the `is_executable` crate doesn't validate this on
-    // Windows.
-    path.is_file() && path.is_executable()
-}
+/// Fallback label used when a `RemotePath`'s host is not currently tracked.
+/// Matches the fallback in `terminal::writeable_pty::remote_server_controller::connection_label_from_user_and_host`.
+const UNKNOWN_HOST_LABEL: &str = "Remote host";
 
-/// Resolves `command` into an executable path, matching the shell's search behavior.
-/// If the command contains a path separator, it should resolve to an executable
-/// file. Otherwise, it should exist in the process's `PATH`.
-///
-/// Callers that need to resolve against a different PATH (e.g. one
-/// captured from the user's interactive login shell) should use
-/// [`resolve_executable_in_path`] directly.
-pub fn resolve_executable(command: &str) -> Option<Cow<'_, Path>> {
-    let path_var = env::var_os("PATH").unwrap_or_default();
-    resolve_executable_in_path(command, &path_var)
-}
-
-/// Like [`resolve_executable`], but resolves PATH-based lookups against
-/// the given `path_env` instead of the process's own `PATH`.
-///
-/// Intended for callers that have a specific PATH to search (e.g. one
-/// captured from the user's interactive login shell, matching how
-/// MCP/LSP find binaries). Callers that want the process's PATH should
-/// use [`resolve_executable`] instead.
-pub fn resolve_executable_in_path<'a>(command: &'a str, path_env: &OsStr) -> Option<Cow<'a, Path>> {
-    if command.contains(path::MAIN_SEPARATOR) {
-        let path = Path::new(command);
-        return file_exists_and_is_executable(path).then_some(Cow::Borrowed(path));
-    }
-    for path_dir in env::split_paths(path_env).unique() {
-        let resolved = path_dir.join(command);
-        if file_exists_and_is_executable(&resolved) {
-            return Some(Cow::Owned(resolved));
+/// Returns the display name of a local or remote path, prefixed with the
+/// host label for remote paths.
+pub fn display_name_with_host(path: &LocalOrRemotePath, ctx: &AppContext) -> String {
+    let name = path.display_name();
+    match path {
+        LocalOrRemotePath::Local(_) => name.to_string(),
+        LocalOrRemotePath::Remote(remote) => {
+            let host_label = RemoteServerManager::as_ref(ctx)
+                .host_label(&remote.host_id)
+                .unwrap_or(UNKNOWN_HOST_LABEL);
+            format!("{host_label}:{name}")
         }
     }
-    None
 }
 
-#[cfg(test)]
-#[path = "path_test.rs"]
-mod tests;
+/// Returns the display path of a local or remote path,
+/// prefixed with the host label for remote paths.
+///
+/// When `abbreviate_home` is true, local paths under the user's home directory
+/// are abbreviated with a `~/` prefix. The flag is ignored for remote paths,
+/// whose home directory lives on a different machine.
+pub fn display_path_with_host(
+    path: &LocalOrRemotePath,
+    abbreviate_home: bool,
+    ctx: &AppContext,
+) -> String {
+    match path {
+        LocalOrRemotePath::Local(local_path) => {
+            if abbreviate_home {
+                dirs::home_dir()
+                    .and_then(|home| local_path.strip_prefix(&home).ok())
+                    .map(|relative| format!("~/{}", relative.display()))
+                    .unwrap_or_else(|| local_path.display().to_string())
+            } else {
+                path.display_path()
+            }
+        }
+        LocalOrRemotePath::Remote(remote) => {
+            let host_label = RemoteServerManager::as_ref(ctx)
+                .host_label(&remote.host_id)
+                .unwrap_or(UNKNOWN_HOST_LABEL);
+            format!("{host_label}:{}", path.display_path())
+        }
+    }
+}

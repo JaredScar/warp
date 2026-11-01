@@ -1,21 +1,19 @@
 mod helper;
 mod model_impl;
 
+use chrono::{DateTime, Local, TimeDelta};
 pub use helper::AIBlockModelHelper;
 pub use model_impl::*;
 use session_sharing_protocol::common::ParticipantId;
 use warp_core::features::FeatureFlag;
-
-use crate::ai::{
-    agent::{
-        conversation::AIConversationId, AIAgentExchangeId, AIAgentInput, AIAgentOutput,
-        CancellationReason, PassiveSuggestionTrigger, PassiveSuggestionTriggerType,
-        RenderableAIError, ServerOutputId, Shared,
-    },
-    llms::LLMId,
-};
-use chrono::TimeDelta;
 use warpui::{AppContext, ViewContext};
+
+use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent::{
+    AIAgentExchangeId, AIAgentInput, AIAgentOutput, CancellationReason, PassiveSuggestionTrigger,
+    PassiveSuggestionTriggerType, RenderableAIError, ServerOutputId, Shared,
+};
+use crate::ai::llms::LLMId;
 
 #[derive(Debug, Clone, Copy)]
 pub enum PassiveRequestType {
@@ -184,6 +182,9 @@ pub trait AIBlockModel {
     fn time_since_request_start(&self, _app: &AppContext) -> Option<TimeDelta> {
         None
     }
+    fn query_sent_at(&self, _app: &AppContext) -> Option<DateTime<Local>> {
+        None
+    }
 
     /// Returns the [`LLMId`] for the base model used to generate output in this block.
     fn base_model<'a>(&'a self, app: &'a AppContext) -> Option<&'a LLMId>;
@@ -222,22 +223,28 @@ pub trait AIBlockModel {
 pub mod testing {
     use warpui::{AppContext, ViewContext};
 
-    use crate::ai::{
-        agent::{
-            conversation::AIConversationId, AIAgentInput, AIAgentOutput, ServerOutputId, Shared,
-        },
-        blocklist::{
-            model::{AIRequestType, PassiveRequestType, PassiveSuggestionTriggerType},
-            AIBlock,
-        },
-        llms::LLMId,
-    };
-
     use super::{AIBlockModel, AIBlockOutputStatus, OutputStatusUpdateCallback};
+    use crate::ai::agent::conversation::AIConversationId;
+    use crate::ai::agent::{
+        AIAgentInput, AIAgentOutput, CancellationReason, ServerOutputId, Shared,
+    };
+    use crate::ai::blocklist::AIBlock;
+    use crate::ai::blocklist::model::{
+        AIRequestType, PassiveRequestType, PassiveSuggestionTriggerType,
+    };
+    use crate::ai::llms::LLMId;
+
+    /// The output shape a [`FakeAIBlockModel`] reports, mirroring the streaming,
+    /// successful, and cancelled states of a live block.
+    enum FakeOutput {
+        Streaming,
+        Complete(Shared<AIAgentOutput>),
+        Cancelled(Shared<AIAgentOutput>),
+    }
 
     pub struct FakeAIBlockModel {
         input: Vec<AIAgentInput>,
-        output: Shared<AIAgentOutput>,
+        output: FakeOutput,
         model_id: LLMId,
     }
 
@@ -245,7 +252,27 @@ pub mod testing {
         pub fn new(input: Vec<AIAgentInput>, output: AIAgentOutput) -> Self {
             Self {
                 input,
-                output: Shared::new(output),
+                output: FakeOutput::Complete(Shared::new(output)),
+                model_id: "fake-llm".to_owned().into(),
+            }
+        }
+
+        /// Builds a fake model whose status stays [`AIBlockOutputStatus::Pending`],
+        /// modeling a block that is still streaming output.
+        pub fn new_streaming(input: Vec<AIAgentInput>) -> Self {
+            Self {
+                input,
+                output: FakeOutput::Streaming,
+                model_id: "fake-llm".to_owned().into(),
+            }
+        }
+
+        /// Builds a fake model for a block whose stream was cancelled by the
+        /// user partway through, keeping `output` as the partial output.
+        pub fn new_cancelled(input: Vec<AIAgentInput>, output: AIAgentOutput) -> Self {
+            Self {
+                input,
+                output: FakeOutput::Cancelled(Shared::new(output)),
                 model_id: "fake-llm".to_owned().into(),
             }
         }
@@ -255,8 +282,15 @@ pub mod testing {
         type View = AIBlock;
 
         fn status(&self, _app: &AppContext) -> AIBlockOutputStatus {
-            AIBlockOutputStatus::Complete {
-                output: self.output.clone(),
+            match &self.output {
+                FakeOutput::Streaming => AIBlockOutputStatus::Pending,
+                FakeOutput::Complete(output) => AIBlockOutputStatus::Complete {
+                    output: output.clone(),
+                },
+                FakeOutput::Cancelled(output) => AIBlockOutputStatus::Cancelled {
+                    partial_output: Some(output.clone()),
+                    reason: CancellationReason::ManuallyCancelled,
+                },
             }
         }
 

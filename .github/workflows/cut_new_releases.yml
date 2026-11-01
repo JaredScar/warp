@@ -30,6 +30,7 @@ jobs:
   get_config:
     name: Get release configuration
     runs-on: ubuntu-latest
+    if: github.repository_owner == 'warpdotdev'
     env:
       SCHEDULE: ${{ github.event.schedule }}
       TARGETS: ${{ inputs.targets }}
@@ -40,7 +41,7 @@ jobs:
         run: |
           [ $GITHUB_REF == "refs/heads/master" ] || (echo "::error::Can only cut new releases on the master branch" && exit 1)
         shell: bash
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - id: get-config
         run: |
           # Check to see if this was auto-run as a cron job.  If so, set the 
@@ -70,6 +71,9 @@ jobs:
   create_release:
     name: Create Release
     uses: ./.github/workflows/create_release.yml
+    permissions:
+      contents: write # create_release.yml pushes the release branch/tag and creates and uploads the GitHub release; a reusable-workflow caller must grant everything its callee declares
+      id-token: write # create_release.yml federates its OIDC token to GCP and Octo STS
     needs: get_config
     strategy:
       fail-fast: false
@@ -84,10 +88,18 @@ jobs:
     needs:
       - create_release
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write # octo-sts/action exchanges the job's OIDC token for a scoped GitHub token
     steps:
+      - name: Mint channel-versions token
+        id: app_token
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05 # v1.1.1
+        with:
+          scope: warpdotdev/channel-versions
+          identity: warp-internal-dispatch
       - name: Invoke update workflow in channel-versions repository
         uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
         with:
           repository: warpdotdev/channel-versions
-          token: ${{ secrets.CHANNEL_VERSIONS_REPOSITORY_DISPATCH_TOKEN }}
+          token: ${{ steps.app_token.outputs.token }}
           event-type: update-channel-versions

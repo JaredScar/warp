@@ -1,13 +1,9 @@
 //! This module contains test-only APIs and utils for testing the completions engine.
-#[cfg(feature = "v2")]
-mod v2;
 
-use std::{
-    collections::{HashMap, HashSet},
-    ops::Deref,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use smol_str::SmolStr;
@@ -16,18 +12,15 @@ use warp_command_signatures::IconType;
 use warp_core::command::ExitCode;
 use warp_util::path::{EscapeChar, ShellFamily, TEST_SESSION_HOME_DIR};
 
-use crate::{
-    completer::{
-        CommandOutput, CompletionContext, Description, EngineDirEntry, EngineFileType,
-        GeneratorContext, PathCompletionContext, Suggestion, TopLevelCommandCaseSensitivity,
-    },
-    signatures::{
-        testing::{TEST_ALIAS_COMMAND, TEST_GENERATOR_1_COMMAND, TEST_GENERATOR_2_COMMAND},
-        CommandRegistry,
-    },
-};
-
 use super::{CommandExitStatus, MatchedSuggestion, PathSeparators};
+use crate::completer::{
+    CommandOutput, CompletionContext, Description, EngineDirEntry, EngineFileType,
+    GeneratorContext, PathCompletionContext, Suggestion, TopLevelCommandCaseSensitivity,
+};
+use crate::signatures::CommandRegistry;
+use crate::signatures::testing::{
+    TEST_ALIAS_COMMAND, TEST_GENERATOR_1_COMMAND, TEST_GENERATOR_2_COMMAND,
+};
 
 impl EngineDirEntry {
     pub fn test_file(file_name: &str) -> Self {
@@ -141,6 +134,7 @@ impl GeneratorContext for MockGeneratorContext {
 #[derive(Debug, Clone)]
 pub struct MockPathCompletionContext {
     home_directory: Option<String>,
+    cdpath: Option<String>,
     pwd: TypedPathBuf,
     directory_to_entries: HashMap<PathBuf, Vec<EngineDirEntry>>,
 }
@@ -149,6 +143,7 @@ impl MockPathCompletionContext {
     pub fn new(pwd: TypedPathBuf) -> Self {
         Self {
             home_directory: TEST_SESSION_HOME_DIR.clone(),
+            cdpath: None,
             pwd,
             directory_to_entries: HashMap::new(),
         }
@@ -156,6 +151,11 @@ impl MockPathCompletionContext {
 
     pub fn with_home_directory(mut self, home_directory: String) -> Self {
         self.home_directory = Some(home_directory);
+        self
+    }
+
+    pub fn with_cdpath(mut self, cdpath: String) -> Self {
+        self.cdpath = Some(cdpath);
         self
     }
 
@@ -233,6 +233,10 @@ impl PathCompletionContext for MockPathCompletionContext {
         self.home_directory.as_deref()
     }
 
+    fn cdpath(&self) -> Option<&str> {
+        self.cdpath.as_deref()
+    }
+
     fn pwd(&self) -> TypedPath<'_> {
         self.pwd.to_path()
     }
@@ -258,9 +262,6 @@ pub struct FakeCompletionContext {
     shell_family: Option<ShellFamily>,
 
     command_registry: CommandRegistry,
-
-    #[cfg(feature = "v2")]
-    js_ctx: v2::FakeJsExecutionContext,
 }
 
 impl FakeCompletionContext {
@@ -279,9 +280,6 @@ impl FakeCompletionContext {
             command_case_sensitivity: TopLevelCommandCaseSensitivity::CaseInsensitive,
             escape_char: EscapeChar::Backslash,
             shell_family: None,
-
-            #[cfg(feature = "v2")]
-            js_ctx: v2::FakeJsExecutionContext {},
         }
     }
 
@@ -362,11 +360,6 @@ impl CompletionContext for FakeCompletionContext {
         self.generator_context
             .as_ref()
             .map(|context| context as &dyn GeneratorContext)
-    }
-
-    #[cfg(feature = "v2")]
-    fn js_context(&self) -> Option<&dyn crate::completer::context::JsExecutionContext> {
-        Some(&self.js_ctx)
     }
 
     fn top_level_commands(&self) -> Box<dyn Iterator<Item = &str> + '_> {

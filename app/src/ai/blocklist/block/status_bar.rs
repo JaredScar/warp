@@ -1,89 +1,76 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
 
-use super::{
-    cli_controller::{CLISubagentController, CLISubagentEvent, UserTakeOverReason},
-    model::{AIBlockModel, AIBlockModelImpl, AIBlockOutputStatus},
-    view_impl::common::{
-        render_switch_control_to_user_button, render_warping_indicator,
-        render_warping_indicator_base, ButtonProps, ForceRefreshButtonProps, MaybeShimmeringText,
-        WarpingIndicatorProps, WarpingProps, LOAD_OUTPUT_MESSAGE, WAITING_FOR_USER_INPUT_MESSAGE,
-    },
-};
-use crate::{
-    ai::agent_tips::AITipModel,
-    terminal::{
-        input::buffer_model::InputBufferUpdateEvent,
-        view::ambient_agent::is_cloud_agent_pre_first_exchange,
-    },
-};
-use crate::{
-    ai::blocklist::agent_view::{
-        agent_view_bg_fill, child_agent_status_card::ChildAgentStatusCard, AgentMessageBar,
-        AgentViewController, EphemeralMessageModel,
-    },
-    terminal::input::{
-        buffer_model::InputBufferModel,
-        message_bar::common::render_standard_message_bar,
-        message_bar::{Message, MessageItem},
-        slash_command_model::SlashCommandModel,
-        suggestions_mode_model::InputSuggestionsModeModel,
-    },
-};
-use warp_multi_agent_api as api;
-
-use crate::{
-    ai::{
-        agent::{
-            conversation::AIConversationId, icons, AIAgentExchangeId, AIAgentOutput,
-            AIAgentOutputMessageType, CancellationReason, SummarizationType,
-        },
-        blocklist::{
-            agent_view::shortcuts::AgentShortcutViewModel,
-            ai_brand_color,
-            model::AIBlockModelHelper,
-            summarization_cancel_dialog::{
-                self, SummarizationCancelDialog, SummarizationCancelDialogEvent,
-            },
-            BlocklistAIActionEvent, BlocklistAIActionModel, BlocklistAIContextEvent,
-            BlocklistAIContextModel, BlocklistAIController, BlocklistAIHistoryEvent,
-            BlocklistAIInputEvent, BlocklistAIInputModel, ResponseStreamId,
-        },
-        llms::LLMPreferences,
-        AgentTip,
-    },
-    send_telemetry_from_app_ctx,
-    server::telemetry::TelemetryEvent,
-    settings::{InputModeSettings, InputSettings},
-    settings_view::keybindings::KeybindingChangedNotifier,
-    terminal::{
-        input::SET_INPUT_MODE_TERMINAL_ACTION_NAME,
-        model::block::LONG_RUNNING_COMMAND_DURATION_MS,
-        model_events::{ModelEvent, ModelEventDispatcher},
-        view::ambient_agent::{AmbientAgentViewModel, AmbientAgentViewModelEvent},
-        warpify::render::LEFT_STRIPE_WIDTH,
-        TerminalModel, CANCEL_COMMAND_KEYBINDING, TOGGLE_AUTOEXECUTE_MODE_KEYBINDING,
-        TOGGLE_HIDE_CLI_RESPONSES_KEYBINDING, TOGGLE_QUEUE_NEXT_PROMPT_KEYBINDING,
-    },
-    util::bindings::keybinding_name_to_keystroke,
-    BlocklistAIHistoryModel,
-};
 use instant::Instant;
+use markdown_parser::FormattedTextFragment;
 use parking_lot::FairMutex;
 use pathfinder_color::ColorU;
-use warp_core::{
-    features::FeatureFlag,
-    ui::{appearance::Appearance, theme::Fill, Icon as CoreIcon},
-};
+use warp_core::channel::{Channel, ChannelState};
+use warp_core::features::FeatureFlag;
+use warp_core::ui::Icon as CoreIcon;
+use warp_core::ui::appearance::Appearance;
+use warp_core::ui::theme::Fill;
+use warpui::r#async::{SpawnedFutureHandle, Timer};
 use warpui::elements::shimmering_text::ShimmeringTextStateHandle;
+use warpui::elements::{Border, Container, Empty, Flex, MouseStateHandle, ParentElement, Text};
+use warpui::keymap::Keystroke;
+use warpui::presenter::ChildView;
 use warpui::{
-    elements::{Border, Container, Empty, Flex, MouseStateHandle, ParentElement, Text},
-    keymap::Keystroke,
-    presenter::ChildView,
-    r#async::SpawnedFutureHandle,
-    AppContext, Element, Entity, EntityId, ModelHandle, SingletonEntity, View, ViewContext,
-    ViewHandle,
+    AppContext, Element, Entity, EntityId, ModelHandle, SingletonEntity, TypedActionView, View,
+    ViewContext, ViewHandle,
 };
-use warpui::{r#async::Timer, TypedActionView};
+
+use super::cli_controller::{CLISubagentController, CLISubagentEvent, UserTakeOverReason};
+use super::model::{AIBlockModel, AIBlockModelImpl, AIBlockOutputStatus};
+use super::view_impl::common::{
+    AutoExecuteButtonProps, ButtonProps, ForceRefreshButtonProps, LOAD_OUTPUT_MESSAGE,
+    MaybeShimmeringText, STATUS_MESSAGE_ELLIPSIS, WAITING_FOR_USER_INPUT_MESSAGE,
+    WarpingIndicatorProps, WarpingProps, render_switch_control_to_user_button,
+    render_warping_indicator, render_warping_indicator_base, status_message_naming_model,
+};
+use crate::ai::AgentTip;
+use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::agent::{
+    AIAgentExchangeId, AIAgentOutput, AIAgentOutputMessageType, CancellationReason,
+    OutputModelInfo, SummarizationType, icons,
+};
+use crate::ai::agent_tips::AITipModel;
+use crate::ai::blocklist::agent_view::shortcuts::AgentShortcutViewModel;
+use crate::ai::blocklist::agent_view::{
+    AgentMessageBar, AgentViewController, EphemeralMessageModel, is_in_cloud_context,
+};
+use crate::ai::blocklist::model::AIBlockModelHelper;
+use crate::ai::blocklist::summarization_cancel_dialog::{
+    self, SummarizationCancelDialog, SummarizationCancelDialogEvent,
+};
+use crate::ai::blocklist::{
+    BlocklistAIActionEvent, BlocklistAIActionModel, BlocklistAIContextEvent,
+    BlocklistAIContextModel, BlocklistAIController, BlocklistAIHistoryEvent, BlocklistAIInputEvent,
+    BlocklistAIInputModel, QueuedQueryEvent, QueuedQueryModel, ResponseStreamId, ai_brand_color,
+};
+use crate::ai::llms::LLMPreferences;
+use crate::server::server_api::ServerApiProvider;
+use crate::server::telemetry::TelemetryEvent;
+use crate::settings::{InputModeSettings, InputSettings, PrivacySettings};
+use crate::settings_view::keybindings::KeybindingChangedNotifier;
+use crate::terminal::input::buffer_model::{InputBufferModel, InputBufferUpdateEvent};
+use crate::terminal::input::message_bar::common::render_wrapping_standard_message_bar;
+use crate::terminal::input::slash_command_model::SlashCommandModel;
+use crate::terminal::input::suggestions_mode_model::InputSuggestionsModeModel;
+use crate::terminal::input::{HandoffComposeState, SET_INPUT_MODE_TERMINAL_ACTION_NAME};
+use crate::terminal::model::block::LONG_RUNNING_COMMAND_DURATION_MS;
+use crate::terminal::model_events::{ModelEvent, ModelEventDispatcher};
+use crate::terminal::view::ambient_agent::{
+    AmbientAgentViewModel, AmbientAgentViewModelEvent, is_cloud_agent_pre_first_exchange,
+};
+use crate::terminal::warpify::render::LEFT_STRIPE_WIDTH;
+use crate::terminal::{
+    CANCEL_COMMAND_KEYBINDING, TOGGLE_AUTOEXECUTE_MODE_KEYBINDING,
+    TOGGLE_HIDE_CLI_RESPONSES_KEYBINDING, TOGGLE_QUEUE_NEXT_PROMPT_KEYBINDING, TerminalModel,
+};
+use crate::util::bindings::keybinding_name_to_keystroke;
+use crate::{BlocklistAIHistoryModel, send_telemetry_from_app_ctx};
 
 pub fn init(app: &mut AppContext) {
     summarization_cancel_dialog::init(app);
@@ -96,7 +83,6 @@ struct StateHandles {
     stop_button: MouseStateHandle,
     take_over_button: MouseStateHandle,
     hide_cli_responses_button: MouseStateHandle,
-    github_auth_link: MouseStateHandle,
     /// Tracks hover/press state for the inline `Check now` affordance rendered next to
     /// `Last seen by agent ...` while the agent is polling a long-running command.
     force_refresh_button: MouseStateHandle,
@@ -139,7 +125,6 @@ pub struct BlocklistAIStatusBar {
 
     ephemeral_message_model: ModelHandle<EphemeralMessageModel>,
     agent_message_bar: ViewHandle<AgentMessageBar>,
-    child_agent_status_card: ViewHandle<ChildAgentStatusCard>,
 }
 
 impl BlocklistAIStatusBar {
@@ -159,13 +144,35 @@ impl BlocklistAIStatusBar {
         input_suggestions_model: ModelHandle<InputSuggestionsModeModel>,
         slash_command_model: ModelHandle<SlashCommandModel>,
         ephemeral_message_model: ModelHandle<EphemeralMessageModel>,
+        handoff_compose_state: ModelHandle<HandoffComposeState>,
         terminal_view_id: EntityId,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
         let history_model = BlocklistAIHistoryModel::handle(ctx);
         ctx.subscribe_to_model(&history_model, move |me, _, event, ctx| {
+            match event {
+                BlocklistAIHistoryEvent::UpdatedStreamingExchange {
+                    exchange_id,
+                    conversation_id,
+                    ..
+                } => {
+                    if let Some(model) = me.active_exchange_model.as_ref() {
+                        if model.exchange_id(ctx) == Some(*exchange_id) {
+                            me.on_updated_active_exchange_output(ctx);
+                        } else if model.conversation_id(ctx) == Some(*conversation_id) {
+                            ctx.notify();
+                        }
+                    }
+                    return;
+                }
+                BlocklistAIHistoryEvent::ConversationUsageMetadataUpdated { .. } => {
+                    ctx.notify();
+                    return;
+                }
+                _ => (),
+            }
             if event
-                .terminal_view_id()
+                .terminal_surface_id()
                 .is_some_and(|id| id != terminal_view_id)
             {
                 return;
@@ -182,7 +189,7 @@ impl BlocklistAIStatusBar {
                     }
                     me.reset_model_for_exchange(*exchange_id, *conversation_id, ctx);
                 }
-                BlocklistAIHistoryEvent::ClearedConversationsInTerminalView { .. } => {
+                BlocklistAIHistoryEvent::ClearedConversationsForTerminalSurface { .. } => {
                     me.active_exchange_model = None;
                     ctx.notify();
                 }
@@ -225,10 +232,15 @@ impl BlocklistAIStatusBar {
             }
         });
         ctx.subscribe_to_model(&context_model, |_, _, event, ctx| {
+            if matches!(event, BlocklistAIContextEvent::PendingQueryStateUpdated) {
+                ctx.notify();
+            }
+        });
+        ctx.subscribe_to_model(&QueuedQueryModel::handle(ctx), |_, _, event, ctx| {
             if matches!(
                 event,
-                BlocklistAIContextEvent::PendingQueryStateUpdated
-                    | BlocklistAIContextEvent::QueueNextPromptToggled
+                QueuedQueryEvent::QueueNextPromptToggled { .. }
+                    | QueuedQueryEvent::DefaultModeChanged
             ) {
                 ctx.notify();
             }
@@ -294,6 +306,11 @@ impl BlocklistAIStatusBar {
             ctx.notify();
         });
 
+        ctx.observe(&AITipModel::handle(ctx), |me, tip_model, ctx| {
+            me.current_tip = tip_model.as_ref(ctx).current_tip().cloned();
+            ctx.notify();
+        });
+
         let summarization_cancel_dialog =
             ctx.add_typed_action_view(|_| SummarizationCancelDialog::default());
         ctx.subscribe_to_view(
@@ -338,7 +355,7 @@ impl BlocklistAIStatusBar {
             ctx.notify();
         });
 
-        let agent_message_bar = ctx.add_view(|ctx| {
+        let agent_message_bar = ctx.add_typed_action_view(|ctx| {
             AgentMessageBar::new(
                 agent_view_controller.clone(),
                 ephemeral_message_model.clone(),
@@ -348,32 +365,13 @@ impl BlocklistAIStatusBar {
                 input_suggestions_model,
                 slash_command_model,
                 context_model.clone(),
+                handoff_compose_state,
                 terminal_model.clone(),
                 ctx,
             )
         });
 
-        let child_agent_status_card = ctx.add_typed_action_view(|ctx| {
-            ChildAgentStatusCard::new(agent_view_controller.clone(), ctx)
-        });
-        if let Some(ambient_agent_view_model) = ambient_agent_view_model.as_ref() {
-            ctx.subscribe_to_model(ambient_agent_view_model, |me, _, event, ctx| match event {
-                AmbientAgentViewModelEvent::DispatchedAgent
-                | AmbientAgentViewModelEvent::ProgressUpdated => {
-                    me.update_agent_tip(ctx);
-                    ctx.notify();
-                }
-                AmbientAgentViewModelEvent::SessionReady { .. }
-                | AmbientAgentViewModelEvent::Failed { .. }
-                | AmbientAgentViewModelEvent::NeedsGithubAuth
-                | AmbientAgentViewModelEvent::Cancelled => {
-                    ctx.notify();
-                }
-                _ => (),
-            });
-        }
-
-        Self {
+        let mut me = Self {
             active_exchange_model: None,
             shimmering_text_handle: ShimmeringTextStateHandle::new(),
             action_model,
@@ -395,12 +393,52 @@ impl BlocklistAIStatusBar {
             summarization_timer_handle: None,
             summarization_start_time: None,
             last_read_refresh_handle: None,
-            ambient_agent_view_model,
+            ambient_agent_view_model: None,
             current_tip: None,
             ephemeral_message_model,
             agent_message_bar,
-            child_agent_status_card,
+        };
+        // Route ambient wiring through the setter so construction and the lazy shared-session
+        // viewer path share one implementation.
+        if let Some(ambient_agent_view_model) = ambient_agent_view_model {
+            me.set_ambient_agent_view_model(ambient_agent_view_model, ctx);
         }
+        me
+    }
+
+    /// Attaches an ambient agent view model to an already-constructed status bar. Used on the
+    /// shared-session viewer path where the model is created lazily at `SessionJoined` (a raw
+    /// `shared_session` link that turns out to be a cloud run), after the status bar was built
+    /// with `None`. Without this, `render_cloud_mode_setup_status` has no model and the
+    /// "connecting to host / creating environment" progress never renders for the viewer's
+    /// follow-up. Wires the same subscription as [`Self::new`] so the status bar re-renders as
+    /// setup progress updates. Idempotent: a no-op when a model is already set.
+    pub fn set_ambient_agent_view_model(
+        &mut self,
+        view_model: ModelHandle<AmbientAgentViewModel>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.ambient_agent_view_model.is_some() {
+            return;
+        }
+        ctx.subscribe_to_model(&view_model, |me, _, event, ctx| match event {
+            AmbientAgentViewModelEvent::DispatchedAgent
+            | AmbientAgentViewModelEvent::FollowupDispatched
+            | AmbientAgentViewModelEvent::ProgressUpdated => {
+                me.update_agent_tip(ctx);
+                ctx.notify();
+            }
+            AmbientAgentViewModelEvent::SessionReady { .. }
+            | AmbientAgentViewModelEvent::ExecutionSessionReady { .. }
+            | AmbientAgentViewModelEvent::Failed { .. }
+            | AmbientAgentViewModelEvent::NeedsGithubAuth
+            | AmbientAgentViewModelEvent::Cancelled => {
+                ctx.notify();
+            }
+            _ => (),
+        });
+        self.ambient_agent_view_model = Some(view_model);
+        ctx.notify();
     }
 
     pub fn should_show_summarization_cancel_dialog(&self, app: &AppContext) -> bool {
@@ -478,13 +516,7 @@ impl BlocklistAIStatusBar {
                     )
                     .ok()
                 })
-                .map(|model| {
-                    model.on_updated_output(
-                        Box::new(|me, ctx| me.on_updated_active_exchange_output(ctx)),
-                        ctx,
-                    );
-                    Box::new(model) as Box<dyn AIBlockModel<View = BlocklistAIStatusBar>>
-                });
+                .map(|model| Box::new(model) as Box<dyn AIBlockModel<View = BlocklistAIStatusBar>>);
             self.is_summarization_cancel_dialog_open = false;
             self.stop_summarization_timer();
 
@@ -735,6 +767,7 @@ impl BlocklistAIStatusBar {
                     },
                     ctx
                 );
+                send_agent_tip_shown_analytics_event(tip.description.clone(), ctx);
             }
         } else {
             self.current_tip = None;
@@ -797,29 +830,25 @@ impl BlocklistAIStatusBar {
 
         let output_status = model.status(app);
         let output_to_render = output_status.output_to_render();
-        let (current_is_fallback, current_display_name) = output_to_render
-            .as_ref()
-            .and_then(|o| {
-                let o = o.get();
-                let m = o.model_info.as_ref()?;
-                Some((Some(m.is_fallback), Some(m.display_name.clone())))
-            })
-            .unwrap_or((None, None));
+        let current_model_in_use = output_to_render.as_ref().and_then(|output| {
+            let output = output.get();
+            output.model_info.as_ref().map(ModelInUse::from)
+        });
 
-        let fallback_warping_text = resolve_fallback_warping_message(
-            current_is_fallback,
-            current_display_name,
-            model.as_ref(),
-            app,
+        let model_warping_message =
+            resolve_warping_model_message(current_model_in_use, model.as_ref(), app);
+        let default_warping_text = model_warping_message.as_ref().map_or_else(
+            || LOAD_OUTPUT_MESSAGE.to_owned(),
+            |message| message.text.clone(),
         );
-        let default_warping_text = fallback_warping_text
-            .as_deref()
-            .unwrap_or(LOAD_OUTPUT_MESSAGE)
-            .to_owned();
-        let secondary_element = if fallback_warping_text.is_some() {
-            Some(render_fallback_explanation(model.as_ref(), app))
-        } else {
-            self.render_tip(app)
+        let model_in_use_name = model_warping_message
+            .as_ref()
+            .and_then(|message| message.model_display_name.clone());
+        let secondary_element = match &model_warping_message {
+            Some(message) if message.show_fallback_explanation => {
+                Some(render_fallback_explanation(model.as_ref(), app))
+            }
+            _ => self.render_tip(app),
         };
 
         Some(render_warping_indicator(
@@ -828,25 +857,28 @@ impl BlocklistAIStatusBar {
                 terminal_model: &terminal_model,
                 action_model: self.action_model.as_ref(app),
                 shimmering_text_handle: &self.shimmering_text_handle,
+                model_in_use_name,
                 summarization_start_time: self.summarization_start_time,
                 auto_execute_button: (!model.request_type(app).is_passive_code_diff()).then_some(
-                    ButtonProps {
+                    AutoExecuteButtonProps {
                         button_handle: &self.state_handles.autoexecute_button,
                         keystroke: self.autoexecute_keystroke.as_ref(),
                         is_active: model
                             .conversation(app)
                             .map(|c| c.autoexecute_any_action())
                             .unwrap_or(false),
+                        is_locked: is_in_cloud_context(&terminal_model),
                     },
                 ),
                 queue_next_prompt_button: FeatureFlag::QueueSlashCommand.is_enabled().then_some(
                     ButtonProps {
                         button_handle: &self.state_handles.queue_next_prompt_button,
                         keystroke: self.queue_next_prompt_keystroke.as_ref(),
-                        is_active: self
-                            .context_model
-                            .as_ref(app)
-                            .is_queue_next_prompt_enabled(),
+                        is_active: QueuedQueryModel::as_ref(app).is_queue_next_prompt_enabled(
+                            conversation.id(),
+                            active_block,
+                            app,
+                        ),
                     },
                 ),
                 stop_button: Some(ButtonProps {
@@ -886,14 +918,16 @@ impl BlocklistAIStatusBar {
             .as_ref()
             .map(|ambient_agent_view_model| ambient_agent_view_model.as_ref(app))?;
 
+        // The step indicator is only meaningful while a spawn is in flight. Terminal states
+        // (`Failed`, `NeedsGithubAuth`, `Cancelled`) still carry an `AgentProgress` for
+        // telemetry purposes, so guard on `is_waiting_for_session()` rather than relying on
+        // `agent_progress()` being `None`.
+        if !ambient_agent_model.is_waiting_for_session() {
+            return None;
+        }
+
         let progress = ambient_agent_model.agent_progress()?;
-        let progress_text = if progress.harness_started_at.is_some() {
-            "Starting Environment (Step 3/3)"
-        } else if progress.claimed_at.is_some() {
-            "Creating Environment (Step 2/3)"
-        } else {
-            "Connecting to Host (Step 1/3)"
-        };
+        let progress_text = progress.setup_status_text();
         Some(render_warping_indicator_base(
             WarpingIndicatorProps {
                 icon: None,
@@ -911,7 +945,10 @@ impl BlocklistAIStatusBar {
         ))
     }
 
-    fn render_cloud_mode_setup_terminal_message(&self, app: &AppContext) -> Option<Message> {
+    fn render_cloud_mode_setup_terminal_message(
+        &self,
+        app: &AppContext,
+    ) -> Option<Box<dyn Element>> {
         if !FeatureFlag::CloudModeSetupV2.is_enabled() {
             return None;
         }
@@ -924,51 +961,64 @@ impl BlocklistAIStatusBar {
         let error_color = theme.ansi_fg_red();
 
         if let Some(auth_url) = ambient_agent_model.github_auth_url() {
-            return Some(Message::new(vec![
-                MessageItem::Icon {
-                    icon: CoreIcon::Triangle,
-                    color: Some(error_color),
-                },
-                MessageItem::Text {
-                    content: "Missing GitHub authentication. ".into(),
-                    color: Some(error_color),
-                },
-                MessageItem::hyperlink(
-                    "Authenticate GitHub",
-                    auth_url.to_owned(),
-                    self.state_handles.github_auth_link.clone(),
-                ),
-            ]));
-        }
-
-        if let Some(error_message) = ambient_agent_model.error_message() {
-            return Some(Message::new(vec![
-                MessageItem::Icon {
-                    icon: CoreIcon::Triangle,
-                    color: Some(error_color),
-                },
-                MessageItem::Text {
-                    content: error_message.to_owned().into(),
-                    color: Some(error_color),
-                },
-            ]));
+            let error_message = ambient_agent_model
+                .github_auth_error_message()
+                .unwrap_or("Missing GitHub authentication.");
+            return Some(render_wrapping_standard_message_bar(
+                CoreIcon::Triangle,
+                error_color,
+                error_color,
+                vec![
+                    FormattedTextFragment::plain_text(format!("{error_message} ")),
+                    FormattedTextFragment::hyperlink("Authenticate GitHub", auth_url.to_owned()),
+                ],
+                app,
+            ));
         }
 
         if ambient_agent_model.is_cancelled() {
             let color = theme.disabled_text_color(theme.background()).into_solid();
-            return Some(Message::new(vec![
-                MessageItem::Icon {
-                    icon: CoreIcon::StopFilled,
-                    color: Some(color),
-                },
-                MessageItem::Text {
-                    content: "Cloud agent run cancelled".into(),
-                    color: Some(color),
-                },
-            ]));
+            return Some(render_wrapping_standard_message_bar(
+                CoreIcon::StopFilled,
+                color,
+                color,
+                vec![FormattedTextFragment::plain_text(
+                    "Cloud agent run cancelled",
+                )],
+                app,
+            ));
+        }
+
+        if let Some(error_message) = ambient_agent_model.error_message() {
+            return Some(render_wrapping_standard_message_bar(
+                CoreIcon::Triangle,
+                error_color,
+                error_color,
+                vec![FormattedTextFragment::plain_text(error_message.to_owned())],
+                app,
+            ));
         }
 
         None
+    }
+}
+
+/// The model an exchange's output is running on, as last reported by a `ModelUsed`
+/// message.
+#[derive(Debug, PartialEq)]
+struct ModelInUse {
+    /// `None` when the server reported the model without a display name.
+    display_name: Option<String>,
+    is_fallback: bool,
+}
+
+impl From<&OutputModelInfo> for ModelInUse {
+    fn from(model_info: &OutputModelInfo) -> Self {
+        Self {
+            display_name: Some(model_info.display_name.clone())
+                .filter(|display_name| !display_name.is_empty()),
+            is_fallback: model_info.is_fallback,
+        }
     }
 }
 
@@ -978,7 +1028,7 @@ impl BlocklistAIStatusBar {
 fn latest_model_used_before_exchange<V: View>(
     model: &dyn AIBlockModel<View = V>,
     app: &AppContext,
-) -> Option<api::message::ModelUsed> {
+) -> Option<ModelInUse> {
     let conversation = model.conversation(app)?;
     conversation
         .exchanges_reversed()
@@ -986,19 +1036,15 @@ fn latest_model_used_before_exchange<V: View>(
         .and_then(|exchange| {
             let output = exchange.output_status.output()?;
             let output = output.get();
-            let model_info = output.model_info.as_ref()?;
-            Some(api::message::ModelUsed {
-                model_id: model_info.model_id.to_string(),
-                model_display_name: model_info.display_name.clone(),
-                is_fallback: model_info.is_fallback,
-            })
+            output.model_info.as_ref().map(ModelInUse::from)
         })
 }
 
 fn render_agent_tip(tip: &AgentTip, app: &AppContext) -> Box<dyn Element> {
-    use crate::ai::agent_tips::AITip;
     use markdown_parser::{FormattedTextFragment, FormattedTextLine};
     use warpui::text_layout::ClipConfig;
+
+    use crate::ai::agent_tips::AITip;
 
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
@@ -1008,12 +1054,17 @@ fn render_agent_tip(tip: &AgentTip, app: &AppContext) -> Box<dyn Element> {
 
     let mut fragments = tip.to_formatted_text(app);
 
-    if let (Some(action), Some(text)) = (tip.action.clone(), action_text.clone()) {
-        fragments.push(FormattedTextFragment::plain_text(" "));
-        fragments.push(FormattedTextFragment::hyperlink_action(text, action));
-    } else if let Some(link_target) = tip.link.clone() {
-        fragments.push(FormattedTextFragment::plain_text(" "));
-        fragments.push(FormattedTextFragment::hyperlink("Learn more", link_target));
+    match (tip.action.clone(), action_text.clone()) {
+        (Some(action), Some(text)) => {
+            fragments.push(FormattedTextFragment::plain_text(" "));
+            fragments.push(FormattedTextFragment::hyperlink_action(text, action));
+        }
+        _ => {
+            if let Some(link_target) = tip.link.clone() {
+                fragments.push(FormattedTextFragment::plain_text(" "));
+                fragments.push(FormattedTextFragment::hyperlink("Learn more", link_target));
+            }
+        }
     }
 
     let formatted_text =
@@ -1069,7 +1120,7 @@ fn render_fallback_explanation<V: View>(
     let llm_prefs = LLMPreferences::as_ref(app);
     let base_model_id = model.base_model(app);
     let primary_name = base_model_id
-        .and_then(|base_id| llm_prefs.get_llm_info(base_id))
+        .and_then(|base_id| llm_prefs.get_llm_info(base_id, app))
         .map(|info| info.base_model_name.as_str());
     let text = match primary_name {
         Some(primary) => {
@@ -1089,48 +1140,168 @@ fn render_fallback_explanation<V: View>(
     .finish()
 }
 
-/// If the current exchange is using a fallback model, returns the warping message to display
-/// (e.g. "Warping with Claude 3.5 Haiku."). When the current exchange's output doesn't have
-/// model info yet (the ModelUsed message hasn't arrived), we check the most recent previous
-/// exchange as a best guess — if the conversation already fell back, the next exchange likely
-/// will too. This avoids a flicker from "Warping..." to "Warping with {name}." on follow-ups.
+/// Warping text naming the model in use, the name itself so the row's other
+/// status messages can name it too, and whether the row should carry the
+/// fallback explanation line beneath it.
+#[derive(Debug, PartialEq)]
+struct WarpingModelMessage {
+    text: String,
+    /// `None` for a fallback whose model arrived without a display name: the text
+    /// can still say something useful, but there is no name to put in a message.
+    model_display_name: Option<String>,
+    show_fallback_explanation: bool,
+}
+
+/// What the warping row knows about the model when it renders.
+struct WarpingModelInputs {
+    /// The model reported for the exchange being rendered.
+    current: Option<ModelInUse>,
+    /// The model reported for the exchange before it.
+    previous: Option<ModelInUse>,
+    /// Whether the exchange being rendered begins with a user query.
+    is_new_user_query: bool,
+}
+
+const UNNAMED_FALLBACK_MODEL_WARPING_TEXT: &str = "Warping with another model.";
+
+/// The fallback message's copy. It shipped before model naming existed and keeps
+/// its full stop, where everything named since ends in the row's ellipsis. The
+/// inconsistency is deliberate and was chosen by the requester: do not "fix" it.
 ///
-/// We skip the lookback for new user queries because the underlying model may have recovered
-/// since the previous exchange. For agent-initiated follow-up exchanges (action results, etc.)
-/// the lookback is still applied.
-fn resolve_fallback_warping_message<V: View>(
-    current_is_fallback: Option<bool>,
-    current_display_name: Option<String>,
+/// When `FallbackModelLoadOutputMessaging` is eventually removed, keep this branch
+/// live. Cleaning the flag up in the "treat as false" direction would silently
+/// flip every fallback message to the ellipsis copy and drop its explanation line.
+fn fallback_warping_text(display_name: &str) -> String {
+    let stem = LOAD_OUTPUT_MESSAGE
+        .strip_suffix(STATUS_MESSAGE_ELLIPSIS)
+        .unwrap_or(LOAD_OUTPUT_MESSAGE);
+    format!("{stem} with {display_name}.")
+}
+
+/// Warping text for the model a response is running on, e.g. "Warping with Claude
+/// Sonnet 4.5...". `None` keeps the row on its generic copy, which is what `auto`
+/// and custom routers get until routing picks a model and the server reports it.
+///
+/// Naming the model is `WarpingModelName`'s. `FallbackModelLoadOutputMessaging`
+/// owns the two things specific to a fallback attempt: the explanation line, and
+/// naming the previous exchange's model when this one has not reported yet. That
+/// lookback avoids a flicker from "Warping..." on agent-initiated follow-ups,
+/// since a conversation that fell back once is likely to again, and is skipped
+/// after a new user query because the primary model may have recovered by then.
+/// Nothing else borrows another exchange's model: naming one the response may not
+/// be using is worse than naming none.
+///
+/// The fallback message shipped before model naming did, so it still names its
+/// model on its own flag alone; every other naming needs `WarpingModelName`.
+fn warping_model_message(inputs: WarpingModelInputs) -> Option<WarpingModelMessage> {
+    let fallback_messaging_enabled = FeatureFlag::FallbackModelLoadOutputMessaging.is_enabled();
+    let (model_in_use, is_current_exchange) = match inputs.current {
+        Some(current) => (current, true),
+        None => {
+            if !fallback_messaging_enabled || inputs.is_new_user_query {
+                return None;
+            }
+            let previous = inputs.previous?;
+            if !previous.is_fallback {
+                return None;
+            }
+            (previous, false)
+        }
+    };
+
+    let is_fallback_message = model_in_use.is_fallback && fallback_messaging_enabled;
+    let naming_enabled = FeatureFlag::WarpingModelName.is_enabled();
+    if !naming_enabled && !is_fallback_message {
+        return None;
+    }
+
+    let text = match (model_in_use.display_name.as_deref(), is_fallback_message) {
+        (Some(display_name), true) => fallback_warping_text(display_name),
+        // An unnamed fallback still has something to say.
+        (None, true) => UNNAMED_FALLBACK_MODEL_WARPING_TEXT.to_owned(),
+        (Some(display_name), false) => {
+            status_message_naming_model(LOAD_OUTPUT_MESSAGE, display_name)
+        }
+        // No name, and no fallback message to fall back on: keep the generic copy.
+        (None, false) => return None,
+    };
+
+    Some(WarpingModelMessage {
+        text,
+        // The row's other messages get a name only under the naming flag, and only
+        // for this exchange's own model. The fallback message's flag must not
+        // smuggle naming into them on the shipped configuration, and the lookback's
+        // borrowed guess was justified for the one sentence it replaces, not for
+        // spreading across five more messages.
+        model_display_name: (naming_enabled && is_current_exchange)
+            .then_some(model_in_use.display_name)
+            .flatten(),
+        show_fallback_explanation: is_fallback_message,
+    })
+}
+
+/// Collects the exchange state [`warping_model_message`] decides on.
+fn resolve_warping_model_message<V: View>(
+    current: Option<ModelInUse>,
     model: &dyn AIBlockModel<View = V>,
     app: &AppContext,
-) -> Option<String> {
-    if !FeatureFlag::FallbackModelLoadOutputMessaging.is_enabled() {
-        return None;
-    }
-    let mut is_fallback = current_is_fallback;
-    let mut display_name = current_display_name;
-    let is_new_user_query = model
-        .conversation(app)
-        .and_then(|conv| {
-            let exchange_id = model.exchange_id(app)?;
-            conv.exchange_with_id(exchange_id)
-        })
-        .is_some_and(|exchange| exchange.has_user_query());
-    if is_fallback.is_none() && !is_new_user_query {
-        if let Some(prev) = latest_model_used_before_exchange(model, app) {
-            is_fallback = Some(prev.is_fallback);
-            if !prev.model_display_name.is_empty() {
-                display_name = Some(prev.model_display_name);
-            }
-        }
-    }
-    if !is_fallback.unwrap_or(false) {
-        return None;
-    }
-    Some(match display_name.as_deref() {
-        Some(name) => format!("Warping with {name}."),
-        None => "Warping with another model.".to_owned(),
+) -> Option<WarpingModelMessage> {
+    // Both only feed the fallback lookback, which cannot apply once the exchange
+    // being rendered has reported a model of its own.
+    let (previous, is_new_user_query) = if current.is_none() {
+        (
+            latest_model_used_before_exchange(model, app),
+            model
+                .conversation(app)
+                .and_then(|conversation| {
+                    let exchange_id = model.exchange_id(app)?;
+                    conversation.exchange_with_id(exchange_id)
+                })
+                .is_some_and(|exchange| exchange.has_user_query()),
+        )
+    } else {
+        (None, false)
+    };
+
+    warping_model_message(WarpingModelInputs {
+        current,
+        previous,
+        is_new_user_query,
     })
+}
+
+fn should_send_agent_tip_shown_analytics_event(app: &AppContext) -> bool {
+    let privacy_settings_snapshot = PrivacySettings::handle(app).as_ref(app).get_snapshot(app);
+    if privacy_settings_snapshot.should_disable_telemetry() {
+        return false;
+    }
+    if !FeatureFlag::AgentModeAnalytics.is_enabled() || ChannelState::is_release_bundle() {
+        return false;
+    }
+
+    if matches!(
+        ChannelState::channel(),
+        Channel::Dev | Channel::Local | Channel::Integration
+    ) {
+        return true;
+    }
+
+    ChannelState::server_root_url().contains("staging")
+}
+
+fn send_agent_tip_shown_analytics_event(tip: String, app: &AppContext) {
+    if !should_send_agent_tip_shown_analytics_event(app) {
+        return;
+    }
+
+    let server_api = ServerApiProvider::handle(app).as_ref(app).get();
+    app.background_executor()
+        .spawn(async move {
+            if let Err(error) = server_api.send_agent_tip_shown_analytics_event(tip).await {
+                log::warn!("Error occurred with sending AgentTipShown analytics event: {error}");
+            }
+        })
+        .detach();
 }
 
 impl View for BlocklistAIStatusBar {
@@ -1144,104 +1315,112 @@ impl View for BlocklistAIStatusBar {
         if let Some(cloud_mode_setup_terminal_message) =
             self.render_cloud_mode_setup_terminal_message(app)
         {
-            return render_standard_message_bar(cloud_mode_setup_terminal_message, None, app);
+            return cloud_mode_setup_terminal_message;
         }
-        let status_element =
-            if let Some(cloud_mode_setup_status) = self.render_cloud_mode_setup_status(app) {
-                cloud_mode_setup_status
-            } else if FeatureFlag::CloudModeSetupV2.is_enabled()
-                && self
-                    .ambient_agent_view_model
-                    .as_ref()
-                    .is_some_and(|ambient_agent_view_model| {
-                        is_cloud_agent_pre_first_exchange(
-                            Some(ambient_agent_view_model),
-                            &self.agent_view_controller,
-                            app,
-                        )
-                    })
-            {
-                render_warping_indicator_base(
-                    WarpingIndicatorProps {
-                        icon: None,
-                        warping_indicator_text: MaybeShimmeringText::Shimmering {
-                            text: "Setting up environment".into(),
-                            shimmering_text_handle: self.shimmering_text_handle.clone(),
+        let status_element = match self.render_cloud_mode_setup_status(app) {
+            Some(cloud_mode_setup_status) => cloud_mode_setup_status,
+            _ => {
+                if FeatureFlag::CloudModeSetupV2.is_enabled()
+                    && self.ambient_agent_view_model.as_ref().is_some_and(
+                        |ambient_agent_view_model| {
+                            let terminal_model = self.terminal_model.lock();
+                            is_cloud_agent_pre_first_exchange(
+                                Some(ambient_agent_view_model),
+                                &self.agent_view_controller,
+                                &terminal_model,
+                                app,
+                            )
                         },
-                        non_shimmering_text: None,
-                        non_shimmering_suffix: None,
-                        buttons: None,
-                        is_passive_code_diff: false,
-                        secondary_element: self.render_tip(app),
-                    },
-                    app,
-                )
-            } else if self
-                .terminal_model
-                .lock()
-                .block_list()
-                .active_block()
-                .is_agent_tagged_in()
-                && self
-                    .ephemeral_message_model
-                    .as_ref(app)
-                    .current_message()
-                    .is_none()
-            {
-                render_warping_indicator_base(
-                    WarpingIndicatorProps {
-                        icon: Some(icons::gray_clock_icon(appearance).finish()),
-                        warping_indicator_text: MaybeShimmeringText::Static(
-                            WAITING_FOR_USER_INPUT_MESSAGE.into(),
-                        ),
-                        non_shimmering_text: None,
-                        non_shimmering_suffix: None,
-                        buttons: Some(render_switch_control_to_user_button(
-                            "Exit",
-                            "Exit agent input",
-                            ButtonProps {
-                                button_handle: &self.state_handles.take_over_button,
-                                keystroke: self.set_terminal_input_keystroke.as_ref(),
-                                is_active: false,
+                    )
+                {
+                    render_warping_indicator_base(
+                        WarpingIndicatorProps {
+                            icon: None,
+                            warping_indicator_text: MaybeShimmeringText::Shimmering {
+                                text: "Setting up environment".into(),
+                                shimmering_text_handle: self.shimmering_text_handle.clone(),
                             },
-                            appearance,
-                        )),
-                        is_passive_code_diff: false,
-                        secondary_element: self.render_tip(app),
-                    },
-                    app,
-                )
-            } else if let (Some(warping_indicator), true) = (
-                self.render_warping_indicator_for_latest_exchange(app),
-                self.ephemeral_message_model
-                    .as_ref(app)
-                    .current_message()
-                    .is_none(),
-            ) {
-                warping_indicator
-            } else if self.ambient_agent_view_model.as_ref().is_some_and(
-                |ambient_agent_view_model| {
-                    ambient_agent_view_model
+                            non_shimmering_text: None,
+                            non_shimmering_suffix: None,
+                            buttons: None,
+                            is_passive_code_diff: false,
+                            secondary_element: self.render_tip(app),
+                        },
+                        app,
+                    )
+                } else if self
+                    .terminal_model
+                    .lock()
+                    .block_list()
+                    .active_block()
+                    .is_agent_tagged_in()
+                    && self
+                        .ephemeral_message_model
                         .as_ref(app)
-                        .is_waiting_for_session()
-                },
-            ) {
-                // Don't render warping indicator - the loading screen is shown in the main view
-                return Empty::new().finish();
-            } else if agent_view_controller.is_active() {
-                return Flex::column()
-                    .with_child(ChildView::new(&self.child_agent_status_card).finish())
-                    .with_child(ChildView::new(&self.agent_message_bar).finish())
-                    .finish();
-            } else {
-                return Empty::new().finish();
-            };
+                        .current_message()
+                        .is_none()
+                {
+                    render_warping_indicator_base(
+                        WarpingIndicatorProps {
+                            icon: Some(icons::gray_clock_icon(appearance).finish()),
+                            warping_indicator_text: MaybeShimmeringText::Static(
+                                WAITING_FOR_USER_INPUT_MESSAGE.into(),
+                            ),
+                            non_shimmering_text: None,
+                            non_shimmering_suffix: None,
+                            buttons: Some(render_switch_control_to_user_button(
+                                "Exit",
+                                "Exit agent input",
+                                ButtonProps {
+                                    button_handle: &self.state_handles.take_over_button,
+                                    keystroke: self.set_terminal_input_keystroke.as_ref(),
+                                    is_active: false,
+                                },
+                                appearance,
+                            )),
+                            is_passive_code_diff: false,
+                            secondary_element: self.render_tip(app),
+                        },
+                        app,
+                    )
+                } else {
+                    match (
+                        self.render_warping_indicator_for_latest_exchange(app),
+                        self.ephemeral_message_model
+                            .as_ref(app)
+                            .current_message()
+                            .is_none(),
+                    ) {
+                        (Some(warping_indicator), true) => warping_indicator,
+                        _ => {
+                            if self.ambient_agent_view_model.as_ref().is_some_and(
+                                |ambient_agent_view_model| {
+                                    ambient_agent_view_model
+                                        .as_ref(app)
+                                        .is_waiting_for_session()
+                                },
+                            ) {
+                                // Don't render warping indicator - the loading screen is shown in the main view
+                                return Empty::new().finish();
+                            } else if agent_view_controller.is_active() {
+                                // The orchestration pill bar in the agent view header
+                                // replaces the legacy child-agent status card rows;
+                                // render only the message bar here.
+                                return Flex::column()
+                                    .with_child(ChildView::new(&self.agent_message_bar).finish())
+                                    .finish();
+                            } else {
+                                return Empty::new().finish();
+                            }
+                        }
+                    }
+                }
+            }
+        };
 
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
-        let background = if agent_view_controller.is_inline() {
-            agent_view_bg_fill(app)
-        } else if InputSettings::as_ref(app).is_universal_developer_input_enabled(app)
+        let background = if InputSettings::as_ref(app).is_universal_developer_input_enabled(app)
             || FeatureFlag::AgentView.is_enabled()
         {
             // Use a fully transparent background for universal developer input (or unconditionally, if the new
@@ -1294,16 +1473,6 @@ impl View for BlocklistAIStatusBar {
             }
         } else {
             container = container.with_vertical_padding(8.);
-        }
-
-        // When the agent view is active, keep the child agent status card
-        // visible above the warping/status indicator so it doesn't disappear
-        // while the agent is working.
-        if agent_view_controller.is_active() {
-            return Flex::column()
-                .with_child(ChildView::new(&self.child_agent_status_card).finish())
-                .with_child(container.finish())
-                .finish();
         }
 
         container.finish()
@@ -1360,3 +1529,7 @@ impl TypedActionView for BlocklistAIStatusBar {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "status_bar_tests.rs"]
+mod tests;

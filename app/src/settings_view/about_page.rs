@@ -1,23 +1,20 @@
-use super::{
-    settings_page::{
-        MatchData, PageType, SettingsPageEvent, SettingsPageMeta, SettingsPageViewHandle,
-        SettingsWidget,
-    },
-    SettingsSection,
+use warpui::assets::asset_cache::AssetSource;
+use warpui::elements::{
+    Align, CacheOption, ConstrainedBox, Container, CrossAxisAlignment, Element, Flex, Image,
+    MainAxisAlignment, MouseStateHandle, ParentElement, Wrap,
 };
-use crate::{
-    appearance::Appearance, channel::ChannelState, themes::theme::ColorScheme,
-    workspace::WorkspaceAction,
+use warpui::ui_components::components::UiComponent;
+use warpui::{AppContext, Entity, TypedActionView, View, ViewContext, ViewHandle};
+
+use super::SettingsSection;
+use super::settings_page::{
+    MatchData, PageType, SettingsPageEvent, SettingsPageMeta, SettingsPageViewHandle,
+    SettingsWidget,
 };
-use warpui::{
-    assets::asset_cache::AssetSource,
-    elements::{
-        Align, CacheOption, ConstrainedBox, Container, CrossAxisAlignment, Element, Flex, Image,
-        MainAxisAlignment, MouseStateHandle, ParentElement, Wrap,
-    },
-    ui_components::components::UiComponent,
-    AppContext, Entity, View, ViewContext, ViewHandle,
-};
+use crate::appearance::Appearance;
+use crate::channel::ChannelState;
+use crate::themes::theme::ColorScheme;
+use crate::workspace::WorkspaceAction;
 
 pub struct AboutPageView {
     page: PageType<Self>,
@@ -33,6 +30,9 @@ impl AboutPageView {
 
 impl Entity for AboutPageView {
     type Event = SettingsPageEvent;
+}
+impl TypedActionView for AboutPageView {
+    type Action = ();
 }
 
 impl View for AboutPageView {
@@ -72,8 +72,7 @@ impl SettingsWidget for AboutPageWidget {
             "bundled/svg/warp-logo-with-dark-title.svg"
         };
 
-        let version = ChannelState::app_version()
-            .unwrap_or(concat!("v", env!("CARGO_PKG_VERSION"), " (local build)"));
+        let version = ChannelState::app_version().unwrap_or("v#.##.###");
 
         let version_text = ui_builder
             .span(version.to_string())

@@ -2,24 +2,32 @@ use std::sync::Arc;
 
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
+use settings::Setting as _;
+use warp_core::ui::appearance::Appearance;
+use warp_core::ui::theme::Fill;
+use warp_core::ui::theme::color::internal_colors;
+use warp_errors::report_if_error;
+use warpui::elements::{
+    Border, ChildAnchor, ChildView, OffsetPositioning, ParentAnchor, ParentElement as _,
+    ParentOffsetBounds, Stack,
+};
+use warpui::fonts::{Properties, Weight};
+use warpui::text_layout::ClipConfig;
 use warpui::{
-    elements::{
-        Border, ChildAnchor, ChildView, OffsetPositioning, ParentAnchor, ParentElement as _,
-        ParentOffsetBounds, Stack,
-    },
-    fonts::{Properties, Weight},
     AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
 };
 
-use warp_core::ui::appearance::Appearance;
-use warp_core::ui::theme::color::internal_colors;
-use warp_core::ui::theme::Fill;
-
+use crate::ai::blocklist::inline_action::orchestration_controls::ORCHESTRATION_WARP_WORKER_HOST;
+use crate::ai::cloud_agent_settings::CloudAgentSettings;
+use crate::ai::connected_self_hosted_workers::ConnectedSelfHostedWorkersModel;
+use crate::auth::auth_manager::{AuthManager, AuthManagerEvent};
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
+use crate::network::{NetworkStatus, NetworkStatusEvent, NetworkStatusKind};
 use crate::terminal::input::{MenuPositioning, MenuPositioningProvider};
 use crate::view_components::action_button::{
     ActionButton, ActionButtonTheme, ButtonSize, TooltipAlignment,
 };
+use crate::workspaces::user_workspaces::UserWorkspaces;
 
 const HEADER_FONT_SIZE: f32 = 12.;
 
@@ -37,15 +45,31 @@ const BUTTON_TOOLTIP: &str = "Execution host";
 
 const MENU_HEADER_LABEL: &str = "Execution host";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+const DEFAULT_BADGE: &str = "Default";
+
+const CONNECTED_BADGE: &str = "Connected";
+
+const DISCONNECTED_BADGE: &str = "Disconnected";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Host {
     Warp,
+    SelfHosted { slug: String },
 }
 
 impl Host {
-    fn display_name(self) -> &'static str {
+    fn display_name(&self) -> &str {
         match self {
             Host::Warp => "Warp",
+            Host::SelfHosted { slug } => slug.as_str(),
+        }
+    }
+
+    /// Returns the value to send as `worker_host` in the config snapshot.
+    pub fn worker_host_value(&self) -> Option<String> {
+        match self {
+            Host::Warp => Some(ORCHESTRATION_WARP_WORKER_HOST.to_string()),
+            Host::SelfHosted { slug } => Some(slug.clone()),
         }
     }
 }
@@ -58,6 +82,7 @@ pub enum HostSelectorAction {
 
 pub enum HostSelectorEvent {
     MenuVisibilityChanged { open: bool },
+    HostSelected,
 }
 
 pub struct HostSelector {
@@ -66,6 +91,8 @@ pub struct HostSelector {
     is_menu_open: bool,
     menu_positioning_provider: Arc<dyn MenuPositioningProvider>,
     selected: Host,
+    /// The configured default self-hosted host, if any.
+    default_host: Option<Host>,
 }
 
 impl HostSelector {
@@ -78,9 +105,10 @@ impl HostSelector {
         // `SelectHost`), so it stays out of clippy's `field is never read`
         // warning while still serving as the source of truth for the label.
         let selected = Host::Warp;
+        let initial_label = selected.display_name().to_string();
 
         let button = ctx.add_typed_action_view(|_ctx| {
-            ActionButton::new(selected.display_name(), NakedHeaderButtonTheme)
+            ActionButton::new(initial_label, NakedHeaderButtonTheme)
                 .with_size(ButtonSize::AgentInputButton)
                 .with_menu(true)
                 .with_tooltip(BUTTON_TOOLTIP)
@@ -107,6 +135,27 @@ impl HostSelector {
         ctx.subscribe_to_model(&Appearance::handle(ctx), |me, _, _, ctx| {
             me.refresh_menu(ctx);
         });
+        ctx.subscribe_to_model(
+            &ConnectedSelfHostedWorkersModel::handle(ctx),
+            |me, _, _, ctx| {
+                me.refresh_menu(ctx);
+            },
+        );
+        ctx.subscribe_to_model(&NetworkStatus::handle(ctx), |me, _, event, ctx| {
+            if matches!(
+                event,
+                NetworkStatusEvent::NetworkStatusChanged {
+                    new_status: NetworkStatusKind::Online,
+                }
+            ) {
+                me.refresh_connected_hosts(ctx);
+            }
+        });
+        ctx.subscribe_to_model(&AuthManager::handle(ctx), |me, _, event, ctx| {
+            if matches!(event, AuthManagerEvent::AuthComplete) {
+                me.refresh_connected_hosts(ctx);
+            }
+        });
 
         let mut me = Self {
             button,
@@ -114,13 +163,95 @@ impl HostSelector {
             is_menu_open: false,
             menu_positioning_provider,
             selected,
+            default_host: None,
         };
+        // Restore the last selected host from settings.
+        if let Some(saved_slug) = CloudAgentSettings::as_ref(ctx)
+            .last_selected_host
+            .value()
+            .as_deref()
+        {
+            let restored = if saved_slug == ORCHESTRATION_WARP_WORKER_HOST {
+                Host::Warp
+            } else {
+                Host::SelfHosted {
+                    slug: saved_slug.to_string(),
+                }
+            };
+            me.selected = restored;
+            let label = me.selected.display_name().to_string();
+            me.button.update(ctx, |button, ctx| {
+                button.set_label(label, ctx);
+            });
+        }
+        me.refresh_connected_hosts(ctx);
         me.refresh_menu(ctx);
         me
     }
 
     pub fn is_menu_open(&self) -> bool {
         self.is_menu_open
+    }
+
+    pub fn has_default_host(&self) -> bool {
+        self.default_host.is_some()
+    }
+
+    pub fn selected(&self) -> &Host {
+        &self.selected
+    }
+
+    pub fn set_default_host(&mut self, slug: String, ctx: &mut ViewContext<Self>) {
+        let host = Host::SelfHosted { slug };
+        self.default_host = Some(host.clone());
+
+        // If the user has a saved selection, preserve it instead of
+        // unconditionally overwriting with the default.
+        let saved_slug = CloudAgentSettings::as_ref(ctx)
+            .last_selected_host
+            .value()
+            .clone();
+        if saved_slug.is_some() {
+            // The constructor already applied the saved selection;
+            // just refresh the menu so the new default appears as an option.
+            self.refresh_menu(ctx);
+            return;
+        }
+
+        // No saved preference — use the default host.
+        let label = host.display_name().to_string();
+        self.selected = host;
+        self.button.update(ctx, |button, ctx| {
+            button.set_label(label, ctx);
+        });
+        self.refresh_menu(ctx);
+    }
+
+    /// Drops the configured default host, e.g. because the window moved to a team that
+    /// configures none. The inverse of [`Self::set_default_host`], deferring to a saved
+    /// selection the same way: without it, a selection chosen only because of the previous
+    /// team's default would survive the move and keep pointing at that team's worker.
+    pub fn clear_default_host(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.default_host.is_none() {
+            return;
+        }
+        self.default_host = None;
+
+        if CloudAgentSettings::as_ref(ctx)
+            .last_selected_host
+            .value()
+            .is_some()
+        {
+            self.refresh_menu(ctx);
+            return;
+        }
+
+        self.selected = Host::Warp;
+        let label = self.selected.display_name().to_string();
+        self.button.update(ctx, |button, ctx| {
+            button.set_label(label, ctx);
+        });
+        self.refresh_menu(ctx);
     }
 
     /// Programmatically opens the host selector popover. No-op if already open.
@@ -132,9 +263,16 @@ impl HostSelector {
     /// from closed to open so the user has a clear starting point for arrow-key navigation
     /// instead of an unselected list.
     fn highlight_selected_host(&mut self, ctx: &mut ViewContext<Self>) {
-        let selected_action = HostSelectorAction::SelectHost(self.selected);
+        let selected_action = HostSelectorAction::SelectHost(self.selected.clone());
         self.menu.update(ctx, |menu, ctx| {
             menu.set_selected_by_action(&selected_action, ctx);
+        });
+    }
+
+    fn refresh_connected_hosts(&mut self, ctx: &mut ViewContext<Self>) {
+        let scope = UserWorkspaces::as_ref(ctx).team_context_for_operation(ctx);
+        ConnectedSelfHostedWorkersModel::handle(ctx).update(ctx, |model, ctx| {
+            model.refresh(&scope, ctx);
         });
     }
 
@@ -144,6 +282,7 @@ impl HostSelector {
         }
         self.is_menu_open = is_open;
         if is_open {
+            self.refresh_connected_hosts(ctx);
             ctx.focus(&self.menu);
             self.highlight_selected_host(ctx);
         }
@@ -157,7 +296,13 @@ impl HostSelector {
         let hover_background: Fill = internal_colors::neutral_4(theme).into();
         let header_text_color = theme.disabled_text_color(theme.surface_2()).into_solid();
         let border = Border::all(1.).with_border_fill(theme.outline());
-        let items = build_menu_items(hover_background, header_text_color);
+        let items = build_menu_items(
+            hover_background,
+            header_text_color,
+            self.default_host.as_ref(),
+            &self.selected,
+            ctx,
+        );
         self.menu.update(ctx, |menu, ctx| {
             menu.set_border(Some(border));
             menu.set_items(items, ctx);
@@ -185,6 +330,9 @@ impl HostSelector {
 fn build_menu_items(
     hover_background: Fill,
     header_text_color: ColorU,
+    default_host: Option<&Host>,
+    selected: &Host,
+    ctx: &mut ViewContext<HostSelector>,
 ) -> Vec<MenuItem<HostSelectorAction>> {
     let header = MenuItem::Header {
         fields: MenuItemFields::new(MENU_HEADER_LABEL)
@@ -195,18 +343,63 @@ fn build_menu_items(
         clickable: false,
         right_side_fields: None,
     };
+    let scope = UserWorkspaces::as_ref(ctx).team_context_for_view(ctx);
 
-    let item_for = |host: Host| {
-        MenuItem::Item(
-            MenuItemFields::new(host.display_name())
-                .with_font_size_override(ITEM_FONT_SIZE)
-                .with_padding_override(ITEM_VERTICAL_PADDING, MENU_HORIZONTAL_PADDING)
-                .with_override_hover_background_color(hover_background)
-                .with_on_select_action(HostSelectorAction::SelectHost(host)),
-        )
+    let item_for = |host: Host, badge: Option<&str>| {
+        let label = host.display_name().to_string();
+        let mut fields = MenuItemFields::new(label)
+            .with_font_size_override(ITEM_FONT_SIZE)
+            .with_padding_override(ITEM_VERTICAL_PADDING, MENU_HORIZONTAL_PADDING)
+            .with_override_hover_background_color(hover_background)
+            // Ellipsize long worker names so they don't overflow into the right-side badge.
+            .with_clip_config(ClipConfig::ellipsis())
+            .with_on_select_action(HostSelectorAction::SelectHost(host));
+        if let Some(badge) = badge {
+            fields = fields.with_right_side_label(
+                badge,
+                Properties {
+                    weight: Weight::Semibold,
+                    ..Default::default()
+                },
+            );
+        }
+        MenuItem::Item(fields)
     };
 
-    vec![header, item_for(Host::Warp)]
+    let mut items = vec![header];
+    if let Some(host) = default_host {
+        items.push(item_for(host.clone(), Some(DEFAULT_BADGE)));
+    }
+    items.push(item_for(Host::Warp, None));
+    let default_slug = match default_host {
+        Some(Host::SelfHosted { slug }) => Some(slug.as_str()),
+        Some(Host::Warp) | None => None,
+    };
+    let mut connected_hosts = ConnectedSelfHostedWorkersModel::as_ref(ctx)
+        .worker_hosts_excluding(&scope, default_slug)
+        .into_iter()
+        .collect::<Vec<_>>();
+    connected_hosts.sort();
+    connected_hosts.dedup();
+    for host in &connected_hosts {
+        items.push(item_for(
+            Host::SelfHosted { slug: host.clone() },
+            Some(CONNECTED_BADGE),
+        ));
+    }
+    if let Host::SelfHosted { slug } = selected {
+        let is_default = default_slug == Some(slug.as_str());
+        let is_connected = connected_hosts
+            .iter()
+            .any(|host| host.eq_ignore_ascii_case(slug));
+        if !is_default && !is_connected {
+            items.push(item_for(
+                Host::SelfHosted { slug: slug.clone() },
+                Some(DISCONNECTED_BADGE),
+            ));
+        }
+    }
+    items
 }
 
 impl Entity for HostSelector {
@@ -223,11 +416,18 @@ impl TypedActionView for HostSelector {
                 self.set_menu_visibility(new_state, ctx);
             }
             HostSelectorAction::SelectHost(host) => {
-                self.selected = *host;
-                let label = self.selected.display_name();
+                self.selected = host.clone();
+                let label = self.selected.display_name().to_string();
                 self.button.update(ctx, |button, ctx| {
-                    button.set_label(label, ctx);
+                    button.set_label(label.clone(), ctx);
                 });
+                // Persist the selection to settings for next time.
+                if let Some(slug) = host.worker_host_value() {
+                    CloudAgentSettings::handle(ctx).update(ctx, |settings, ctx| {
+                        report_if_error!(settings.last_selected_host.set_value(Some(slug), ctx));
+                    });
+                }
+                ctx.emit(HostSelectorEvent::HostSelected);
                 self.set_menu_visibility(false, ctx);
             }
         }
@@ -252,6 +452,7 @@ impl View for HostSelector {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct NakedHeaderButtonTheme;
 
 impl ActionButtonTheme for NakedHeaderButtonTheme {

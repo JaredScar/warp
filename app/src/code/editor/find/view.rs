@@ -1,41 +1,41 @@
 #![cfg_attr(target_family = "wasm", allow(dead_code, unused_imports))]
 // Adding this file level gate as some of the code around editability is not used in WASM yet.
 
+use pathfinder_color::ColorU;
+use warp_editor::editor::NavigationKey;
+use warp_editor::search::{SearchEvent, Searcher};
+pub use warpui::AppContext;
+pub use warpui::accessibility::{AccessibilityContent, WarpA11yRole};
+use warpui::elements::{
+    Align, Border, ChildAnchor, Clipped, ConstrainedBox, Container, CornerRadius,
+    CrossAxisAlignment, DropShadow, Element, Flex, Hoverable, MainAxisAlignment, MouseStateHandle,
+    OffsetPositioning, ParentAnchor, ParentOffsetBounds, Radius, Rect, SavePosition, Shrinkable,
+    Text,
+};
+pub use warpui::elements::{ParentElement as _, Stack};
+pub use warpui::geometry::vector::vec2f;
+use warpui::keymap::EditableBinding;
+use warpui::presenter::ChildView;
+use warpui::ui_components::components::UiComponent;
+use warpui::{
+    Entity, FocusContext, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
+    ViewHandle,
+};
+
 use crate::appearance::Appearance;
 use crate::editor::{
     EditorView, Event as EditorEvent, InteractionState, PropagateAndNoOpNavigationKeys,
     SingleLineEditorOptions, TextOptions,
 };
+use crate::features::FeatureFlag;
 use crate::send_telemetry_from_ctx;
 use crate::server::telemetry::{FindOption, TelemetryEvent};
+use crate::settings::AppEditorSettings;
 use crate::themes::theme::Fill;
-use crate::ui_components::{blended_colors, icons::Icon};
+use crate::ui_components::blended_colors;
+use crate::ui_components::icons::Icon;
 use crate::view_components::action_button::{ActionButton, DisabledSecondaryTheme, SecondaryTheme};
 use crate::view_components::find::FindDirection;
-use crate::{features::FeatureFlag, settings::AppEditorSettings};
-use pathfinder_color::ColorU;
-use warp_editor::editor::NavigationKey;
-use warp_editor::search::{SearchEvent, Searcher};
-use warpui::elements::MainAxisAlignment;
-use warpui::elements::{ChildAnchor, OffsetPositioning, Radius, SavePosition, Shrinkable};
-use warpui::keymap::EditableBinding;
-use warpui::ui_components::components::UiComponent;
-pub use warpui::{
-    accessibility::{AccessibilityContent, WarpA11yRole},
-    elements::{ParentElement as _, Stack},
-    geometry::vector::vec2f,
-    AppContext,
-};
-use warpui::{
-    elements::{
-        Align, Border, Clipped, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
-        DropShadow, Element, Flex, Hoverable, MouseStateHandle, ParentAnchor, ParentOffsetBounds,
-        Rect, Text,
-    },
-    Entity, SingletonEntity, TypedActionView, View,
-};
-use warpui::{presenter::ChildView, ViewContext, ViewHandle};
-use warpui::{FocusContext, ModelHandle};
 
 pub const FIND_BAR_WIDTH: f32 = 500.;
 const ICON_PADDING: f32 = 4.;
@@ -81,6 +81,9 @@ pub struct CodeEditorFind {
     replace_editor: ViewHandle<EditorView>,
     searcher: ModelHandle<Searcher>,
     button_mouse_states: ButtonMouseStates,
+    find_editor_mouse_state: MouseStateHandle,
+    /// Save position of the find input, so its bounds can be resolved for mouse events.
+    find_editor_position_id: String,
     preserve_case_enabled: bool,
     is_open: bool,
     is_replace_open: bool,
@@ -101,6 +104,8 @@ pub enum FindAction {
     ToggleReplaceOpen,
     ReplaceAll,
     TogglePreserveCase,
+    /// The find input was clicked, so it should become editable and take focus again.
+    FocusFindInput,
 }
 
 pub fn init(app: &mut AppContext) {
@@ -229,6 +234,8 @@ impl CodeEditorFind {
             replace_editor,
             searcher,
             button_mouse_states: Default::default(),
+            find_editor_mouse_state: Default::default(),
+            find_editor_position_id: format!("code_editor_find_query_{}", ctx.view_id()),
             preserve_case_enabled: false,
             is_open: false,
             is_replace_open: false,
@@ -279,6 +286,17 @@ impl CodeEditorFind {
             editor.set_interaction_state(state, ctx);
         });
     }
+
+    /// Makes the find input editable, selects its current query, and focuses it.
+    fn activate_find_input(&mut self, ctx: &mut ViewContext<Self>) {
+        self.find_editor.update(ctx, |editor, ctx| {
+            editor.set_interaction_state(InteractionState::Editable, ctx);
+            editor.select_all(ctx);
+        });
+        ctx.focus(&self.find_editor);
+        ctx.notify();
+    }
+
     fn handle_find_editor_event(&mut self, event: &EditorEvent, ctx: &mut ViewContext<Self>) {
         match event {
             EditorEvent::Edited(_) => {
@@ -765,19 +783,25 @@ impl CodeEditorFind {
         )
         .finish();
 
+        let find_editor = Hoverable::new(self.find_editor_mouse_state.clone(), |_| {
+            SavePosition::new(
+                ConstrainedBox::new(
+                    Clipped::new(ChildView::new(&self.find_editor).finish()).finish(),
+                )
+                .with_height(editor_height)
+                .finish(),
+                &self.find_editor_position_id,
+            )
+            .finish()
+        })
+        .on_mouse_down(|ctx, _, _| {
+            ctx.dispatch_typed_action(FindAction::FocusFindInput);
+        })
+        .finish();
+
         let mut query_editor_row = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_child(
-                Shrinkable::new(
-                    1.,
-                    ConstrainedBox::new(
-                        Clipped::new(ChildView::new(&self.find_editor).finish()).finish(),
-                    )
-                    .with_height(editor_height)
-                    .finish(),
-                )
-                .finish(),
-            );
+            .with_child(Shrinkable::new(1., find_editor).finish());
         query_editor_row.add_child(regex_icon);
         query_editor_row.add_child(case_sensitive_icon);
 
@@ -890,6 +914,17 @@ impl CodeEditorFind {
     }
 }
 
+#[cfg(test)]
+impl CodeEditorFind {
+    pub fn find_editor_for_test(&self) -> ViewHandle<EditorView> {
+        self.find_editor.clone()
+    }
+
+    pub fn find_editor_position_id_for_test(&self) -> &str {
+        &self.find_editor_position_id
+    }
+}
+
 impl Entity for CodeEditorFind {
     type Event = Event;
 }
@@ -913,6 +948,15 @@ impl TypedActionView for CodeEditorFind {
             FindAction::TogglePreserveCase => {
                 self.preserve_case_enabled = !self.preserve_case_enabled;
                 ctx.notify();
+            }
+            FindAction::FocusFindInput => {
+                // While Vim owns the editor caret the find input is disabled, so the editor
+                // element ignores mouse events and the click can only be handled here. When the
+                // input is already editable the editor element handles the click itself, placing
+                // the caret where the user clicked.
+                if !self.is_find_input_editable(ctx) {
+                    self.activate_find_input(ctx);
+                }
             }
         }
     }
@@ -955,12 +999,7 @@ impl View for CodeEditorFind {
             searcher.set_auto_select(true);
         });
         if focus_ctx.is_self_focused() {
-            self.find_editor.update(ctx, |editor, ctx| {
-                editor.set_interaction_state(InteractionState::Editable, ctx);
-                editor.select_all(ctx);
-            });
-            ctx.focus(&self.find_editor);
-            ctx.notify();
+            self.activate_find_input(ctx);
         }
     }
 

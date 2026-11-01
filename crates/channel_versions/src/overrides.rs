@@ -49,7 +49,7 @@ impl TargetOS {
             Some(TargetOS::Web)
         } else if cfg!(target_os = "macos") {
             Some(TargetOS::MacOS)
-        } else if cfg!(target_os = "linux") {
+        } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             Some(TargetOS::Linux)
         } else if cfg!(target_os = "windows") {
             Some(TargetOS::Windows)
@@ -128,6 +128,9 @@ impl VersionInfo {
         }
         if let Some(cli_version) = other.cli_version {
             self.cli_version = Some(cli_version);
+        }
+        if let Some(tui_version) = other.tui_version {
+            self.tui_version = Some(tui_version);
         }
     }
 }

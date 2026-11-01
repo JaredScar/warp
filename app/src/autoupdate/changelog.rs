@@ -1,16 +1,16 @@
-use std::{iter, sync::Arc};
+use std::iter;
+use std::sync::Arc;
 
 use anyhow::Result;
 use channel_versions::{Changelog, ChannelVersions};
-use rand::{distributions::Alphanumeric, thread_rng, Rng as _};
-
-use crate::{
-    channel::{Channel, ChannelState},
-    server::server_api::ServerApi,
-};
+use rand::distributions::Alphanumeric;
+use rand::{Rng as _, thread_rng};
+use warp_errors::report_error;
 
 use super::channel_versions::fetch_channel_versions;
 use super::release_assets_directory_url;
+use crate::channel::{Channel, ChannelState};
+use crate::server::server_api::ServerApi;
 
 pub async fn get_current_changelog(server_api: Arc<ServerApi>) -> Result<Option<Changelog>> {
     let rand: String = {
@@ -30,7 +30,9 @@ pub async fn get_current_changelog(server_api: Arc<ServerApi>) -> Result<Option<
             changelog_result @ Ok(_) => {
                 return changelog_result.map(Option::Some);
             }
-            Err(error) => log::error!("Failed to fetch changelog.json: {error}"),
+            Err(error) => {
+                report_error!(error.context("Failed to fetch changelog.json"))
+            }
         };
     }
 

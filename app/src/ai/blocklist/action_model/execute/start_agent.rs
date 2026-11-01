@@ -1,61 +1,61 @@
-use futures::{future::BoxFuture, FutureExt};
-use warpui::{Entity, ModelContext, SingletonEntity};
+use std::collections::HashMap;
+
+use warp_errors::report_error;
+use warpui::{Entity, ModelContext, ModelHandle, SingletonEntity};
 
 use crate::ai::agent::conversation::{AIConversationId, ConversationStatus};
-use crate::ai::agent::{
-    AIAgentAction, AIAgentActionResultType, AIAgentActionType, LifecycleEventType,
-    StartAgentExecutionMode, StartAgentResult,
-};
+use crate::ai::agent::{LifecycleEventType, StartAgentExecutionMode};
 use crate::ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer;
-use crate::ai::blocklist::orchestration_events::OrchestrationEventService;
 use crate::ai::blocklist::{BlocklistAIHistoryEvent, BlocklistAIHistoryModel};
-use warp_cli::agent::Harness;
-use warp_core::features::FeatureFlag;
+use crate::server::team_scope::RequestTeamScope;
+pub const TEAM_CHANGED_DURING_CHILD_LAUNCH_ERROR: &str =
+    "The window's team changed before the child agent could start. Run the orchestration again.";
 
-use super::{ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput};
-
-/// The result sent back to the executor after observing the child agent's lifecycle.
-enum StartAgentDecision {
-    /// The child conversation was created successfully.
-    Started { agent_id: String },
+/// Per-request outcome of a StartAgent dispatch.
+#[derive(Debug, Clone)]
+pub enum StartAgentOutcome {
+    Started {
+        agent_id: String,
+    },
     /// An error occurred while starting the agent.
     Error(String),
 }
 
-fn invalid_local_child_harness_error(harness_type: &str) -> String {
-    let harness_name = harness_type.trim();
-    if harness_name.is_empty() {
-        "Local child harness type is missing.".to_string()
-    } else {
-        format!("Unsupported local child harness '{harness_name}'.")
+/// Opaque, monotonically increasing request identifier.
+/// Disambiguates parallel in-flight StartAgent requests.
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Default)]
+pub struct StartAgentRequestId(u64);
+
+impl StartAgentRequestId {
+    #[cfg(test)]
+    pub const fn from_raw_for_test(value: u64) -> Self {
+        Self(value)
     }
 }
 
-/// Groups the data for a single StartAgent invocation as it flows from the
-/// executor through the terminal view and pane group into the controller.
 #[derive(Clone)]
 pub struct StartAgentRequest {
+    pub metadata: HashMap<String, String>,
+    pub id: StartAgentRequestId,
     pub name: String,
     pub prompt: String,
     pub execution_mode: StartAgentExecutionMode,
     pub lifecycle_subscription: Option<Vec<LifecycleEventType>>,
     pub parent_conversation_id: AIConversationId,
     pub parent_run_id: Option<String>,
+    pub request_team_scope: RequestTeamScope,
 }
 
-/// Tracks a single in-flight StartAgent action. At most one can be pending at
-/// a time because StartAgent actions execute serially (RunningActionPhase::Serial).
 struct PendingStartAgent {
     parent_conversation_id: AIConversationId,
-    /// Set when `StartedNewConversation` fires for a conversation whose
-    /// `parent_conversation_id` matches.
+    /// Set once the child conversation is synchronously created.
     child_conversation_id: Option<AIConversationId>,
-    sender: async_channel::Sender<StartAgentDecision>,
+    sender: async_channel::Sender<StartAgentOutcome>,
 }
 
 pub struct StartAgentExecutor {
-    /// The currently pending StartAgent action, if any.
-    pending: Option<PendingStartAgent>,
+    pending: HashMap<StartAgentRequestId, PendingStartAgent>,
+    next_request_id: u64,
 }
 
 impl StartAgentExecutor {
@@ -63,339 +63,243 @@ impl StartAgentExecutor {
         let history_model = BlocklistAIHistoryModel::handle(ctx);
         ctx.subscribe_to_model(&history_model, Self::handle_history_event);
 
-        Self { pending: None }
+        Self {
+            pending: HashMap::new(),
+            next_request_id: 0,
+        }
+    }
+
+    fn next_request_id(&mut self) -> StartAgentRequestId {
+        let id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        StartAgentRequestId(id)
+    }
+
+    /// Links a pending request to its freshly-created child
+    /// conversation so subsequent history events can find it.
+    fn record_child_conversation(
+        &mut self,
+        request_id: StartAgentRequestId,
+        child_conversation_id: AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(pending) = self.pending.get_mut(&request_id) else {
+            return;
+        };
+        pending.child_conversation_id = Some(child_conversation_id);
+        self.maybe_complete_pending_for_child_state(request_id, child_conversation_id, ctx);
+    }
+
+    fn find_pending_by_child(
+        &self,
+        child_conversation_id: &AIConversationId,
+    ) -> Option<StartAgentRequestId> {
+        self.pending.iter().find_map(|(id, pending)| {
+            (pending.child_conversation_id.as_ref() == Some(child_conversation_id)).then_some(*id)
+        })
+    }
+
+    fn complete_pending_as_started(
+        &mut self,
+        request_id: StartAgentRequestId,
+        child_conversation_id: AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(pending) = self.pending.remove(&request_id) else {
+            return;
+        };
+        let agent_id = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&child_conversation_id)
+            .and_then(|conversation| conversation.orchestration_agent_id());
+        match agent_id {
+            Some(id) => {
+                let _ = pending.sender.try_send(StartAgentOutcome::Started {
+                    agent_id: id.clone(),
+                });
+                OrchestrationEventStreamer::handle(ctx).update(ctx, |streamer, ctx| {
+                    streamer.register_watched_run_id(pending.parent_conversation_id, id, ctx);
+                });
+            }
+            None => {
+                report_error!(
+                    "No agent identifier found for child conversation",
+                    extra: { "child_conversation_id" => ?child_conversation_id }
+                );
+                let _ = pending.sender.try_send(StartAgentOutcome::Error(
+                    "Server did not assign an agent identifier".to_string(),
+                ));
+            }
+        }
+    }
+
+    fn complete_pending_as_error(
+        &mut self,
+        request_id: StartAgentRequestId,
+        child_conversation_id: AIConversationId,
+        error_msg: String,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(pending) = self.pending.remove(&request_id) else {
+            return;
+        };
+        let _ = pending.sender.try_send(StartAgentOutcome::Error(error_msg));
+        // A child that reaches `complete_pending_as_error` never obtained an
+        // agent id, so it failed at the launch stage. Clean up its hidden
+        // pane + conversation so the orchestration pill bar does not retain a
+        // dead chip — but only for terminal failures, leaving recoverable
+        // `Blocked` startup states (e.g. awaiting GitHub auth) intact.
+        let should_cleanup = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&child_conversation_id)
+            .is_some_and(|conversation| should_cleanup_failed_child_launch(conversation.status()));
+        if should_cleanup {
+            ctx.emit(StartAgentExecutorEvent::CleanupFailedChildLaunch {
+                conversation_id: child_conversation_id,
+            });
+        }
+    }
+
+    fn maybe_complete_pending_for_child_state(
+        &mut self,
+        request_id: StartAgentRequestId,
+        child_conversation_id: AIConversationId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(conversation) =
+            BlocklistAIHistoryModel::as_ref(ctx).conversation(&child_conversation_id)
+        else {
+            return;
+        };
+        if let Some(error_msg) = start_agent_error_message_for_status(
+            conversation.status(),
+            conversation.status_error_message().as_deref(),
+        ) {
+            self.complete_pending_as_error(request_id, child_conversation_id, error_msg, ctx);
+            return;
+        }
+        if conversation.orchestration_agent_id().is_some() {
+            self.complete_pending_as_started(request_id, child_conversation_id, ctx);
+        }
     }
 
     fn handle_history_event(
         &mut self,
+        _: ModelHandle<BlocklistAIHistoryModel>,
         event: &BlocklistAIHistoryEvent,
         ctx: &mut ModelContext<Self>,
     ) {
         match event {
-            BlocklistAIHistoryEvent::StartedNewConversation {
-                new_conversation_id,
-                ..
-            } => {
-                let Some(pending) = self.pending.as_mut() else {
-                    return;
-                };
-                if pending.child_conversation_id.is_some() {
-                    return;
-                }
-                let history = BlocklistAIHistoryModel::as_ref(ctx);
-                let Some(conversation) = history.conversation(new_conversation_id) else {
-                    return;
-                };
-                if conversation.parent_conversation_id() == Some(pending.parent_conversation_id) {
-                    pending.child_conversation_id = Some(*new_conversation_id);
-                }
-            }
             BlocklistAIHistoryEvent::ConversationServerTokenAssigned {
                 conversation_id, ..
             } => {
-                let matches = self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|p| p.child_conversation_id.as_ref() == Some(conversation_id));
-                if !matches {
+                let Some(request_id) = self.find_pending_by_child(conversation_id) else {
                     return;
-                }
-                let pending = self.pending.take().unwrap();
-                let agent_id = BlocklistAIHistoryModel::as_ref(ctx)
-                    .conversation(conversation_id)
-                    .and_then(|c| c.orchestration_agent_id());
-                match agent_id {
-                    Some(id) => {
-                        let _ = pending.sender.try_send(StartAgentDecision::Started {
-                            agent_id: id.clone(),
-                        });
-                        if FeatureFlag::OrchestrationV2.is_enabled() {
-                            OrchestrationEventStreamer::handle(ctx).update(ctx, |streamer, ctx| {
-                                streamer.register_watched_run_id(
-                                    pending.parent_conversation_id,
-                                    id,
-                                    ctx,
-                                );
-                            });
-                        } else {
-                            OrchestrationEventService::handle(ctx).update(ctx, |svc, ctx| {
-                                svc.emit_child_startup_started(*conversation_id, ctx);
-                            });
-                        }
-                    }
-                    None => {
-                        log::error!(
-                            "ConversationServerTokenAssigned fired but no agent identifier for \
-                             {conversation_id:?}"
-                        );
-                        let _ = pending.sender.try_send(StartAgentDecision::Error(
-                            "Server did not assign an agent identifier".to_string(),
-                        ));
-                        if !FeatureFlag::OrchestrationV2.is_enabled() {
-                            OrchestrationEventService::handle(ctx).update(ctx, |svc, ctx| {
-                                svc.emit_child_startup_errored(
-                                    *conversation_id,
-                                    "missing_agent_id".to_string(),
-                                    "Server did not assign an agent identifier".to_string(),
-                                    ctx,
-                                );
-                            });
-                        }
-                    }
-                }
+                };
+                self.complete_pending_as_started(request_id, *conversation_id, ctx);
             }
             BlocklistAIHistoryEvent::UpdatedConversationStatus {
                 conversation_id, ..
             } => {
-                let matches = self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|p| p.child_conversation_id.as_ref() == Some(conversation_id));
-                if !matches {
+                let Some(request_id) = self.find_pending_by_child(conversation_id) else {
                     return;
-                }
+                };
                 let history = BlocklistAIHistoryModel::as_ref(ctx);
                 let Some(conversation) = history.conversation(conversation_id) else {
                     return;
                 };
                 let error_msg = start_agent_error_message_for_status(
                     conversation.status(),
-                    conversation.status_error_message(),
+                    conversation.status_error_message().as_deref(),
                 );
                 if let Some(error_msg) = error_msg {
-                    let pending = self.pending.take().unwrap();
-                    let _ = pending
-                        .sender
-                        .try_send(StartAgentDecision::Error(error_msg.clone()));
-                    if !FeatureFlag::OrchestrationV2.is_enabled() {
-                        OrchestrationEventService::handle(ctx).update(ctx, |svc, ctx| {
-                            svc.emit_child_startup_errored(
-                                *conversation_id,
-                                "conversation_status".to_string(),
-                                error_msg,
-                                ctx,
-                            );
-                        });
-                    }
+                    self.complete_pending_as_error(request_id, *conversation_id, error_msg, ctx);
                 }
             }
-            BlocklistAIHistoryEvent::CreatedSubtask { .. }
+            BlocklistAIHistoryEvent::NewConversationRequestComplete {
+                request_id,
+                conversation_id,
+            } => {
+                self.record_child_conversation(*request_id, *conversation_id, ctx);
+            }
+            BlocklistAIHistoryEvent::StartedNewConversation { .. }
+            | BlocklistAIHistoryEvent::CreatedSubtask { .. }
             | BlocklistAIHistoryEvent::UpgradedTask { .. }
             | BlocklistAIHistoryEvent::AppendedExchange { .. }
             | BlocklistAIHistoryEvent::ReassignedExchange { .. }
             | BlocklistAIHistoryEvent::UpdatedStreamingExchange { .. }
             | BlocklistAIHistoryEvent::SetActiveConversation { .. }
             | BlocklistAIHistoryEvent::ClearedActiveConversation { .. }
-            | BlocklistAIHistoryEvent::ClearedConversationsInTerminalView { .. }
+            | BlocklistAIHistoryEvent::ClearedConversationsForTerminalSurface { .. }
             | BlocklistAIHistoryEvent::UpdatedTodoList { .. }
             | BlocklistAIHistoryEvent::UpdatedAutoexecuteOverride { .. }
             | BlocklistAIHistoryEvent::SplitConversation { .. }
             | BlocklistAIHistoryEvent::RemoveConversation { .. }
             | BlocklistAIHistoryEvent::DeletedConversation { .. }
             | BlocklistAIHistoryEvent::RestoredConversations { .. }
+            | BlocklistAIHistoryEvent::UpdatedConversationTitle { .. }
             | BlocklistAIHistoryEvent::UpdatedConversationMetadata { .. }
-            | BlocklistAIHistoryEvent::UpdatedConversationArtifacts { .. } => {}
+            | BlocklistAIHistoryEvent::UpdatedConversationArtifacts { .. }
+            | BlocklistAIHistoryEvent::ConversationTransferredBetweenTerminalSurfaces { .. } => {}
+            BlocklistAIHistoryEvent::OrchestrationConfigUpdated { .. }
+            | BlocklistAIHistoryEvent::ConversationUsageMetadataUpdated { .. }
+            | BlocklistAIHistoryEvent::LocalSharedSessionEstablished { .. } => {}
         }
     }
 
-    pub(super) fn should_autoexecute(
-        &self,
-        _input: ExecuteActionInput,
-        _ctx: &mut ModelContext<Self>,
-    ) -> bool {
-        // TODO(QUALITY-342): this should be a setting
-        true
-    }
-
-    pub(super) fn execute(
+    /// Dispatch a pre-validated StartAgent request. Returns a receiver
+    /// for the resulting [`StartAgentOutcome`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch(
         &mut self,
-        input: ExecuteActionInput,
+        name: String,
+        prompt: String,
+        execution_mode: StartAgentExecutionMode,
+        metadata: HashMap<String, String>,
+        lifecycle_subscription: Option<Vec<LifecycleEventType>>,
+        parent_conversation_id: AIConversationId,
+        parent_run_id: Option<String>,
+        request_team_scope: RequestTeamScope,
         ctx: &mut ModelContext<Self>,
-    ) -> impl Into<AnyActionExecution> {
-        let AIAgentAction {
-            action:
-                AIAgentActionType::StartAgent {
-                    version,
-                    name,
-                    prompt,
-                    execution_mode,
-                    lifecycle_subscription,
-                },
-            ..
-        } = input.action
-        else {
-            return ActionExecution::InvalidAction;
-        };
-
-        let prompt = prompt.clone();
-        let version = *version;
-        let parent_conversation_id = input.conversation_id;
-        let (execution_mode, parent_run_id) = match execution_mode.clone() {
-            StartAgentExecutionMode::Local { harness_type: None } => {
-                // Legacy local Oz child agents do not use
-                // StartAgentRequest.parent_run_id. Instead, the child
-                // conversation is linked back to its parent on the first
-                // request via Request.metadata.parent_agent_id, sourced
-                // from the conversation's versioned orchestration_agent_id()
-                // (run_id in v2, server conversation token in v1). Remote
-                // child agents and local third-party harness children need
-                // parent_run_id here because their run is spawned before that
-                // first child request exists.
-                (StartAgentExecutionMode::Local { harness_type: None }, None)
-            }
-            StartAgentExecutionMode::Local {
-                harness_type: Some(harness_type),
-            } => {
-                let Some(harness) = Harness::parse_local_child_harness(&harness_type) else {
-                    return ActionExecution::Sync(AIAgentActionResultType::StartAgent(
-                        StartAgentResult::Error {
-                            error: invalid_local_child_harness_error(&harness_type),
-                            version,
-                        },
-                    ));
-                };
-
-                if !FeatureFlag::OrchestrationV2.is_enabled() {
-                    return ActionExecution::Sync(AIAgentActionResultType::StartAgent(
-                        StartAgentResult::Error {
-                            error: "Local harness child agents require orchestration v2."
-                                .to_string(),
-                            version,
-                        },
-                    ));
-                }
-
-                let parent_run_id = BlocklistAIHistoryModel::as_ref(ctx)
-                    .conversation(&parent_conversation_id)
-                    .and_then(|conversation| conversation.run_id());
-                let Some(parent_run_id) = parent_run_id else {
-                    return ActionExecution::Sync(AIAgentActionResultType::StartAgent(
-                        StartAgentResult::Error {
-                            error:
-                                "Local harness child agents require the parent run_id to be available."
-                                    .to_string(),
-                            version,
-                        },
-                    ));
-                };
-
-                (
-                    StartAgentExecutionMode::Local {
-                        harness_type: Some(harness.to_string()),
-                    },
-                    Some(parent_run_id),
-                )
-            }
-            StartAgentExecutionMode::Remote {
-                environment_id,
-                skill_references,
-                model_id,
-                computer_use_enabled,
-                worker_host,
-                harness_type,
-                title,
-            } => {
-                if !FeatureFlag::OrchestrationV2.is_enabled() {
-                    return ActionExecution::Sync(AIAgentActionResultType::StartAgent(
-                        StartAgentResult::Error {
-                            error: "Remote child agents require orchestration v2.".to_string(),
-                            version,
-                        },
-                    ));
-                }
-
-                let harness_type = Harness::parse_orchestration_harness(&harness_type)
-                    .map(|harness| harness.to_string())
-                    .unwrap_or(harness_type);
-                if Harness::parse_orchestration_harness(&harness_type) == Some(Harness::OpenCode) {
-                    return ActionExecution::Sync(AIAgentActionResultType::StartAgent(
-                        StartAgentResult::Error {
-                            error: "Remote child agents do not support the opencode harness yet."
-                                .to_string(),
-                            version,
-                        },
-                    ));
-                }
-
-                // An empty environment_id is allowed and means the child will be spawned with an
-                // empty environment (no preconfigured repositories, secrets, or integrations).
-                // Callers are discouraged from relying on this, but we intentionally do not reject
-                // it here so that agent authors can opt into running without an environment.
-                if environment_id.trim().is_empty() {
-                    log::warn!(
-                        "Starting remote child agent with empty environment_id; the child will run \
-                         with an empty environment."
-                    );
-                }
-
-                let parent_run_id = BlocklistAIHistoryModel::as_ref(ctx)
-                    .conversation(&parent_conversation_id)
-                    .and_then(|conversation| conversation.run_id());
-                let Some(parent_run_id) = parent_run_id else {
-                    return ActionExecution::Sync(AIAgentActionResultType::StartAgent(
-                        StartAgentResult::Error {
-                            error: "Remote child agents require the parent run_id to be available."
-                                .to_string(),
-                            version,
-                        },
-                    ));
-                };
-
-                (
-                    StartAgentExecutionMode::Remote {
-                        environment_id,
-                        skill_references,
-                        model_id,
-                        computer_use_enabled,
-                        worker_host,
-                        harness_type,
-                        title,
-                    },
-                    Some(parent_run_id),
-                )
-            }
-        };
-
+    ) -> async_channel::Receiver<StartAgentOutcome> {
         let (sender, receiver) = async_channel::bounded(1);
-        self.pending = Some(PendingStartAgent {
-            parent_conversation_id,
-            child_conversation_id: None,
-            sender,
-        });
-
-        ctx.emit(StartAgentExecutorEvent::CreateAgent(StartAgentRequest {
-            name: name.clone(),
-            prompt,
-            execution_mode,
-            lifecycle_subscription: lifecycle_subscription.clone(),
-            parent_conversation_id,
-            parent_run_id,
-        }));
-
-        ActionExecution::new_async(async move { receiver.recv().await }, move |result, _ctx| {
-            match result {
-                Ok(StartAgentDecision::Started { agent_id }) => {
-                    AIAgentActionResultType::StartAgent(StartAgentResult::Success {
-                        agent_id,
-                        version,
-                    })
-                }
-                Ok(StartAgentDecision::Error(error)) => {
-                    AIAgentActionResultType::StartAgent(StartAgentResult::Error { error, version })
-                }
-                Err(_) => {
-                    AIAgentActionResultType::StartAgent(StartAgentResult::Cancelled { version })
-                }
-            }
-        })
+        let request_id = self.next_request_id();
+        self.pending.insert(
+            request_id,
+            PendingStartAgent {
+                parent_conversation_id,
+                child_conversation_id: None,
+                sender,
+            },
+        );
+        ctx.emit(StartAgentExecutorEvent::CreateAgent(Box::new(
+            StartAgentRequest {
+                id: request_id,
+                name,
+                prompt,
+                execution_mode,
+                metadata,
+                lifecycle_subscription,
+                parent_conversation_id,
+                parent_run_id,
+                request_team_scope,
+            },
+        )));
+        receiver
     }
+}
 
-    pub(super) fn preprocess_action(
-        &mut self,
-        _action: PreprocessActionInput,
-        _ctx: &mut ModelContext<Self>,
-    ) -> BoxFuture<'static, ()> {
-        futures::future::ready(()).boxed()
+/// Whether a child that failed before launch should have its hidden pane and
+/// conversation cleaned up. Only terminal launch failures qualify; recoverable
+/// `Blocked` startup states (e.g. awaiting GitHub auth) and non-terminal
+/// `TransientError` (a recovery is in flight) keep their chip so the user can
+/// resolve them or let the retry complete.
+fn should_cleanup_failed_child_launch(status: &ConversationStatus) -> bool {
+    match status {
+        ConversationStatus::Error | ConversationStatus::Cancelled => true,
+        ConversationStatus::Blocked { .. }
+        | ConversationStatus::InProgress
+        | ConversationStatus::TransientError
+        | ConversationStatus::Success
+        | ConversationStatus::WaitingForEvents => false,
     }
 }
 
@@ -421,7 +325,16 @@ fn start_agent_error_message_for_status(
                 blocked_action.to_string()
             })
         }
-        ConversationStatus::InProgress | ConversationStatus::Success => None,
+        // `WaitingForEvents` is treated like `InProgress`/`Success` here:
+        // a child that's actively waiting for events has, by definition,
+        // already initialized successfully and is not an error case.
+        // TransientError is likewise non-terminal: a recovery is in flight,
+        // so keep waiting. The agent run is still in flight in all of these
+        // cases, so we don't surface an error message for the start path.
+        ConversationStatus::InProgress
+        | ConversationStatus::TransientError
+        | ConversationStatus::Success
+        | ConversationStatus::WaitingForEvents => None,
     }
 }
 
@@ -430,9 +343,11 @@ impl Entity for StartAgentExecutor {
 }
 
 pub enum StartAgentExecutorEvent {
-    CreateAgent(StartAgentRequest),
+    CreateAgent(Box<StartAgentRequest>),
+    /// A child agent failed at the launch stage (never started a server-side
+    /// run). The owning terminal view removes its hidden pane and conversation
+    /// so the orchestration pill bar does not retain a dead chip.
+    CleanupFailedChildLaunch {
+        conversation_id: AIConversationId,
+    },
 }
-
-#[cfg(test)]
-#[path = "start_agent_tests.rs"]
-mod tests;

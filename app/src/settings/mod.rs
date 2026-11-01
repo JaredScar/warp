@@ -18,8 +18,9 @@ mod init;
 pub mod initializer;
 mod input;
 mod input_mode;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod linux;
+mod local_control;
 pub mod macros;
 pub mod manager;
 pub mod native_preference;
@@ -27,10 +28,17 @@ mod onboarding;
 mod pane;
 mod privacy;
 mod same_line_prompt_block;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod schema_generation;
 mod scroll;
 mod select;
+mod shared_object_limit_banner;
 mod ssh;
 mod theme;
+mod tui_autoupdate;
+mod tui_theme;
+mod tui_voice;
+mod tui_zero_state;
 mod vim_banner;
 
 #[cfg(test)]
@@ -52,17 +60,25 @@ pub use gpu::*;
 pub use init::*;
 pub use input::*;
 pub use input_mode::*;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub use linux::*;
+pub use local_control::*;
 pub use native_preference::*;
-pub use onboarding::*;
+pub(crate) use onboarding::*;
 pub use pane::*;
 pub use privacy::*;
 pub use same_line_prompt_block::*;
+#[cfg(not(target_family = "wasm"))]
+pub use schema_generation::dump_settings_schema;
 pub use scroll::*;
 pub use select::*;
+pub use shared_object_limit_banner::*;
 pub use ssh::*;
 pub use theme::*;
+pub use tui_autoupdate::*;
+pub use tui_theme::*;
+pub use tui_voice::*;
+pub use tui_zero_state::*;
 pub use vim_banner::*;
 use warp_core::user_preferences::GetUserPreferences as _;
 
@@ -115,23 +131,25 @@ impl SettingsFileError {
     }
 }
 
-use crate::{
-    root_view::QuakeModePinPosition,
-    terminal::{BlockListSettings, BlockPadding},
-    themes::theme::{ThemeKind, WarpTheme},
-    user_config::WarpConfig,
-};
+use std::collections::HashMap;
+use std::ops::Mul;
+use std::path::PathBuf;
+
 use lazy_static::lazy_static;
-use pathfinder_geometry::{rect::RectF, vector::Vector2F};
+use pathfinder_geometry::rect::RectF;
+use pathfinder_geometry::vector::Vector2F;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use settings::Setting as _;
-use std::{collections::HashMap, ops::Mul, path::PathBuf};
 use warp_core::features::FeatureFlag;
-use warpui::{
-    elements::DEFAULT_UI_LINE_HEIGHT_RATIO, keymap::Keystroke, AppContext, DisplayIdx,
-    SingletonEntity,
-};
+use warpui::elements::DEFAULT_UI_LINE_HEIGHT_RATIO;
+use warpui::keymap::Keystroke;
+use warpui::{AppContext, DisplayIdx, SingletonEntity};
+
+use crate::root_view::QuakeModePinPosition;
+use crate::terminal::{BlockListSettings, BlockPadding};
+use crate::themes::theme::{ThemeKind, WarpTheme};
+use crate::user_config::WarpConfig;
 
 // The following are user preferences keys.
 pub const CHANGELOG_VERSIONS: &str = "ChangelogVersions";
@@ -214,6 +232,7 @@ pub enum CtrlTabBehavior {
     #[default]
     ActivatePrevNextTab,
     CycleMostRecentSession,
+    CycleMostRecentTab,
 }
 
 impl CtrlTabBehavior {
@@ -221,6 +240,7 @@ impl CtrlTabBehavior {
         match self {
             Self::ActivatePrevNextTab => "Activate previous/next tab",
             Self::CycleMostRecentSession => "Cycle most recent session",
+            Self::CycleMostRecentTab => "Cycle most recent tab",
         }
     }
 }
@@ -254,7 +274,7 @@ pub struct Settings;
 /// later allow users to have both quake mode and activation mode enabled simultaneously. If/when
 /// that happens we'll remove this enum. These options are not modeled as a ternary option in the
 /// serialized user-defaults, but as independent options.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GlobalHotkeyMode {
     #[default]
     Disabled,
@@ -488,7 +508,7 @@ impl Settings {
             match res {
                 Ok(versions) => versions[&changelog_version].as_bool().unwrap_or(false),
                 Err(e) => {
-                    log::warn!("Error deserializing changlog user default {e}");
+                    log::warn!("Error deserializing changelog user default {e}");
                     false
                 }
             }
@@ -586,7 +606,16 @@ pub fn user_preferences_file_path() -> PathBuf {
     warp_core::paths::config_local_dir().join("user_preferences.json")
 }
 
-/// Returns the path to the TOML settings file.
+/// Returns the path to the TOML settings file for the active settings surface.
+///
+/// Both surfaces use the same `settings.toml` file name but live in different
+/// config directories (the GUI under [`warp_core::paths::config_local_dir`], the
+/// TUI under [`warp_core::paths::tui_config_local_dir`]) so an installed GUI and
+/// TUI never share (and clobber) one file.
 pub fn user_preferences_toml_file_path() -> PathBuf {
-    warp_core::paths::config_local_dir().join("settings.toml")
+    let config_dir = match settings::settings_mode() {
+        settings::SettingsMode::Gui => warp_core::paths::config_local_dir(),
+        settings::SettingsMode::Tui => warp_core::paths::tui_config_local_dir(),
+    };
+    config_dir.join("settings.toml")
 }

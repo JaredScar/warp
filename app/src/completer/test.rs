@@ -3,19 +3,16 @@ use std::iter::FromIterator;
 use std::sync::Arc;
 
 use itertools::Itertools;
-use typed_path::TypedPathBuf;
+use typed_path::{TypedPath, TypedPathBuf};
 #[cfg(windows)]
 use typed_path::{UnixComponent, WindowsComponent, WindowsPrefix};
-use warp_completer::completer::PathCompletionContext;
-use warp_completer::completer::{CompletionContext, EngineDirEntry};
+use warp_completer::completer::{CompletionContext, EngineDirEntry, PathCompletionContext};
 use warp_completer::signatures::CommandRegistry;
 use warpui::App;
 
 use crate::completer::SessionContext;
-use crate::terminal::model::session::Session;
-use crate::terminal::model::session::{
-    command_executor::testing::TestCommandExecutor, SessionInfo,
-};
+use crate::terminal::model::session::command_executor::testing::TestCommandExecutor;
+use crate::terminal::model::session::{Session, SessionInfo};
 use crate::test_util::{Stub, VirtualFS};
 
 fn test_session_context(session: Session, cwd: TypedPathBuf, app: &App) -> SessionContext {
@@ -277,6 +274,46 @@ pub fn test_session_context_lists_directory_entries_remotely() {
     });
 }
 
+/// Regression test for APP-5190: in a remote/Warpified session a symlink pointing at a
+/// directory is classified as a directory (so it completes with a trailing separator and is
+/// offered for `cd`), while a symlink to a file completes as a file.
+#[cfg(unix)]
+#[test]
+pub fn test_session_context_follows_symlinked_directories_remotely() {
+    App::test((), |app| async move {
+        VirtualFS::test(
+            "test_session_context_follows_symlinked_directories_remotely",
+            |dirs, mut sandbox| {
+                sandbox.mkdir("real_dir");
+                sandbox.touch(vec![Stub::EmptyFile("real_file.txt")]);
+                sandbox.ln("real_dir", "link_to_dir");
+                sandbox.ln("real_file.txt", "link_to_file");
+
+                let cwd = TypedPathBuf::from(dirs.tests().to_string_lossy().as_bytes());
+                let ctx = test_session_context(Session::test_remote(), cwd.clone(), &app);
+
+                let mut entries = HashSet::<EngineDirEntry>::from_iter(Arc::unwrap_or_clone(
+                    warpui::r#async::block_on(ctx.list_directory_entries(cwd)),
+                ));
+                // TODO(CORE-2000): The ls script we use to list entries in remote
+                // sessions adds a spurious "." directory when run in the VirtualFS.
+                // As a temporary workaround, we remove this file in the test.
+                entries.remove(&EngineDirEntry::test_dir("."));
+
+                assert_eq!(
+                    entries,
+                    HashSet::from_iter([
+                        EngineDirEntry::test_dir("real_dir"),
+                        EngineDirEntry::test_file("real_file.txt"),
+                        EngineDirEntry::test_dir("link_to_dir"),
+                        EngineDirEntry::test_file("link_to_file"),
+                    ])
+                );
+            },
+        );
+    });
+}
+
 fn perform_special_characters_in_path_test(session: Session, file_names: Vec<&str>) {
     let file_names = file_names
         .iter()
@@ -371,4 +408,169 @@ pub fn test_session_context_lists_directory_entries_remotely_with_special_charac
     let file_names = vec![r"a.txt", r"b file.txt", r"c's.txt", r"#d&.txt"];
 
     perform_special_characters_in_path_test(Session::test_remote(), file_names);
+}
+
+#[test]
+pub fn test_session_context_refresh_directory_entries_bypasses_cache() {
+    App::test((), |app| async move {
+        VirtualFS::test(
+            "test_session_context_refresh_directory_entries_bypasses_cache",
+            |dirs, mut sandbox| {
+                sandbox.touch(vec![Stub::EmptyFile("first.txt")]);
+
+                let tests_dir = TypedPathBuf::from(dirs.tests().to_string_lossy().as_bytes());
+                let ctx = test_session_context(Session::test(), tests_dir.clone(), &app);
+
+                // Prime the shared cache with the directory's initial contents.
+                let cached = warpui::r#async::block_on(
+                    ctx.path_completion_context()
+                        .expect("Path completion context should exist with active session")
+                        .list_directory_entries(tests_dir.clone()),
+                );
+                assert_eq!(
+                    HashSet::<EngineDirEntry>::from_iter(Arc::unwrap_or_clone(cached)),
+                    HashSet::from_iter([EngineDirEntry::test_file("first.txt")]),
+                );
+
+                // Add a file on disk after the listing has already been cached.
+                sandbox.touch(vec![Stub::EmptyFile("second.txt")]);
+
+                // `list_directory_entries` keeps returning the stale cached listing.
+                let stale = warpui::r#async::block_on(
+                    ctx.path_completion_context()
+                        .expect("Path completion context should exist with active session")
+                        .list_directory_entries(tests_dir.clone()),
+                );
+                assert_eq!(
+                    HashSet::<EngineDirEntry>::from_iter(Arc::unwrap_or_clone(stale)),
+                    HashSet::from_iter([EngineDirEntry::test_file("first.txt")]),
+                );
+
+                // `refresh_directory_entries` re-reads from disk and overwrites the cached entry.
+                let refreshed =
+                    warpui::r#async::block_on(ctx.refresh_directory_entries(tests_dir.clone()));
+                assert_eq!(
+                    HashSet::<EngineDirEntry>::from_iter(Arc::unwrap_or_clone(refreshed)),
+                    HashSet::from_iter([
+                        EngineDirEntry::test_file("first.txt"),
+                        EngineDirEntry::test_file("second.txt"),
+                    ]),
+                );
+
+                // Subsequent cached reads now observe the refreshed listing.
+                let after_refresh = warpui::r#async::block_on(
+                    ctx.path_completion_context()
+                        .expect("Path completion context should exist with active session")
+                        .list_directory_entries(tests_dir),
+                );
+                assert_eq!(
+                    HashSet::<EngineDirEntry>::from_iter(Arc::unwrap_or_clone(after_refresh)),
+                    HashSet::from_iter([
+                        EngineDirEntry::test_file("first.txt"),
+                        EngineDirEntry::test_file("second.txt"),
+                    ]),
+                );
+            },
+        );
+    });
+}
+
+#[test]
+pub fn test_ls_script_for_dir_builds_the_expected_command() {
+    let directory = TypedPath::unix("/home/user/somedir");
+    let script = super::ls_script_for_dir(&directory)
+        .expect("a UTF-8 directory should always produce a script");
+
+    // Assert on structure rather than the exact byte-for-byte string: this is what matters for
+    // correctness (the target directory, following symlinks with `-L`, both `find` passes, and
+    // collapsing to a single line for in-band executors), without pinning incidental whitespace.
+    assert!(
+        !script.contains('\n'),
+        "script must be collapsed to a single line: {script:?}"
+    );
+    assert!(script.contains("cd /home/user/somedir &&"), "{script:?}");
+    assert!(
+        script.contains("find -L . -maxdepth 1 -type d -print0"),
+        "{script:?}"
+    );
+    assert!(script.contains("printf '%b' '\\0'"), "{script:?}");
+    assert!(
+        script.contains("find -L . -maxdepth 1 -not -type d -print0"),
+        "{script:?}"
+    );
+}
+
+#[test]
+pub fn test_parse_ls_script_output_splits_dirs_and_files() {
+    let output = b"./foo\0.\0\0./bar.txt\0./baz.txt\0";
+
+    assert_eq!(
+        HashSet::<EngineDirEntry>::from_iter(
+            super::parse_ls_script_output(output).expect("well-formed output should parse")
+        ),
+        HashSet::from_iter([
+            EngineDirEntry::test_dir("foo"),
+            EngineDirEntry::test_file("bar.txt"),
+            EngineDirEntry::test_file("baz.txt"),
+        ])
+    );
+}
+
+#[test]
+pub fn test_parse_ls_script_output_drops_only_the_non_utf8_entry() {
+    let mut output = b"./good_dir\0.\0\0./good_file.txt\0./bad_".to_vec();
+    output.extend_from_slice(&[0xFF, 0xFE]); // Not valid UTF-8 on its own.
+    output.push(0);
+
+    assert_eq!(
+        HashSet::<EngineDirEntry>::from_iter(
+            super::parse_ls_script_output(&output)
+                .expect("a non-UTF-8 entry shouldn't fail parsing")
+        ),
+        HashSet::from_iter([
+            EngineDirEntry::test_dir("good_dir"),
+            EngineDirEntry::test_file("good_file.txt"),
+        ])
+    );
+}
+
+#[test]
+pub fn test_parse_ls_script_output_zero_files_is_a_real_listing() {
+    let output = b"./only-dir\0\0";
+
+    assert_eq!(
+        super::parse_ls_script_output(output)
+            .expect("a complete one-dir/zero-file output should parse"),
+        vec![EngineDirEntry::test_dir("only-dir")]
+    );
+}
+
+#[test]
+pub fn test_parse_ls_script_output_empty_directory_is_a_real_listing() {
+    let output = b"\0";
+
+    assert_eq!(
+        super::parse_ls_script_output(output)
+            .expect("a lone separator should parse as an empty directory"),
+        Vec::<EngineDirEntry>::new()
+    );
+}
+
+#[test]
+pub fn test_parse_ls_script_output_truncated_before_separator_fails() {
+    let output = b"./only-dir\0";
+
+    assert_eq!(super::parse_ls_script_output(output), None);
+}
+
+#[test]
+pub fn test_parse_ls_script_output_empty_output_fails() {
+    assert_eq!(super::parse_ls_script_output(b""), None);
+}
+
+#[test]
+pub fn test_parse_ls_script_output_truncated_mid_file_entry_fails() {
+    let output = b"./dir\0\0./whole_file.txt\0./partial_fil";
+
+    assert_eq!(super::parse_ls_script_output(output), None);
 }

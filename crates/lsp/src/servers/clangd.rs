@@ -3,16 +3,16 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 #[cfg(feature = "local_fs")]
 use command::r#async::Command;
 
+use crate::CommandBuilder;
 #[cfg(feature = "local_fs")]
 use crate::install::{
-    fetch_latest_metadata_from_github_dynamic_asset, install_from_github, AssetKind,
+    AssetKind, fetch_latest_metadata_from_github_dynamic_asset, install_from_github,
 };
 use crate::language_server_candidate::{LanguageServerCandidate, LanguageServerMetadata};
-use crate::CommandBuilder;
-use async_trait::async_trait;
 
 #[cfg(feature = "local_fs")]
 const SERVER_NAME: &str = "clangd";

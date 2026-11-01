@@ -1,8 +1,3 @@
-use crate::appearance::Appearance;
-use crate::search::ai_context_menu::styles;
-use crate::search::ai_context_menu::{mixer::AIContextMenuSearchableAction, safe_truncate};
-use crate::search::item::{IconLocation, SearchItem};
-use crate::search::result_renderer::ItemHighlightState;
 use fuzzy_match::FuzzyMatchResult;
 use ordered_float::OrderedFloat;
 use warpui::elements::{
@@ -13,6 +8,11 @@ use warpui::{AppContext, Element, SingletonEntity};
 
 // Import CodeSymbol from the data_source module
 use super::data_source::CodeSymbol;
+use crate::appearance::Appearance;
+use crate::search::ai_context_menu::mixer::AIContextMenuSearchableAction;
+use crate::search::ai_context_menu::{safe_truncate, styles};
+use crate::search::item::{IconLocation, SearchItem};
+use crate::search::result_renderer::ItemHighlightState;
 
 const MAX_COMBINED_LENGTH: usize = 55;
 
@@ -124,11 +124,7 @@ impl SearchItem for CodeSearchItem {
                 .filter_map(|&i| {
                     let adjusted_i = if let Some(symbol_type) = &self.code_symbol.symbol.type_prefix
                     {
-                        if i < symbol_type.len() {
-                            i
-                        } else {
-                            i + 1
-                        }
+                        if i < symbol_type.len() { i } else { i + 1 }
                     } else {
                         i
                     };

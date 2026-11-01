@@ -1,36 +1,31 @@
-use std::fs;
-use std::io;
 use std::io::Write;
 use std::path::Path;
+use std::{fs, io};
 
-use walkdir::DirEntry;
-
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use itertools::Itertools;
 use repo_metadata::RepositoryUpdate;
-use warpui::{ModelContext, SingletonEntity};
+use warpui::{ModelContext, ModelHandle, SingletonEntity};
 
-use crate::actions::model::{builtin_actions, Action, SavedWorkspace, Trigger};
-use crate::actions::storage::load_runbooks;
+use super::util::{
+    for_each_dir_entry, has_name, is_config_file, parse_model_config_dir_entry,
+    parse_multi_launch_config_dir_entry, parse_multi_workflow_dir_entry,
+    parse_single_theme_dir_entry, parse_tab_config_dir_entry,
+};
+use super::{
+    LAUNCH_CONFIG_COMMENT, WarpConfigUpdateEvent, custom_model_routers_dir, launch_configs_dir,
+    tab_configs_dir, themes_dir, workflows_dir,
+};
+use crate::ai::custom_model_routers::{CustomModelRouter, ModelConfigError};
 use crate::features::FeatureFlag;
 use crate::launch_configs::launch_config::LaunchConfig;
 use crate::tab_configs::{TabConfig, TabConfigError};
 use crate::themes::theme::WarpThemeConfig;
 use crate::warp_managed_paths_watcher::{
-    repository_update_touches_path, repository_update_touches_prefix, WarpManagedPathsWatcher,
-    WarpManagedPathsWatcherEvent,
+    WarpManagedPathsWatcher, WarpManagedPathsWatcherEvent, repository_update_touches_path,
+    repository_update_touches_prefix,
 };
 use crate::workflows::workflow::Workflow;
-
-use super::util::{
-    for_each_dir_entry, has_name, is_config_file, parse_multi_launch_config_dir_entry,
-    parse_multi_workflow_dir_entry, parse_single_theme_dir_entry, parse_tab_config_dir_entry,
-};
-use super::{
-    actions_dir, color_rules_file, launch_configs_dir, naming_rules_file, runbooks_dir,
-    saved_workspaces_dir, tab_configs_dir, themes_dir, triggers_dir, workflows_dir, TabColorRule,
-    TabNamingRule, WarpConfigUpdateEvent, LAUNCH_CONFIG_COMMENT,
-};
 
 impl super::WarpConfig {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
@@ -61,35 +56,25 @@ impl super::WarpConfig {
             );
         }
         let _ = ctx.spawn(
-            async move {
-                let actions = load_actions(&actions_dir());
-                let triggers = load_triggers(&triggers_dir());
-                let workspaces = load_saved_workspaces(&saved_workspaces_dir());
-                let naming_rules = load_naming_rules(&naming_rules_file());
-                let color_rules = load_color_rules(&color_rules_file());
-                let runbooks = load_runbooks(&runbooks_dir());
-                (actions, triggers, workspaces, naming_rules, color_rules, runbooks)
-            },
-            |me, (actions, triggers, workspaces, naming_rules, color_rules, runbooks), ctx| {
-                // Prepend built-ins so they are always first and always present.
-                let mut all_actions = builtin_actions();
-                all_actions.extend(actions);
-                me.actions = all_actions;
-                me.triggers = triggers;
-                me.saved_workspaces = workspaces;
-                me.tab_naming_rules = naming_rules;
-                me.tab_color_rules = color_rules;
-                me.runbooks = runbooks;
-                ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
-            },
-        );
-        let _ = ctx.spawn(
             async move { load_workflows(&workflows_dir()) },
             |me, user_workflows, ctx| {
                 me.local_user_workflows = user_workflows;
                 ctx.emit(WarpConfigUpdateEvent::LocalUserWorkflows);
             },
         );
+        if FeatureFlag::CustomModelRouters.is_enabled() {
+            let _ = ctx.spawn(
+                async move { load_model_configs(&custom_model_routers_dir()) },
+                |me, (models, errors), ctx| {
+                    me.custom_model_routers = models;
+                    me.custom_model_router_errors = errors;
+                    ctx.emit(WarpConfigUpdateEvent::ModelConfigs);
+                    // Don't emit ModelConfigErrors on startup — like tab configs,
+                    // the error toast should only appear when the user saves a
+                    // file, not on app restart.
+                },
+            );
+        }
         ctx.subscribe_to_model(
             &WarpManagedPathsWatcher::handle(ctx),
             Self::handle_warp_managed_paths_event,
@@ -103,6 +88,7 @@ impl super::WarpConfig {
 
     fn handle_warp_managed_paths_event(
         &mut self,
+        _: ModelHandle<WarpManagedPathsWatcher>,
         event: &WarpManagedPathsWatcherEvent,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -156,55 +142,19 @@ impl super::WarpConfig {
             );
         }
 
-        if update_touches_dir(update, &actions_dir())
-            || update_touches_dir(update, &triggers_dir())
-            || update_touches_dir(update, &saved_workspaces_dir())
+        if FeatureFlag::CustomModelRouters.is_enabled()
+            && update_touches_dir(update, &custom_model_routers_dir())
         {
+            let dir_path = custom_model_routers_dir();
             let _ = ctx.spawn(
-                async move {
-                    let actions = load_actions(&actions_dir());
-                    let triggers = load_triggers(&triggers_dir());
-                    let workspaces = load_saved_workspaces(&saved_workspaces_dir());
-                    (actions, triggers, workspaces)
-                },
-                |me, (actions, triggers, workspaces), ctx| {
-                    let mut all_actions = builtin_actions();
-                    all_actions.extend(actions);
-                    me.actions = all_actions;
-                    me.triggers = triggers;
-                    me.saved_workspaces = workspaces;
-                    ctx.emit(WarpConfigUpdateEvent::ActionsAndTriggers);
-                },
-            );
-        }
-
-        if repository_update_touches_path(update, &naming_rules_file()) {
-            let _ = ctx.spawn(
-                async move { load_naming_rules(&naming_rules_file()) },
-                |me, naming_rules, ctx| {
-                    me.tab_naming_rules = naming_rules;
-                    ctx.emit(WarpConfigUpdateEvent::TabNamingRules);
-                },
-            );
-        }
-
-        if repository_update_touches_path(update, &color_rules_file()) {
-            let _ = ctx.spawn(
-                async move { load_color_rules(&color_rules_file()) },
-                |me, color_rules, ctx| {
-                    me.tab_color_rules = color_rules;
-                    ctx.emit(WarpConfigUpdateEvent::TabColorRules);
-                },
-            );
-        }
-
-        if repository_update_touches_prefix(update, &runbooks_dir()) {
-            let dir = runbooks_dir();
-            let _ = ctx.spawn(
-                async move { load_runbooks(&dir) },
-                |me, runbooks, ctx| {
-                    me.runbooks = runbooks;
-                    ctx.emit(WarpConfigUpdateEvent::Runbooks);
+                async move { load_model_configs(&dir_path) },
+                |me, (models, errors), ctx| {
+                    me.custom_model_routers = models;
+                    me.custom_model_router_errors = errors.clone();
+                    ctx.emit(WarpConfigUpdateEvent::ModelConfigs);
+                    if !errors.is_empty() {
+                        ctx.emit(WarpConfigUpdateEvent::ModelConfigErrors(errors));
+                    }
                 },
             );
         }
@@ -214,6 +164,53 @@ impl super::WarpConfig {
         {
             ctx.emit(WarpConfigUpdateEvent::Settings);
         }
+    }
+
+    /// Writes a custom model router to disk as a YAML file.
+    ///
+    /// When `existing_path` is provided (editing) the file at that path is
+    /// overwritten; otherwise a new file is created under
+    /// `custom_model_routers_dir()`. The file name is derived from `name` by
+    /// lowercasing and replacing non-alphanumeric characters (except `-`) with
+    /// `_`. If the candidate path already exists, a numeric suffix is appended
+    /// (`_2`, `_3`, …) until a free slot is found. Returns the path written to.
+    #[cfg(feature = "local_fs")]
+    pub fn save_custom_model_router(
+        name: &str,
+        yaml: &str,
+        existing_path: Option<&std::path::Path>,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let dir = custom_model_routers_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| anyhow::anyhow!("could not create custom_model_routers dir: {e}"))?;
+        let path = if let Some(p) = existing_path {
+            p.to_path_buf()
+        } else {
+            let sanitized = name
+                .to_lowercase()
+                .replace(|c: char| !c.is_alphanumeric() && c != '-', "_");
+            let candidate = dir.join(format!("{sanitized}.yaml"));
+            if candidate.exists() {
+                (2..)
+                    .map(|n| dir.join(format!("{sanitized}_{n}.yaml")))
+                    .find(|p| !p.exists())
+                    .expect("infinite iterator always finds a free slot")
+            } else {
+                candidate
+            }
+        };
+        std::fs::write(&path, yaml)
+            .map_err(|e| anyhow::anyhow!("could not write router file: {e}"))?;
+        Ok(path)
+    }
+
+    /// Deletes a custom model router file from disk.
+    /// The filesystem watcher in [`Self::handle_warp_managed_paths_event`] will
+    /// pick up the deletion and reload `custom_model_routers`.
+    #[cfg(feature = "local_fs")]
+    pub fn delete_custom_model_router(source_path: &std::path::Path) -> anyhow::Result<()> {
+        std::fs::remove_file(source_path)
+            .map_err(|e| anyhow::anyhow!("could not delete router file: {e}"))
     }
 
     /// This method takes a file name candidate (appends .yaml if missing) and a LaunchConfig as
@@ -272,6 +269,30 @@ pub fn load_launch_configs(launch_config_path: &Path) -> Vec<LaunchConfig> {
         .collect_vec()
 }
 
+/// Loads custom model routers from the config directory at `dir_path`
+/// (`~/.warp/custom_model_routers/`), where each file defines a single router.
+/// Returns the parsed routers (sorted by display name) and any per-file
+/// parse/validation errors. If the directory does not exist, returns empty vecs.
+pub fn load_model_configs(dir_path: &Path) -> (Vec<CustomModelRouter>, Vec<ModelConfigError>) {
+    let results = for_each_dir_entry(dir_path, parse_model_config_dir_entry);
+    let mut models = Vec::new();
+    let mut errors = Vec::new();
+    for result in results {
+        match result {
+            Ok(model) => models.push(model),
+            Err(error) => errors.push(error),
+        }
+    }
+    models.sort_by(|a, b| {
+        let a_name = a.info.display_name.to_lowercase();
+        let b_name = b.info.display_name.to_lowercase();
+        a_name
+            .cmp(&b_name)
+            .then_with(|| a.info.display_name.cmp(&b.info.display_name))
+    });
+    (models, errors)
+}
+
 /// Loads all tab configs from `tab_config_path`. Each tab config is an individual TOML file.
 ///
 /// Returns successfully parsed configs and any errors for files that failed to parse.
@@ -303,120 +324,4 @@ fn update_touches_path(update: &RepositoryUpdate, path: &Path) -> bool {
     let canonical_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     repository_update_touches_path(update, path)
         || repository_update_touches_path(update, &canonical_path)
-}
-
-/// Returns `true` if `item` is a regular `.toml` file.
-fn is_toml_dir_entry(item: &DirEntry) -> bool {
-    item.metadata()
-        .map(|m| m.is_file())
-        .unwrap_or(false)
-        && item
-            .path()
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("toml"))
-            .unwrap_or(false)
-}
-
-/// Loads all actions from `~/.warp/actions/*.toml`.
-pub fn load_actions(dir: &Path) -> Vec<Action> {
-    for_each_dir_entry(dir, |item| {
-        if !is_toml_dir_entry(item) {
-            return None;
-        }
-        let mut action: Action = super::util::from_toml(item.path().into()).ok()?;
-        action.source_path = Some(item.path().into());
-        Some(action)
-    })
-}
-
-/// Loads all triggers from `~/.warp/triggers/*.toml`.
-pub fn load_triggers(dir: &Path) -> Vec<Trigger> {
-    for_each_dir_entry(dir, |item| {
-        if !is_toml_dir_entry(item) {
-            return None;
-        }
-        let mut trigger: Trigger = super::util::from_toml(item.path().into()).ok()?;
-        trigger.source_path = Some(item.path().into());
-        Some(trigger)
-    })
-}
-
-/// Loads all saved workspaces from `~/.warp/workspaces/*.toml`.
-pub fn load_saved_workspaces(dir: &Path) -> Vec<SavedWorkspace> {
-    for_each_dir_entry(dir, |item| {
-        if !is_toml_dir_entry(item) {
-            return None;
-        }
-        let mut ws: SavedWorkspace = super::util::from_toml(item.path().into()).ok()?;
-        ws.source_path = Some(item.path().into());
-        Some(ws)
-    })
-}
-
-/// Loads tab naming rules from `~/.warp/naming_rules.toml`.
-pub fn load_naming_rules(path: &Path) -> Vec<TabNamingRule> {
-    if !path.exists() {
-        return Vec::new();
-    }
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    #[derive(serde::Deserialize)]
-    struct NamingRulesFile {
-        #[serde(default)]
-        rules: Vec<TabNamingRule>,
-    }
-    toml::from_str::<NamingRulesFile>(&content)
-        .map(|f| f.rules)
-        .unwrap_or_default()
-}
-
-pub fn load_color_rules(path: &Path) -> Vec<TabColorRule> {
-    if !path.exists() {
-        return Vec::new();
-    }
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    #[derive(serde::Deserialize)]
-    struct ColorRulesFile {
-        #[serde(default)]
-        rules: Vec<TabColorRule>,
-    }
-    toml::from_str::<ColorRulesFile>(&content)
-        .map(|f| f.rules)
-        .unwrap_or_default()
-}
-
-/// Saves tab color rules to `~/.warp/color_rules.toml`.
-pub fn save_color_rules(rules: &[TabColorRule]) -> Result<()> {
-    let path = super::color_rules_file();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    #[derive(serde::Serialize)]
-    struct ColorRulesFile<'a> {
-        rules: &'a [TabColorRule],
-    }
-    let content = toml::to_string_pretty(&ColorRulesFile { rules })?;
-    fs::write(&path, content)?;
-    Ok(())
-}
-
-/// Saves tab naming rules to `~/.warp/naming_rules.toml`.
-pub fn save_naming_rules(rules: &[TabNamingRule]) -> Result<()> {
-    let path = super::naming_rules_file();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    #[derive(serde::Serialize)]
-    struct NamingRulesFile<'a> {
-        rules: &'a [TabNamingRule],
-    }
-    let content = toml::to_string_pretty(&NamingRulesFile { rules })?;
-    fs::write(&path, content)?;
-    Ok(())
 }

@@ -1,34 +1,27 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use chrono::{DateTime, Local, TimeZone as _};
 use futures::Future;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
-
 use warp_core::command::ExitCode;
+use warp_errors::report_error;
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 
-use super::{
-    model::block::{AgentInteractionMetadata, Block, SerializedAIMetadata, SerializedBlock},
-    shell::ShellType,
-};
-use crate::{
-    cloud_object::{
-        model::{persistence::CloudModel, view::CloudViewModel},
-        Space,
-    },
-    server::ids::{ClientId, HashableId as _, SyncId},
-    terminal::model::session::{Session, SessionId},
-    util::dedupe_from_last,
-    workflows::{
-        local_workflows::LocalWorkflows, workflow::Workflow, WorkflowId, WorkflowSource,
-        WorkflowType,
-    },
-};
+use super::model::block::{AgentInteractionMetadata, Block, SerializedAIMetadata, SerializedBlock};
+use super::shell::ShellType;
+use crate::cloud_object::Space;
+use crate::cloud_object::model::persistence::CloudModel;
+use crate::cloud_object::model::view::CloudViewModel;
+use crate::server::ids::{ClientId, HashableId as _, SyncId};
+use crate::terminal::model::session::{Session, SessionId};
+use crate::util::dedupe_from_last;
+use crate::workflows::local_workflows::LocalWorkflows;
+use crate::workflows::workflow::Workflow;
+use crate::workflows::{WorkflowId, WorkflowSource, WorkflowType};
 
 mod up_arrow;
-pub(crate) use up_arrow::UpArrowHistoryConfig;
+pub use up_arrow::UpArrowHistoryConfig;
 
 /// Data model for a history command persisted to sqlite, used as an intermediate representation
 /// between the sqlite schema (sqlite::model::Command) and the [`History`] model.
@@ -164,32 +157,12 @@ pub enum HistoryEvent {
     Initialized(SessionId),
 }
 
-/// This holds the aggregated data from the "commands" table in sqlite. We aggregate as a means of
-/// de-duping, and store data mostly for the most recent execution for each command.
-#[derive(Debug)]
-struct CommandHistorySummary {
-    /// The execution metadata from the latest time a particular command was run.
-    most_recent_entry: HistoryEntry,
-    /// Counts the number of executions in the "commands" table. Note that this may not match the
-    /// count in the HISTFILE.
-    count: u32,
-}
-
-impl CommandHistorySummary {
-    fn new(most_recent_entry: HistoryEntry) -> Self {
-        Self {
-            most_recent_entry,
-            count: 1,
-        }
-    }
-}
-
 #[derive(Default, Debug)]
 pub struct History {
-    /// For each ShellHost, the de-duped commands from the sqlite "commands" table is stored here.
-    /// Each time a history file is read, it gets "joined" to the commands in here to add the
-    /// execution metadata from the most recent run.
-    persisted_commands_summary: HashMap<ShellHost, HashMap<String, CommandHistorySummary>>,
+    /// For each ShellHost, the de-duped commands from the sqlite "commands" table is stored here,
+    /// keyed by command string. Each time a history file is read, it gets "joined" to the
+    /// commands in here to add the execution metadata from the most recent run.
+    persisted_commands_summary: HashMap<ShellHost, HashMap<String, HistoryEntry>>,
 
     /// Entries from the history file for the host.  Immutable once loaded and
     /// shared between sessions.
@@ -213,7 +186,7 @@ pub struct History {
     session_id_to_shell_host: HashMap<SessionId, ShellHost>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinkedWorkflowData {
     /// The history entry is linked to a `CloudWorkflow` by its ID.
     Id(SyncId),
@@ -468,7 +441,7 @@ impl History {
     pub fn new(persisted_commands: Vec<PersistedCommand>) -> Self {
         log::debug!("Creating new History model with persisted commands {persisted_commands:?}");
         let mut persisted_commands_summary =
-            HashMap::<ShellHost, HashMap<String, CommandHistorySummary>>::new();
+            HashMap::<ShellHost, HashMap<String, HistoryEntry>>::new();
 
         for command in persisted_commands {
             if let Some(shell_host) = command.shell_host.as_ref() {
@@ -478,8 +451,7 @@ impl History {
                 let hist_entry: HistoryEntry = command.into();
                 summaries
                     .entry(hist_entry.command.clone())
-                    .and_modify(|summary| summary.count += 1)
-                    .or_insert(CommandHistorySummary::new(hist_entry));
+                    .or_insert(hist_entry);
             }
         }
 
@@ -487,17 +459,6 @@ impl History {
             persisted_commands_summary,
             ..Default::default()
         }
-    }
-
-    /// Returns an iterator over a tuple of (count, &HistoryEntry) for all commands in the history.
-    /// where count is the number of times the command has been run.
-    pub fn command_summaries(&self, hostname: String) -> Vec<(u32, &HistoryEntry)> {
-        self.persisted_commands_summary
-            .iter()
-            .filter(|(shell_host, _)| shell_host.hostname == hostname)
-            .flat_map(|(_, summaries)| summaries.values())
-            .map(|summary| (summary.count, &summary.most_recent_entry))
-            .collect()
     }
 
     pub fn all_live_session_ids(&self) -> HashSet<SessionId> {
@@ -614,7 +575,7 @@ impl History {
             }
             Some(ReadHistoryFileState::Done) => {
                 let Some(history_file_commands) = self.history_file_commands.get(&host) else {
-                    log::error!(
+                    report_error!(
                         "History file commands should exist if history file has been read."
                     );
                     return;
@@ -665,7 +626,7 @@ impl History {
                     self.persisted_commands_summary
                         .get(&host)
                         .and_then(|summaries| summaries.get(&command))
-                        .map(|summary| summary.most_recent_entry.clone())
+                        .cloned()
                         .unwrap_or_else(|| HistoryEntry::command_only(command))
                 })
                 .map(Arc::new)
@@ -954,13 +915,13 @@ impl History {
         };
 
         for entry in session_commands.iter_mut().rev() {
-            if let Some(entry_start_ts) = &entry.start_ts {
-                if entry_start_ts.timestamp_millis() == command_start_ts.timestamp_millis() {
-                    let entry = Arc::make_mut(entry);
-                    entry.exit_code = Some(exit_code);
-                    entry.completed_ts = Some(command_completed_ts);
-                    break;
-                }
+            if let Some(entry_start_ts) = &entry.start_ts
+                && entry_start_ts.timestamp_millis() == command_start_ts.timestamp_millis()
+            {
+                let entry = Arc::make_mut(entry);
+                entry.exit_code = Some(exit_code);
+                entry.completed_ts = Some(command_completed_ts);
+                break;
             }
         }
     }

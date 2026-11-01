@@ -1,126 +1,113 @@
-use crate::ai::blocklist::view_util::render_provider_icon_button;
-use crate::ai::skills::{SkillOpenOrigin, SkillTelemetryEvent};
+use std::collections::HashMap;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use ai::diff_validation::{
+    DiffDelta, DiffType, ParsedDiff, SearchAndReplace, V4AHunk, fuzzy_match_diffs,
+    fuzzy_match_v4a_preview, parse_line_numbers,
+};
 use anyhow::Result;
+use futures::FutureExt;
+use futures::channel::oneshot;
+use futures::future::{BoxFuture, join_all};
 use lazy_static::lazy_static;
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use pathfinder_geometry::vector::vec2f;
-use rand::{distributions::Alphanumeric, thread_rng, Rng as _};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    rc::Rc,
-    sync::Arc,
-    time::Duration,
-};
-use warp_core::{
-    features::FeatureFlag,
-    platform::SessionPlatform,
-    settings::ToggleableSetting,
-    ui::{
-        appearance::Appearance,
-        color::CLAUDE_ORANGE,
-        theme::{
-            color::internal_colors::{fg_overlay_6, neutral_1, neutral_4},
-            Fill,
-        },
-    },
-    HostId,
-};
-use warp_editor::{
-    content::buffer::InitialBufferState, render::element::VerticalExpansionBehavior,
-};
+use rand::distributions::Alphanumeric;
+use rand::{Rng as _, thread_rng};
+use warp_core::features::FeatureFlag;
+use warp_core::platform::SessionPlatform;
+use warp_core::settings::ToggleableSetting;
+use warp_core::ui::appearance::Appearance;
+use warp_core::ui::color::CLAUDE_ORANGE;
+use warp_core::ui::theme::Fill;
+use warp_core::ui::theme::color::internal_colors::{fg_overlay_6, neutral_1, neutral_4};
+use warp_editor::content::buffer::InitialBufferState;
+use warp_editor::render::element::VerticalExpansionBehavior;
+use warp_errors::report_error;
 use warp_util::file::FileSaveError;
-use warp_util::path::common_path;
+use warp_util::local_or_remote_path::LocalOrRemotePath;
+use warp_util::remote_path::RemotePath;
 use warp_util::standardized_path::StandardizedPath;
+use warpui::elements::new_scrollable::{ScrollableAppearance, SingleAxisConfig};
+use warpui::elements::{
+    Align, Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ConstrainedBox,
+    Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, Empty, EventHandler, Flex,
+    FormattedTextElement, HighlightedHyperlink, Hoverable, MainAxisAlignment, MainAxisSize,
+    MouseStateHandle, NewScrollable, OffsetPositioning, ParentAnchor, ParentElement,
+    ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds, Radius,
+    SavePosition, ScrollTarget, ScrollToPositionMode, ScrollbarWidth, Shrinkable,
+    SizeConstraintCondition, SizeConstraintSwitch, Stack, Text,
+};
+use warpui::keymap::{EditableBinding, FixedBinding, Keystroke};
+use warpui::platform::{Cursor, OperatingSystem};
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{
-    elements::{
-        new_scrollable::{ScrollableAppearance, SingleAxisConfig},
-        Align, Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ConstrainedBox,
-        Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, Empty, EventHandler,
-        Flex, FormattedTextElement, HighlightedHyperlink, Hoverable, MainAxisAlignment,
-        MainAxisSize, MouseStateHandle, NewScrollable, OffsetPositioning, ParentAnchor,
-        ParentElement, ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds,
-        Radius, SavePosition, ScrollTarget, ScrollToPositionMode, ScrollbarWidth, Shrinkable,
-        SizeConstraintCondition, SizeConstraintSwitch, Stack, Text,
-    },
-    keymap::{EditableBinding, FixedBinding, Keystroke},
-    platform::{Cursor, OperatingSystem},
-    ui_components::components::{Coords, UiComponent, UiComponentStyles},
     AppContext, Element, Entity, FocusContext, ModelHandle, SingletonEntity, TypedActionView, View,
-    ViewContext, ViewHandle,
+    ViewContext, ViewHandle, WeakViewHandle,
 };
 
 use super::malformed_line_heuristics::has_malformed_terminal_correction_signal;
-use crate::view_components::action_button::{ActionButton, NakedTheme};
-use crate::{
-    ai::{
-        agent::{
-            icons::{self, yellow_stop_icon},
-            AIAgentActionId, AIIdentifiers, FileEdit, FileLocations, ServerOutputId,
-        },
-        blocklist::{
-            action_model::{
-                AIActionStatus, BlocklistAIActionEvent, BlocklistAIActionModel,
-                EditAcceptAndContinueClickedEvent, EditAcceptClickedEvent, EditResolvedEvent,
-                EditStats, MalformedFinalLineProxyEvent, RequestFileEditsFormatKind,
-                RequestFileEditsTelemetryEvent,
-            },
-            history_model::BlocklistAIHistoryModel,
-            inline_action::{
-                inline_action_header::INLINE_ACTION_HORIZONTAL_PADDING,
-                inline_action_icons::{cancelled_icon, green_check_icon, icon_size, reverted_icon},
-            },
-            model::{AIBlockModel, AIBlockModelHelper},
-            RequestedEditResolution,
-        },
-        mcp::{mcp_provider_from_file_path, MCPProvider},
-        paths::host_native_absolute_path,
-        predict::prompt_suggestions::ACCEPT_PROMPT_SUGGESTION_KEYBINDING,
-        skills::{
-            icon_override_for_skill_name, render_skill_button, skill_path_from_file_path,
-            SkillManager, SkillReference,
-        },
-    },
-    cmd_or_ctrl_shift,
-    code::{
-        diff_viewer::{DiffViewer, DisplayMode},
-        editor::{
-            add_color, remove_color,
-            view::{CodeEditorEvent, CodeEditorRenderOptions, CodeEditorView},
-        },
-        inline_diff::{InlineDiffView, InlineDiffViewEvent},
-        DiffResult,
-    },
-    code_review::telemetry_event::CodeReviewPaneEntrypoint,
-    menu::{Event as MenuEvent, Menu, MenuItemFields, MenuVariant},
-    pane_group::{
-        focus_state::PaneFocusHandle,
-        pane::{view, PaneId},
-        BackingView, PaneEvent,
-    },
-    send_telemetry_from_ctx,
-    server::telemetry::{AgentModeCodeFileNavigationSource, ToggleCodeSuggestionsSettingSource},
-    settings::AISettings,
-    terminal::{input::SET_INPUT_MODE_AGENT_ACTION_NAME, ShellLaunchData},
-    ui_components::{blended_colors, icons::Icon},
-    util::bindings::keybinding_name_to_keystroke,
-    view_components::{
-        action_button::{ButtonSize, KeystrokeSource},
-        compactible_action_button::{
-            render_compact_and_regular_button_rows, CompactibleActionButton,
-            RenderCompactibleActionButton, MEDIUM_SIZE_SWITCH_THRESHOLD,
-            XLARGE_SIZE_SWITCH_THRESHOLD,
-        },
-        compactible_split_action_button::CompactibleSplitActionButton,
-        DismissibleToast,
-    },
-    workspace::ToastStack,
-    TelemetryEvent,
+use crate::ai::agent::icons::{self, yellow_stop_icon};
+use crate::ai::agent::{
+    AIAgentActionId, AIIdentifiers, FileEdit, RequestFileEditsResult, ServerOutputId,
 };
-use ai::diff_validation::{
-    fuzzy_match_diffs, fuzzy_match_v4a_diffs, parse_line_numbers, DiffDelta, DiffType, ParsedDiff,
-    SearchAndReplace, V4AHunk,
+use crate::ai::blocklist::RequestedEditResolution;
+use crate::ai::blocklist::action_model::{
+    AIActionStatus, BlocklistAIActionEvent, BlocklistAIActionModel,
+    EditAcceptAndContinueClickedEvent, EditAcceptClickedEvent, EditResolvedEvent, EditStats,
+    MalformedFinalLineProxyEvent, RequestFileEditsFormatKind, RequestFileEditsTelemetryEvent,
 };
+use crate::ai::blocklist::diff_storage::{
+    DiffStorage, DiffStorageHelper, FileSnapshot, RegisteredDiffStorage, SaveFuture,
+    UpdatedFileState,
+};
+use crate::ai::blocklist::diff_types::{DiffSessionType, FileDiff, changed_lines_from_op};
+use crate::ai::blocklist::history_model::BlocklistAIHistoryModel;
+use crate::ai::blocklist::inline_action::inline_action_header::INLINE_ACTION_HORIZONTAL_PADDING;
+use crate::ai::blocklist::inline_action::inline_action_icons::{
+    cancelled_icon, green_check_icon, icon_size, reverted_icon,
+};
+use crate::ai::blocklist::model::{AIBlockModel, AIBlockModelHelper};
+use crate::ai::blocklist::view_util::render_provider_icon_button;
+use crate::ai::mcp::{MCPProvider, mcp_provider_from_file_path};
+use crate::ai::paths::host_native_absolute_path;
+use crate::ai::predict::prompt_suggestions::ACCEPT_PROMPT_SUGGESTION_KEYBINDING;
+use crate::ai::skills::{
+    SkillManager, SkillOpenOrigin, SkillReference, SkillTelemetryEvent,
+    icon_override_for_skill_name, render_skill_button, skill_path_from_location,
+};
+use crate::code::diff_viewer::{DiffViewer, DisplayMode};
+use crate::code::editor::view::{CodeEditorEvent, CodeEditorRenderOptions, CodeEditorView};
+use crate::code::editor::{add_color, remove_color};
+use crate::code::inline_diff::{InlineDiffView, InlineDiffViewEvent};
+use crate::code_review::telemetry_event::CodeReviewPaneEntrypoint;
+use crate::menu::{Event as MenuEvent, Menu, MenuItemFields, MenuVariant};
+use crate::pane_group::focus_state::PaneFocusHandle;
+use crate::pane_group::pane::{PaneId, view};
+use crate::pane_group::{BackingView, PaneEvent};
+use crate::server::telemetry::{
+    AgentModeCodeFileNavigationSource, ToggleCodeSuggestionsSettingSource,
+};
+use crate::settings::AISettings;
+use crate::terminal::ShellLaunchData;
+use crate::terminal::input::SET_INPUT_MODE_AGENT_ACTION_NAME;
+use crate::ui_components::blended_colors;
+use crate::ui_components::icons::Icon;
+use crate::util::bindings::keybinding_name_to_keystroke;
+use crate::view_components::DismissibleToast;
+use crate::view_components::action_button::{
+    ActionButton, ButtonSize, KeystrokeSource, NakedTheme,
+};
+use crate::view_components::compactible_action_button::{
+    CompactibleActionButton, MEDIUM_SIZE_SWITCH_THRESHOLD, RenderCompactibleActionButton,
+    XLARGE_SIZE_SWITCH_THRESHOLD, render_compact_and_regular_button_rows,
+};
+use crate::view_components::compactible_split_action_button::CompactibleSplitActionButton;
+use crate::workspace::ToastStack;
+use crate::{TelemetryEvent, cmd_or_ctrl_shift, send_telemetry_from_ctx};
 
 const REQUESTED_EDIT_CANCEL_LABEL: &str = "Cancel";
 const REQUESTED_EDIT_REFINE_LABEL: &str = "Refine";
@@ -233,17 +220,6 @@ struct CodeDiffViewMouseStates {
 pub enum CodeDiffViewEvent {
     TryAccept,
     EnableAutoexecuteMode,
-    SavedAcceptedDiffs {
-        diff: DiffResult,
-        updated_files: Vec<(FileLocations, bool)>,
-        /// The accepted file contents keyed by file path, extracted from the
-        /// editor buffers at the time of acceptance. This avoids re-reading
-        /// files from disk (or the remote server) when building context for
-        /// the LLM.
-        file_contents: Vec<(String, String)>,
-        deleted_files: Vec<String>,
-        save_errors: Vec<Rc<FileSaveError>>,
-    },
     Rejected,
     Pane(PaneEvent),
     EditModeChanged {
@@ -270,116 +246,13 @@ pub enum CodeDiffViewEvent {
     /// Emitted when the user opens a skill file from a code diff
     OpenSkill {
         reference: SkillReference,
-        path: PathBuf,
+        path: LocalOrRemotePath,
     },
     /// Emitted when the user opens an MCP config file from a code diff
     OpenMCPConfig {
         provider: MCPProvider,
         path: PathBuf,
     },
-}
-
-/// The base content and file path for a diff.
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub struct DiffBase {
-    /// The original file content before the diff is applied.
-    /// Empty for new file creation.
-    pub content: String,
-    /// The absolute file path.
-    pub file_path: String,
-}
-
-/// User-visible file diff with the original contents of the file
-/// and the changes to those contents.
-#[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub struct FileDiff {
-    pub base: DiffBase,
-    pub diff_type: DiffType,
-}
-
-impl FileDiff {
-    pub fn new(content: String, file_path: String, diff_type: DiffType) -> FileDiff {
-        FileDiff {
-            base: DiffBase { content, file_path },
-            diff_type,
-        }
-    }
-
-    pub fn file_path(&self) -> String {
-        self.base.file_path.clone()
-    }
-}
-
-/// The state of the saving diffs for a list of files.
-///
-/// When the requested edit is accepted, we have to 1) wait for the diff to be computed
-/// by the CodeDiffModel for each file 2) wait for the changes to be saved locally.
-///
-/// After the above two conditions are all met, we can emit the Accepted event with all of the diffs.
-/// This tracks which diffs have been computed.
-#[derive(Clone, Debug)]
-#[cfg_attr(target_family = "wasm", allow(dead_code))]
-pub struct SavingDiffs {
-    pending_diffs: Vec<DiffApplicationState>,
-}
-
-impl SavingDiffs {
-    /// Initialize an accepted diff state with N files.
-    fn new(length: usize) -> Self {
-        Self {
-            pending_diffs: vec![DiffApplicationState::default(); length],
-        }
-    }
-
-    /// Returns true if all of the diffs are saved and computed.
-    fn pending_diff_is_complete(&self) -> bool {
-        self.pending_diffs
-            .iter()
-            .all(|diff| diff.computed_diff.is_some() && diff.save_status.is_complete())
-    }
-
-    /// Update the diff application save state at the given idx.
-    fn mark_diff_saved(&mut self, idx: usize, save_error: Option<Rc<FileSaveError>>) {
-        if let Some(state) = self.pending_diffs.get_mut(idx) {
-            state.save_status = match save_error {
-                None => SaveStatus::Success,
-                Some(error) => SaveStatus::Failed(error),
-            };
-        }
-    }
-
-    /// Update the diff application compute state at the given idx.
-    fn mark_diff_computed(&mut self, idx: usize, diff: Rc<DiffResult>) {
-        if let Some(state) = self.pending_diffs.get_mut(idx) {
-            state.computed_diff = Some(diff);
-        }
-    }
-}
-
-/// The status of saving a file.
-#[derive(Clone, Debug, Default)]
-#[cfg_attr(target_family = "wasm", allow(dead_code))]
-enum SaveStatus {
-    #[default]
-    Pending,
-    Success,
-    Failed(Rc<FileSaveError>),
-}
-
-impl SaveStatus {
-    fn is_complete(&self) -> bool {
-        !matches!(self, SaveStatus::Pending)
-    }
-}
-
-/// The diff application state for a single file.
-#[derive(Clone, Debug, Default)]
-#[cfg_attr(target_family = "wasm", allow(dead_code))]
-struct DiffApplicationState {
-    computed_diff: Option<Rc<DiffResult>>,
-    save_status: SaveStatus,
 }
 
 #[derive(Clone, Debug)]
@@ -389,10 +262,8 @@ pub enum CodeDiffState {
     /// The user is reviewing (and possibly editing) the code diff.
     /// Unlike requested commands, a [`CodeDiffView`] is only created upon stream completion.
     WaitingForUser,
-    /// If the payload is some, the code diff was accepted but the individual file changes have not
-    /// been fully computed and saved yet. We cache the accepted diff state to collect unified diffs
-    /// from each file source.
-    Accepted(Option<SavingDiffs>),
+    /// The user accepted the diff; persistence happens off-view.
+    Accepted,
     /// The user rejected this code diff.
     Rejected,
     /// The changes were reverted after acceptance.
@@ -406,7 +277,7 @@ impl CodeDiffState {
     fn is_complete(&self) -> bool {
         matches!(
             self,
-            CodeDiffState::Accepted(_)
+            CodeDiffState::Accepted
                 | CodeDiffState::Rejected
                 | CodeDiffState::Reverted
                 | CodeDiffState::ViewOnly { is_complete: true }
@@ -445,7 +316,7 @@ pub enum CodeDiffViewAction {
     RevertChanges,
     OpenSkill {
         reference: SkillReference,
-        path: PathBuf,
+        path: LocalOrRemotePath,
         mouse_state: MouseStateHandle,
     },
     OpenMCPConfig {
@@ -462,20 +333,47 @@ enum AcceptSelection {
     AndContinueWithAgent,
 }
 
-/// Whether a code diff targets the local filesystem or a remote host.
-#[derive(Clone, Debug)]
-pub enum DiffSessionType {
-    Local,
-    Remote(HostId),
-}
-
 #[derive(Clone)]
 struct PendingDiff {
     diff_view: ViewHandle<InlineDiffView>,
     tab_handle: MouseStateHandle,
 }
 
-#[derive(Clone)]
+/// The GUI review surface registers as a weak handle so the executor never
+/// keeps a dead review view alive; a dead view at execute time fails
+/// recoverably.
+impl RegisteredDiffStorage for WeakViewHandle<CodeDiffView> {
+    fn set_candidate_diffs(
+        &self,
+        diffs: Vec<FileDiff>,
+        session_type: DiffSessionType,
+        app: &mut AppContext,
+    ) {
+        let Some(view) = self.upgrade(app) else {
+            log::error!("RequestFileEdits review view vanished before diffs resolved");
+            return;
+        };
+        view.update(app, |view, ctx| {
+            view.set_diff_session_type(session_type);
+            view.set_candidate_diffs(diffs, ctx);
+        });
+    }
+
+    fn accept_and_save(&self, app: &mut AppContext) -> BoxFuture<'static, RequestFileEditsResult> {
+        let Some(view) = self.upgrade(app) else {
+            log::warn!("RequestFileEdits review view vanished before execute");
+            return futures::future::ready(RequestFileEditsResult::DiffApplicationFailed {
+                error: "The review surface holding these edits no longer exists".to_string(),
+            })
+            .boxed();
+        };
+        view.update(app, |view, ctx| {
+            view.mark_accepted_for_save(ctx);
+            DiffStorageHelper::accept_and_save(view, ctx)
+        })
+    }
+}
+
 pub struct CodeDiffView {
     action_id: AIAgentActionId,
 
@@ -515,13 +413,16 @@ pub struct CodeDiffView {
     session_platform: Option<SessionPlatform>,
     /// Whether diffs target local disk or a remote host.
     diff_session_type: DiffSessionType,
+    /// Number of dispatched saves still in flight; guards revert while saving.
+    pending_saves: usize,
+    revert_in_progress: bool,
 }
 
 impl CodeDiffView {
     fn open_accept_split_button_menu(&mut self, ctx: &mut ViewContext<Self>) {
         // Don't allow menu toggling in view-only mode.
         if matches!(self.state, CodeDiffState::ViewOnly { .. }) {
-            log::error!("Attempted to toggle accept menu in view-only mode");
+            report_error!("Attempted to toggle accept menu in view-only mode");
             return;
         }
         self.is_accept_split_button_menu_open = true;
@@ -529,14 +430,13 @@ impl CodeDiffView {
         if is_passive {
             self.accept_split_button_menu.update(ctx, |menu, ctx| {
                 menu.set_items(
-                    vec![MenuItemFields::new_multiline(
-                        SUGGESTED_EDIT_ACCEPT_AND_CONTINUE_LABEL,
-                        2,
-                    )
-                    .with_on_select_action(
-                        CodeDiffViewAction::AcceptPassiveDiffAndContinueWithAgent,
-                    )
-                    .into_item()],
+                    vec![
+                        MenuItemFields::new_multiline(SUGGESTED_EDIT_ACCEPT_AND_CONTINUE_LABEL, 2)
+                            .with_on_select_action(
+                                CodeDiffViewAction::AcceptPassiveDiffAndContinueWithAgent,
+                            )
+                            .into_item(),
+                    ],
                     ctx,
                 );
             });
@@ -622,11 +522,10 @@ impl CodeDiffView {
         editor
     }
 
-    /// Sets up event subscriptions for an `InlineDiffView` at the given index.
+    /// Sets up event subscriptions for an `InlineDiffView`.
     fn setup_diff_view_subscriptions(
         &self,
         diff_view: &ViewHandle<InlineDiffView>,
-        idx: usize,
         file_path_for_error: String,
         ctx: &mut ViewContext<Self>,
     ) {
@@ -647,10 +546,13 @@ impl CodeDiffView {
             }
             #[cfg(not(target_family = "wasm"))]
             InlineDiffViewEvent::FileSaved => {
-                me.handle_save_completed(idx, None, ctx);
+                me.pending_saves = me.pending_saves.saturating_sub(1);
             }
             #[cfg(not(target_family = "wasm"))]
             InlineDiffViewEvent::FailedToSave { error } => {
+                if me.revert_in_progress {
+                    return;
+                }
                 crate::safe_error!(
                     safe: ("Failed to save file for accepted AgentMode diffs"),
                     full: ("Failed to save file for accepted AgentMode diffs for {}: {}", file_path_clone, error)
@@ -661,10 +563,7 @@ impl CodeDiffView {
                 ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
                     toast_stack.add_ephemeral_toast(toast, window_id, ctx);
                 });
-                me.handle_save_completed(idx, Some(error.clone()), ctx);
-            }
-            InlineDiffViewEvent::DiffAccepted { diff } => {
-                me.accepted_file_diff_computed(idx, diff.clone(), ctx);
+                me.pending_saves = me.pending_saves.saturating_sub(1);
             }
             InlineDiffViewEvent::UserEdited => {
                 if me.user_edited_file_contents {
@@ -739,8 +638,9 @@ impl CodeDiffView {
                             ctx.notify();
                         }
                         None => {
-                            log::error!(
-                                "Action {action_id} finished but status not found in action model",
+                            report_error!(
+                                "Action finished but status not found in action model",
+                                extra: { "action_id" => %action_id }
                             );
                         }
                     }
@@ -951,6 +851,8 @@ impl CodeDiffView {
             should_show_speedbump,
             session_platform,
             diff_session_type: DiffSessionType::Local,
+            pending_saves: 0,
+            revert_in_progress: false,
         }
     }
 
@@ -992,23 +894,21 @@ impl CodeDiffView {
         let display_mode = self.display_mode;
         let pending_diffs = diffs
             .into_iter()
-            .enumerate()
-            .map(|(idx, diff)| {
+            .map(|diff| {
                 #[cfg(debug_assertions)]
                 log::debug!("Create CodeEditorView with diff: {diff:#?}");
                 let editor = self.create_editor_with_subscriptions(ctx);
                 let file_path = diff.base.file_path.clone();
 
                 // Set up the editor buffer with the pre-loaded content.
-                let path = Path::new(&file_path);
+                let standardized_path = StandardizedPath::try_new(&file_path).ok();
                 editor.update(ctx, |editor_view, ctx| {
-                    editor_view.set_language_with_path(path, ctx);
+                    editor_view.set_language_with_local_path(Path::new(&file_path), ctx);
                     let state = InitialBufferState::plain_text(&diff.base.content);
                     editor_view.reset(state, ctx);
                 });
 
                 // Create the InlineDiffView which applies diffs to the editor buffer.
-                let standardized_path = StandardizedPath::try_new(&file_path).ok();
                 let diff_viewer = ctx.add_typed_action_view(|ctx| {
                     InlineDiffView::new(
                         editor.clone(),
@@ -1026,7 +926,7 @@ impl CodeDiffView {
                     diff_viewer.update(ctx, |view, ctx| view.register_file(session_type, ctx));
                 }
 
-                self.setup_diff_view_subscriptions(&diff_viewer, idx, file_path, ctx);
+                self.setup_diff_view_subscriptions(&diff_viewer, file_path, ctx);
 
                 PendingDiff {
                     diff_view: diff_viewer,
@@ -1038,24 +938,6 @@ impl CodeDiffView {
         self.pending_diffs = pending_diffs;
         ctx.emit(CodeDiffViewEvent::LoadedDiffs);
         ctx.notify();
-    }
-
-    /// Save the file and mark the diff as accepted.
-    pub fn accept_and_save(&mut self, ctx: &mut ViewContext<Self>) {
-        // Don't let users save an old diff while in view-only mode.
-        if matches!(self.state, CodeDiffState::ViewOnly { .. }) {
-            return;
-        }
-
-        // Todo:   kc INT-328 Handle error in save
-        for diff in &self.pending_diffs {
-            diff.diff_view
-                .update(ctx, |v, ctx| v.accept_and_save_diff(ctx));
-        }
-        self.state = CodeDiffState::Accepted(Some(SavingDiffs::new(self.pending_diffs.len())));
-        ctx.notify();
-
-        self.minimize(ctx);
     }
 
     pub fn try_accept_action(&mut self, ctx: &mut ViewContext<Self>) {
@@ -1070,7 +952,7 @@ impl CodeDiffView {
         ctx: &mut ViewContext<Self>,
     ) -> Result<()> {
         if matches!(self.state, CodeDiffState::ViewOnly { .. }) {
-            log::error!("Attempted to accept diff in view-only mode");
+            report_error!("Attempted to accept diff in view-only mode");
             return Err(anyhow::anyhow!(
                 "Attempted to accept diff in view-only mode"
             ));
@@ -1104,14 +986,32 @@ impl CodeDiffView {
         }
 
         ctx.emit(CodeDiffViewEvent::TryAccept);
+
+        // Persistence and result assembly run through the shared
+        // [`DiffStorageHelper`] flow once the executor (or the passive
+        // handler) calls `accept_and_save`. Optimistically mark the diff
+        // accepted and minimize the review UI.
+        self.mark_accepted_for_save(ctx);
         Ok(())
+    }
+
+    /// Flips the view into the accepted state as persistence kicks off. No-op
+    /// once the diff reached a terminal state (user-initiated accepts already
+    /// flipped it in `try_accept_action_with_selection`).
+    pub fn mark_accepted_for_save(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.state.is_complete() {
+            return;
+        }
+        self.state = CodeDiffState::Accepted;
+        self.minimize(ctx);
+        ctx.notify();
     }
 
     /// Mark the diff as rejected.
     pub fn reject(&mut self, ctx: &mut ViewContext<Self>) {
         // Don't let users reject an old diff while in view-only mode.
         if matches!(self.state, CodeDiffState::ViewOnly { .. }) {
-            log::error!("Attempted to reject diff in view-only mode");
+            report_error!("Attempted to reject diff in view-only mode");
             return;
         }
 
@@ -1137,40 +1037,72 @@ impl CodeDiffView {
 
     /// Revert all changes by replacing file contents with the base version.
     /// For newly created files, this deletes them instead.
-    fn revert_changes(&mut self, ctx: &mut ViewContext<Self>) {
-        if !matches!(self.state, CodeDiffState::Accepted(None)) {
-            log::warn!(
-                "Attempted to revert changes when not in Accepted(None) state - actual state: {:?}",
-                self.state
-            );
-            return;
+    fn revert_changes(&mut self, ctx: &mut ViewContext<Self>) -> Option<SaveFuture> {
+        if !matches!(self.state, CodeDiffState::Accepted)
+            || self.pending_saves > 0
+            || self.revert_in_progress
+        {
+            return None;
         }
-
-        let window_id = ctx.window_id();
-        for diff in &self.pending_diffs {
-            if let Err(err) = diff
-                .diff_view
-                .update(ctx, |v, ctx| v.restore_diff_base(ctx))
-            {
-                log::error!("Failed to restore diff base: {err:?}");
+        let restores = self
+            .pending_diffs
+            .iter()
+            .map(|diff| {
                 let file_name = diff
                     .diff_view
                     .as_ref(ctx)
                     .file_name()
-                    .unwrap_or_else(|| "file".to_string());
-                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
-                    toast_stack.add_ephemeral_toast(
-                        DismissibleToast::error(format!("Failed to revert changes to {file_name}")),
-                        window_id,
-                        ctx,
-                    );
-                });
+                    .unwrap_or_else(|| "file".to_owned());
+                let restore = diff
+                    .diff_view
+                    .update(ctx, |view, ctx| view.restore_and_save_diff(ctx))
+                    .unwrap_or_else(|error| {
+                        futures::future::ready(Err(Arc::new(FileSaveError::Other(error)))).boxed()
+                    });
+                async move { (file_name, restore.await) }
+            })
+            .collect::<Vec<_>>();
+        self.revert_in_progress = true;
+        let (tx, rx) = oneshot::channel();
+        let window_id = ctx.window_id();
+        ctx.spawn(
+            async move { join_all(restores).await },
+            move |me, outcomes, ctx| {
+                me.revert_in_progress = false;
+                let mut result = Ok(());
+                for (file_name, outcome) in outcomes {
+                    if let Err(error) = &outcome {
+                        log::error!("Failed to revert file edits: {error}");
+                        ToastStack::handle(ctx).update(ctx, |stack, ctx| {
+                            stack.add_ephemeral_toast(
+                                DismissibleToast::error(format!(
+                                    "Failed to revert changes to {file_name}"
+                                )),
+                                window_id,
+                                ctx,
+                            );
+                        });
+                    }
+                    result = result.and(outcome);
+                }
+                if result.is_ok() {
+                    me.state = CodeDiffState::Reverted;
+                    me.mark_action_as_reverted(ctx);
+                }
+                ctx.notify();
+                let _ = tx.send(result);
+            },
+        );
+        Some(
+            async move {
+                rx.await.unwrap_or_else(|_| {
+                    Err(Arc::new(FileSaveError::Other(
+                        "Revert completion was cancelled".to_owned(),
+                    )))
+                })
             }
-        }
-
-        self.state = CodeDiffState::Reverted;
-        self.mark_action_as_reverted(ctx);
-        ctx.notify();
+            .boxed(),
+        )
     }
 
     fn mark_action_as_reverted(&self, ctx: &mut ViewContext<Self>) {
@@ -1211,7 +1143,7 @@ impl CodeDiffView {
     pub fn expand_and_edit(&mut self, ctx: &mut ViewContext<Self>) {
         // Don't let users edit an old diff while in view-only mode.
         if matches!(self.state, CodeDiffState::ViewOnly { .. }) {
-            log::error!("Attempted to edit/expand diff in view-only mode");
+            report_error!("Attempted to edit/expand diff in view-only mode");
             return;
         }
 
@@ -1460,7 +1392,7 @@ impl CodeDiffView {
         };
 
         let icon = match self.state {
-            CodeDiffState::Accepted(_) | CodeDiffState::ViewOnly { is_complete: true } => {
+            CodeDiffState::Accepted | CodeDiffState::ViewOnly { is_complete: true } => {
                 green_check_icon(appearance).finish()
             }
             CodeDiffState::Rejected => cancelled_icon(appearance).finish(),
@@ -1595,21 +1527,27 @@ impl CodeDiffView {
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Min);
 
-        let file_paths: Vec<PathBuf> = self
+        let file_locations: Vec<LocalOrRemotePath> = self
             .pending_diffs
             .iter()
             .filter_map(|diff| {
-                diff.diff_view
-                    .as_ref(app)
-                    .file_path()
-                    .and_then(|p| p.to_local_path())
+                self.location_for_standardized_path(diff.diff_view.as_ref(app).file_path()?)
             })
             .collect();
 
-        // Renders the 'open skill' button if all edited files live in the same skill directory
-        let skill = common_path(&file_paths)
-            .and_then(|common| skill_path_from_file_path(&common))
-            .and_then(|skill_path| SkillManager::as_ref(app).skill_by_path(&skill_path));
+        // Renders the 'open skill' button only if every edited file lives in the same skill directory.
+        let skill_paths = file_locations
+            .iter()
+            .map(skill_path_from_location)
+            .collect::<Option<Vec<_>>>();
+        let skill = skill_paths.and_then(|skill_paths| {
+            let first_path = skill_paths.first()?;
+            skill_paths
+                .iter()
+                .all(|path| path == first_path)
+                .then(|| SkillManager::as_ref(app).skill_by_path(first_path))
+                .flatten()
+        });
         if let Some(skill) = skill {
             let skill_path = skill.path.clone();
             let skill_reference = SkillManager::handle(app)
@@ -1642,7 +1580,12 @@ impl CodeDiffView {
         // Renders the 'open config' button only when every MCP config file in this diff
         // belongs to the same provider. Mixed-provider diffs (e.g. editing both a Claude
         // config and a Warp config at once) show no badge to avoid misleading attribution.
-        let mcp_configs: Vec<_> = file_paths
+        // MCP config actions currently operate on local paths only.
+        let local_file_paths: Vec<PathBuf> = file_locations
+            .iter()
+            .filter_map(|path| path.to_local_path().map(Path::to_path_buf))
+            .collect();
+        let mcp_configs: Vec<_> = local_file_paths
             .iter()
             .filter_map(|path| {
                 mcp_provider_from_file_path(path).map(|provider| (provider, path.to_path_buf()))
@@ -2280,187 +2223,75 @@ impl CodeDiffView {
         );
     }
 
-    /// We are processing unified diff and saving files concurrently. That's why
-    /// we need to have separate handlers for diff calculation and save completed.
-    ///
-    /// The diffs applied for each CodeEditorView are received individually.
-    /// Store this diff, and try to emit the diffs saved event.
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    fn accepted_file_diff_computed(
-        &mut self,
-        file_idx: usize,
-        diff: Rc<DiffResult>,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        if let CodeDiffState::Accepted(Some(state)) = &mut self.state {
-            state.mark_diff_computed(file_idx, diff);
-            self.try_emit_diffs_saved(ctx);
-        } else {
-            log::warn!("Received computed diff when not in accepted state");
-        }
-    }
+    /// Emits the malformed-final-line proxy telemetry, computed from editor state
+    /// at accept time. Called by the review surface when the user accepts.
+    pub fn send_malformed_line_telemetry(&self, ctx: &mut ViewContext<Self>) {
+        let mut edited_file_count = 0;
+        let mut correction_count = 0;
+        let mut edited_correction_count = 0;
+        let mut unedited_correction_count = 0;
 
-    /// We are processing unified diff and saving files concurrently. That's why
-    /// we need to have separate handlers for diff calculation and save completed.
-    ///
-    /// The save state for each CodeEditorView are received individually.
-    /// Update the accepted diff state, and try to emit the diffs saved event.
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    fn handle_save_completed(
-        &mut self,
-        file_idx: usize,
-        save_error: Option<Rc<FileSaveError>>,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        if let CodeDiffState::Accepted(Some(state)) = &mut self.state {
-            state.mark_diff_saved(file_idx, save_error);
-            self.try_emit_diffs_saved(ctx);
-        } else if !matches!(self.state, CodeDiffState::Reverted) {
-            log::warn!("Received saved diff when not in accepted or reverted state");
-        }
-    }
-
-    /// Check if we have all pending diffs computed and saved.
-    /// Emit the SavedAcceptedDiffs event if so.
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    fn try_emit_diffs_saved(&mut self, ctx: &mut ViewContext<Self>) {
-        if let CodeDiffState::Accepted(state) = &mut self.state {
-            let is_complete = state
-                .as_ref()
-                .map(|diff_state| diff_state.pending_diff_is_complete())
-                .unwrap_or(false);
-
-            if is_complete {
-                let replaced_state = state.take().expect("Checked above");
-
-                let mut combined_diff = DiffResult::default();
-                let mut save_errors = Vec::new();
-                for diff_state in replaced_state.pending_diffs {
-                    if let Some(diff) = diff_state.computed_diff {
-                        combined_diff += diff.as_ref();
-                    }
-                    if let SaveStatus::Failed(error) = diff_state.save_status {
-                        save_errors.push(error);
-                    }
-                }
-
-                let mut updated_files = Vec::new();
-                let mut deleted_files = Vec::new();
-                let mut edited_file_count = 0;
-                let mut correction_count = 0;
-                let mut edited_correction_count = 0;
-                let mut unedited_correction_count = 0;
-
-                for diff in self.pending_diffs.iter() {
-                    let Some(path) = diff.diff_view.as_ref(ctx).file_path() else {
-                        continue;
-                    };
-
-                    let mut file_path_str = path.to_string();
-                    if matches!(
-                        diff.diff_view.as_ref(ctx).diff(),
-                        Some(DiffType::Delete { .. })
-                    ) {
-                        deleted_files.push(file_path_str);
-                    } else {
-                        // If this was a rename, the file being renamed should be considered "deleted".
-                        if let Some(DiffType::Update {
-                            rename: Some(rename),
-                            ..
-                        }) = diff.diff_view.as_ref(ctx).diff()
-                        {
-                            deleted_files.push(file_path_str);
-                            file_path_str = rename.to_string_lossy().to_string();
-                        }
-                        let was_edited = diff.diff_view.as_ref(ctx).was_edited();
-                        let changed_lines = diff.diff_view.as_ref(ctx).changed_lines(ctx);
-                        let has_malformed_terminal_signal = diff
-                            .diff_view
-                            .as_ref(ctx)
-                            .diff()
-                            .is_some_and(|editor_diff| {
-                                has_malformed_terminal_correction_signal(
-                                    editor_diff,
-                                    &changed_lines,
-                                )
-                            });
-
-                        if was_edited {
-                            edited_file_count += 1;
-                        }
-                        if has_malformed_terminal_signal {
-                            correction_count += 1;
-                            if was_edited {
-                                edited_correction_count += 1;
-                            } else {
-                                unedited_correction_count += 1;
-                            }
-                        }
-                        updated_files.push((
-                            FileLocations {
-                                name: file_path_str,
-                                lines: if FeatureFlag::ChangedLinesOnlyApplyDiffResult.is_enabled()
-                                {
-                                    changed_lines
-                                } else {
-                                    vec![]
-                                },
-                            },
-                            was_edited,
-                        ));
-                    }
-                }
-                if correction_count > 0 {
-                    send_telemetry_from_ctx!(
-                        RequestFileEditsTelemetryEvent::MalformedFinalLineProxy(
-                            MalformedFinalLineProxyEvent {
-                                identifiers: self.identifiers.clone(),
-                                file_count: self.pending_diffs.len(),
-                                edited_file_count,
-                                correction_count,
-                                edited_correction_count,
-                                unedited_correction_count,
-                                format_kind: self.edit_format_kind,
-                                passive_diff: self.is_passive,
-                            }
-                        ),
-                        ctx
-                    );
-                }
-
-                // Extract accepted file contents from editor buffers so the
-                // executor doesn't need to re-read from disk or the network.
-                let file_contents: Vec<(String, String)> = self
-                    .pending_diffs
-                    .iter()
-                    .filter_map(|diff| {
-                        let path = diff.diff_view.as_ref(ctx).file_path()?.to_string();
-                        // Skip deleted files — they have no meaningful content.
-                        if matches!(
-                            diff.diff_view.as_ref(ctx).diff(),
-                            Some(DiffType::Delete { .. })
-                        ) {
-                            return None;
-                        }
-                        let content = diff
-                            .diff_view
-                            .as_ref(ctx)
-                            .editor()
-                            .as_ref(ctx)
-                            .text(ctx)
-                            .into_string();
-                        Some((path, content))
-                    })
-                    .collect();
-
-                ctx.emit(CodeDiffViewEvent::SavedAcceptedDiffs {
-                    diff: combined_diff,
-                    updated_files,
-                    file_contents,
-                    deleted_files,
-                    save_errors,
-                });
+        for diff in self.pending_diffs.iter() {
+            // Deletes have no content changes to analyze.
+            if matches!(
+                diff.diff_view.as_ref(ctx).diff(),
+                Some(DiffType::Delete { .. })
+            ) {
+                continue;
             }
+            let was_edited = diff.diff_view.as_ref(ctx).was_edited();
+            let editor_changed_lines = diff.diff_view.as_ref(ctx).changed_lines(ctx);
+            let changed_lines_for_malformed_signal = if editor_changed_lines.is_empty() {
+                changed_lines_for_result(
+                    editor_changed_lines.clone(),
+                    diff.diff_view.as_ref(ctx).diff(),
+                )
+                .into_iter()
+                .map(file_context_range_to_editor_range)
+                .collect()
+            } else {
+                editor_changed_lines
+            };
+            let has_malformed_terminal_signal =
+                diff.diff_view
+                    .as_ref(ctx)
+                    .diff()
+                    .is_some_and(|editor_diff| {
+                        has_malformed_terminal_correction_signal(
+                            editor_diff,
+                            &changed_lines_for_malformed_signal,
+                        )
+                    });
+
+            if was_edited {
+                edited_file_count += 1;
+            }
+            if has_malformed_terminal_signal {
+                correction_count += 1;
+                if was_edited {
+                    edited_correction_count += 1;
+                } else {
+                    unedited_correction_count += 1;
+                }
+            }
+        }
+
+        if correction_count > 0 {
+            send_telemetry_from_ctx!(
+                RequestFileEditsTelemetryEvent::MalformedFinalLineProxy(
+                    MalformedFinalLineProxyEvent {
+                        identifiers: self.identifiers.clone(),
+                        file_count: self.pending_diffs.len(),
+                        edited_file_count,
+                        correction_count,
+                        edited_correction_count,
+                        unedited_correction_count,
+                        format_kind: self.edit_format_kind,
+                        passive_diff: self.is_passive,
+                    }
+                ),
+                ctx
+            );
         }
     }
 
@@ -2608,6 +2439,27 @@ impl CodeDiffView {
             .as_ref(app)
             .file_path()
             .map(|p| p.to_string())
+    }
+
+    /// Returns the primary file location as a `LocalOrRemotePath`,
+    /// using `diff_session_type` to correctly identify remote files.
+    pub fn primary_file_location(&self, app: &AppContext) -> Option<LocalOrRemotePath> {
+        self.pending_diffs
+            .first()?
+            .diff_view
+            .as_ref(app)
+            .file_path()
+            .and_then(|path| self.location_for_standardized_path(path))
+    }
+
+    fn location_for_standardized_path(&self, path: &StandardizedPath) -> Option<LocalOrRemotePath> {
+        match &self.diff_session_type {
+            DiffSessionType::Local => path.to_local_path().map(LocalOrRemotePath::Local),
+            DiffSessionType::Remote(host_id) => Some(LocalOrRemotePath::Remote(RemotePath {
+                host_id: host_id.clone(),
+                path: path.clone(),
+            })),
+        }
     }
 }
 
@@ -2965,7 +2817,13 @@ pub fn convert_file_edits_to_file_diffs(
                                 }
 
                                 // Store the search content with its line range for later use
-                                search_blocks_with_ranges.push((line_range, search_content));
+                                search_blocks_with_ranges.push((
+                                    line_range,
+                                    search_content
+                                        .lines()
+                                        .map(str::to_owned)
+                                        .collect::<Vec<_>>(),
+                                ));
 
                                 search_and_replace_diffs.push(search_replace);
                             }
@@ -2981,26 +2839,14 @@ pub fn convert_file_edits_to_file_diffs(
 
                             // Build dummy content from V4A hunks using pre_context + old + post_context
                             for hunk in hunks {
-                                let mut hunk_content = String::new();
-                                if !hunk.pre_context.is_empty() {
-                                    hunk_content.push_str(&hunk.pre_context);
-                                    if !hunk_content.ends_with('\n') {
-                                        hunk_content.push('\n');
-                                    }
-                                }
-                                if !hunk.old.is_empty() {
-                                    hunk_content.push_str(&hunk.old);
-                                    if !hunk_content.ends_with('\n') {
-                                        hunk_content.push('\n');
-                                    }
-                                }
-                                if !hunk.post_context.is_empty() {
-                                    hunk_content.push_str(&hunk.post_context);
-                                }
+                                let hunk_lines = hunk.original_lines();
                                 // We don't have line numbers for V4A hunks in restored state,
                                 // so use None for the range
-                                if !hunk_content.is_empty() {
-                                    search_blocks_with_ranges.push((None, hunk_content));
+                                if !hunk_lines.is_empty() {
+                                    search_blocks_with_ranges.push((
+                                        None,
+                                        hunk_lines.into_iter().map(str::to_owned).collect(),
+                                    ));
                                 }
                             }
                         }
@@ -3023,13 +2869,12 @@ pub fn convert_file_edits_to_file_diffs(
             }
 
             // Create dummy file content with proper line numbering
-            let mut dummy_content = if max_line_number > 0 || !search_blocks_with_ranges.is_empty()
-            {
+            let dummy_lines = if max_line_number > 0 || !search_blocks_with_ranges.is_empty() {
                 search_blocks_with_ranges.sort_unstable_by_key(|(range, _)| {
                     range.as_ref().map(|r| r.start).unwrap_or(0)
                 });
 
-                let mut dummy_content = String::new();
+                let mut dummy_lines = Vec::new();
 
                 // If the first change is not at the start of the file, prepend an ellipsis
                 let first_start = search_blocks_with_ranges
@@ -3037,25 +2882,24 @@ pub fn convert_file_edits_to_file_diffs(
                     .filter_map(|(r, _)| r.as_ref().map(|r| r.start))
                     .min();
                 if first_start.is_some_and(|s| s > 1) {
-                    dummy_content.push_str("...\n");
+                    dummy_lines.push("...");
                 }
 
-                for (index, (_, search_content)) in search_blocks_with_ranges.iter().enumerate() {
+                for (index, (_, search_lines)) in search_blocks_with_ranges.iter().enumerate() {
                     if index > 0 {
-                        // add "..." between each edit to indicate the seperation
-                        dummy_content.push_str("...\n");
+                        // add "..." between each edit to indicate the separation
+                        dummy_lines.push("...");
                     }
-                    for search_line in search_content.lines() {
-                        dummy_content.push_str(search_line);
-                        dummy_content.push('\n');
-                    }
+                    dummy_lines.extend(search_lines.iter().map(String::as_str));
                 }
 
-                dummy_content
+                dummy_lines
             } else {
                 // No line numbers found, create minimal dummy content
-                String::new()
+                Vec::new()
             };
+            let mut dummy_content: String =
+                dummy_lines.iter().map(|line| format!("{line}\n")).collect();
 
             // For file deletions/moves we may not have any other context to show. Provide a minimal stub.
             if show_as_deleted && dummy_content.is_empty() {
@@ -3079,15 +2923,8 @@ pub fn convert_file_edits_to_file_diffs(
                 }
             }
 
-            // Handle V4A hunks using fuzzy_match_v4a_diffs
             if !v4a_hunks.is_empty() && !show_as_deleted {
-                let v4a_match_result =
-                    fuzzy_match_v4a_diffs(&path, &v4a_hunks, v4a_move_to.clone(), &dummy_content);
-                if let ai::diff_validation::DiffType::Update { deltas, .. } =
-                    v4a_match_result.diff_type
-                {
-                    applied_diffs.extend(deltas);
-                }
+                applied_diffs.extend(fuzzy_match_v4a_preview(&v4a_hunks, &dummy_lines));
             }
 
             // Add create diffs directly
@@ -3108,6 +2945,81 @@ pub fn convert_file_edits_to_file_diffs(
             FileDiff::new(dummy_content, path, DiffType::update(applied_diffs, None))
         })
         .collect()
+}
+
+impl DiffStorage for CodeDiffView {
+    /// Extracts each file's report state and diff inputs from the diff views
+    /// and editor buffers: final (possibly user-edited) content, changed
+    /// lines, base content, and rename/delete bookkeeping.
+    fn snapshot_pending_files(&self, app: &AppContext) -> Vec<FileSnapshot> {
+        self.pending_diffs
+            .iter()
+            .filter_map(|diff| {
+                let diff_view = diff.diff_view.as_ref(app);
+                let path = diff_view.file_path()?.to_string();
+                let diff_base = diff_view.base_content(app).unwrap_or_default();
+                let final_content = diff_view.editor().as_ref(app).text(app).into_string();
+
+                if matches!(diff_view.diff(), Some(DiffType::Delete { .. })) {
+                    return Some(FileSnapshot {
+                        updated: None,
+                        deleted_paths: vec![path.clone()],
+                        diff_base,
+                        diff_new: final_content,
+                        diff_name: path,
+                    });
+                }
+
+                // A rename reports the source path as deleted and the update
+                // at the rename target.
+                let mut deleted_paths = Vec::new();
+                let mut report_path = path.clone();
+                if let Some(DiffType::Update {
+                    rename: Some(rename),
+                    ..
+                }) = diff_view.diff()
+                {
+                    let target = StandardizedPath::try_new(&rename.to_string_lossy())
+                        .map(|target| target.to_string())
+                        .unwrap_or_else(|_| rename.to_string_lossy().to_string());
+                    if target != path {
+                        deleted_paths.push(report_path.clone());
+                        report_path = target;
+                    }
+                }
+
+                let changed_lines =
+                    changed_lines_for_result(diff_view.changed_lines(app), diff_view.diff());
+                Some(FileSnapshot {
+                    updated: Some(UpdatedFileState {
+                        path: report_path,
+                        changed_lines,
+                        final_content: final_content.clone(),
+                        was_edited: diff_view.was_edited(),
+                    }),
+                    deleted_paths,
+                    diff_base,
+                    diff_new: final_content,
+                    diff_name: path,
+                })
+            })
+            .collect()
+    }
+
+    /// Saves every file through its editor buffer, tracking the number of
+    /// dispatched saves for the revert guard.
+    fn start_saving(&mut self, app: &mut AppContext) -> Vec<SaveFuture> {
+        let saves: Vec<SaveFuture> = self
+            .pending_diffs
+            .iter()
+            .filter_map(|diff| {
+                diff.diff_view
+                    .update(app, |view, ctx| view.accept_and_save_diff(ctx))
+            })
+            .collect();
+        self.pending_saves = saves.len();
+        saves
+    }
 }
 
 impl BackingView for CodeDiffView {
@@ -3188,3 +3100,32 @@ fn keystroke_for_mode(key: &str, is_passive: bool) -> Keystroke {
         ..Default::default()
     }
 }
+
+fn changed_lines_for_result(
+    editor_changed_lines: Vec<Range<usize>>,
+    diff_type: Option<&DiffType>,
+) -> Vec<Range<usize>> {
+    if !editor_changed_lines.is_empty() {
+        return editor_changed_lines
+            .into_iter()
+            .map(editor_range_to_file_context_range)
+            .collect();
+    }
+
+    diff_type.map(changed_lines_from_op).unwrap_or_default()
+}
+
+fn editor_range_to_file_context_range(range: Range<usize>) -> Range<usize> {
+    range.start.saturating_add(1)..range.end.saturating_add(1)
+}
+
+fn file_context_range_to_editor_range(range: Range<usize>) -> Range<usize> {
+    range.start.saturating_sub(1)..range.end.saturating_sub(1)
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "code_diff_persistence_tests.rs"]
+mod persistence_tests;
+#[cfg(test)]
+#[path = "code_diff_view_tests.rs"]
+mod tests;

@@ -1,4 +1,5 @@
-use super::{chunker::Fragment, Error};
+use super::Error;
+use super::chunker::Fragment;
 
 mod hash;
 mod node;

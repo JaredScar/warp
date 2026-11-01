@@ -12,8 +12,8 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
     # Appended to $DCS_START to signal that the following message is JSON-encoded.
     DCS_JSON_MARKER="d"
 
-    # Byte used to signal the end of a DCS.
-    DCS_END="$(printf '\x9c')"
+    # Byte sequence used to signal the end of a DCS (7-bit ST: ESC \).
+    DCS_END="$(printf '\x1b\x5c')"
 
     OSC_START="$(printf '\e]9278;')"
 
@@ -38,6 +38,7 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
     # Attempt to cd to the desired initial working directory, swallowing any
     # errors.  If this fails, the user will end up in their home directory.
     if [[ ! -z "$WARP_INITIAL_WORKING_DIR" ]]; then
+        # shellcheck disable=SC2164
         cd "$WARP_INITIAL_WORKING_DIR" >/dev/null 2>&1
         unset WARP_INITIAL_WORKING_DIR
     fi
@@ -188,6 +189,7 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
       # This must be double-quoted to prevent bash word-splitting, which would effectively replace
       # newlines and tabs with spaces, potentially invalidating the syntactical correctness of the
       # command.
+      # shellcheck disable=SC2124
       local command="${@:2}"
       # Bash cannot handle null characters in variables or command substitutions, so hex encode the
       # output immediately before it's stored anywhere. This hex encoding must be done inline --
@@ -258,13 +260,142 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
       # To minimize latency and prevent the user from being blocked from entering a command,
       # cache the user's precmd_functions and only register warp_precmd. In the warp_precmd
       # execution following this generator command, the user's precmd_functions are restored.
-      _USER_PRECMD_FUNCTIONS=(${precmd_functions[@]})
+      _USER_PRECMD_FUNCTIONS=("${precmd_functions[@]}")
       precmd_functions=(warp_precmd)
 
       # $@ must be double-quoted to prevent word-splitting, which would cause the given command to
       # be split into a bash list on $IFS chars (spaces, tabs, newlines), which could invalidate
       # the syntactical correctness of the command.
       (_warp_run_generator_command_internal "$@" &)
+    }
+
+    # Computes native shell completions for the given (hex-encoded) command line and emits them over
+    # the completions OSC protocol.
+    warp_run_generator_command_native_completions() {
+      _WARP_GENERATOR_COMMAND=1
+      _USER_PRECMD_FUNCTIONS=("${precmd_functions[@]}")
+      precmd_functions=(warp_precmd)
+
+      local line
+      line="$(warp_hex_decode_string "$1")"
+
+      printf '\e]9280;A\a'
+      _warp_native_bash_completions "$line"
+      printf '\e]9280;B\a'
+    }
+
+    # Populates COMPREPLY for the given line using bash's own completion machinery (resolved via
+    # `complete -p`), then prints each entry via the completions OSC.
+    _warp_native_bash_completions() {
+      local line="$1"
+      # Force the default IFS; the session's may have been changed by a plugin or the user.
+      local IFS=$' \t\n'
+      local -a words
+      read -ra words <<< "$line"
+      # A trailing space means the user is completing a new, empty word.
+      if [[ "$line" == *[[:space:]] ]]; then
+        words+=("")
+      fi
+      (( ${#words[@]} == 0 )) && return
+      local cword=$(( ${#words[@]} - 1 ))
+      local cmd="${words[0]}"
+      [[ -z "$cmd" ]] && return
+
+      local compspec
+      compspec="$(complete -p "$cmd" 2>/dev/null)"
+      if [[ -z "$compspec" ]]; then
+        # Lazily load $cmd's completion (bash-completion's dynamic loader) and retry once.
+        # Different bash-completion versions expose the loader under different names.
+        if declare -F _comp_complete_load >/dev/null 2>&1; then
+          _comp_complete_load "$cmd" >/dev/null 2>&1
+        elif declare -F _comp_load >/dev/null 2>&1; then
+          _comp_load -- "$cmd" >/dev/null 2>&1
+        elif declare -F _completion_loader >/dev/null 2>&1; then
+          _completion_loader "$cmd" >/dev/null 2>&1
+        fi
+        compspec="$(complete -p "$cmd" 2>/dev/null)"
+      fi
+      [[ -z "$compspec" ]] && return
+
+      # Extract the function passed to `-F`, if any. We call it directly rather than
+      # `compgen -F`, which warns to stderr and returns unfiltered results.
+      local func=""
+      local -a compspec_words
+      read -ra compspec_words <<< "$compspec"
+      local i
+      for (( i = 0; i < ${#compspec_words[@]}; i++ )); do
+        if [[ "${compspec_words[$i]}" == "-F" ]]; then
+          func="${compspec_words[$((i + 1))]}"
+          break
+        fi
+      done
+      [[ -z "$func" ]] && return
+      declare -F "$func" >/dev/null 2>&1 || return
+
+      # $func expects COMP_WORDS/COMP_CWORD/etc. as ambient globals, the way bash's real
+      # completion machinery presents them. `local` makes them visible to $func via bash's
+      # dynamic scoping and auto-unsets them on return, leaving no stale values in the session.
+      local COMPREPLY=()
+      local -a COMP_WORDS=("${words[@]}")
+      local COMP_CWORD=$cword
+      local COMP_LINE="$line"
+      # COMP_POINT is a byte offset into COMP_LINE, not a character count: ${#line} counts
+      # characters under the session's locale, which undercounts for multibyte text.
+      local COMP_POINT=$(( $(LC_ALL=C printf '%s' "$line" | LC_ALL=C command wc -c) ))
+      # COMP_TYPE=9 (plain Tab), faithful to real interactive completion. cobra-generated
+      # "bash completion V2" scripts (kubectl, gh, most modern Go CLIs) bake a padded
+      # "name  (description)" string into each entry under this type when there's more than
+      # one match; that padding is split apart after the call below. 37 (menu-complete) would
+      # avoid it, but bash-completion's `make` completion branches on $COMP_TYPE and breaks
+      # prefixed-target completion under anything but 9.
+      local COMP_TYPE=9
+      local COMP_KEY=9
+
+      # compopt only works while readline is driving a completion; called here it fails to
+      # stderr, so swallow it along with the completion function's other stderr.
+      "$func" "$cmd" "${words[$cword]}" "${words[$((cword > 0 ? cword - 1 : 0))]}" 2>/dev/null
+
+      # cobra's padded shape: a name, a 2+-space run (readline's column alignment, never used
+      # by a real candidate alone), then a parenthesised description to the end. The first
+      # group matches single-space-separated tokens so it stops at the *first* 2+-space run
+      # rather than folding a description's own parenthesised aside into the name.
+      local cobra_padded_shape='^([^[:space:]]+([[:space:]][^[:space:]]+)*)[[:space:]]{2,}\((.*)\)$'
+
+      # cobra pads every entry of a multi-match reply or none, so decide once for the whole
+      # reply rather than per entry: a real candidate that happens to look padded is only
+      # mistakeable when it's the sole match, or when every other entry looks padded too.
+      local reply cobra_shaped_count=0 non_empty_count=0
+      for reply in "${COMPREPLY[@]}"; do
+        reply="${reply% }"
+        [[ -z "$reply" ]] && continue
+        non_empty_count=$((non_empty_count + 1))
+        [[ "$reply" =~ $cobra_padded_shape ]] && cobra_shaped_count=$((cobra_shaped_count + 1))
+      done
+      local split_cobra_padding=0
+      if (( non_empty_count > 1 && cobra_shaped_count == non_empty_count )); then
+        split_cobra_padding=1
+      fi
+
+      local __warp_hex_match __warp_hex_dscr
+      for reply in "${COMPREPLY[@]}"; do
+        # COMPREPLY entries can carry a trailing space (bash appends one when a completion
+        # is unambiguous); trim it so the client controls spacing.
+        reply="${reply% }"
+        [[ -z "$reply" ]] && continue
+
+        local reply_description=""
+        if (( split_cobra_padding )) && [[ "$reply" =~ $cobra_padded_shape ]]; then
+          reply_description="${BASH_REMATCH[3]}"
+          reply="${BASH_REMATCH[1]}"
+        fi
+
+        warp_completions_hex_encode_into __warp_hex_match "$reply"
+        printf '\e]9280;C;%s\a' "$__warp_hex_match"
+        if [[ -n "$reply_description" ]]; then
+          warp_completions_hex_encode_into __warp_hex_dscr "$reply_description"
+          printf '\e]9280;D?description;%s\a' "$__warp_hex_dscr"
+        fi
+      done
     }
 
 
@@ -280,10 +411,11 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
         if [ "$WARP_IN_MSYS2" = true ]; then
           warp_send_hook_via_kv_pairs_start "Preexec"
           warp_send_hook_kv_pair "command" "$BASH_COMMAND"
+          warp_send_hook_kv_pair "session_id" "$WARP_SESSION_ID"
           warp_send_hook_via_kv_pairs_end
         else
           local truncated_command=$(warp_escape_json "$BASH_COMMAND")
-          warp_send_json_message "{\"hook\": \"Preexec\", \"value\": {\"command\": \"$truncated_command\"}}"
+          warp_send_json_message "{\"hook\": \"Preexec\", \"value\": {\"command\": \"$truncated_command\", \"session_id\": $WARP_SESSION_ID}}"
         fi
         warp_maybe_send_reset_grid_osc
 
@@ -324,11 +456,11 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
           done < $_WARP_GENERATOR_PIDS_STARTED_TMP_FILE
 
           # If the array is not empty, kill the ongoing pids.
-          if [[ ! -z $pids ]]; then
-            # Surpress stderr output; kill writes to stderr if any of the given
+          if (( ${#pids[@]} > 0 )); then
+            # Suppress stderr output; kill writes to stderr if any of the given
             # PIDS are not running (which might rarely be the case due to race
             # conditions in checking which PIDS to cancel and this kill command.
-            kill -9 $pids >/dev/null 2>/dev/null
+            kill -9 "${pids[@]}" >/dev/null 2>&1
           fi 
         fi
     }
@@ -338,6 +470,7 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
     # Usage warp_title "title"
     # Users can disable the auto title if they chose to by setting WARP_DISABLE_AUTO_TITLE.
     warp_title () {
+      # shellcheck disable=SC2034
       DISABLE_AUTO_TITLE="1"
 
       # truncating the title's len to 25 characters and leading ".."
@@ -362,7 +495,7 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
       fi
 
       # Note that in older versions of bash (the one builtin with MacOS) the `~` character is just that, 
-      # howerver, when used within `""` (double quotes) on a newer (homebrew) bash version,
+      # however, when used within `""` (double quotes) on a newer (homebrew) bash version,
       # it automatically EXPANDS to the actual value of $HOME and needs to be escaped to give a proper
       # tilde character. So instead, we have it as a separate variable that uses `''` (single quote)
       # to avoid expanding, and use it later within the new bash term title. This way both old and
@@ -382,6 +515,12 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
     warp_set_title_active_on_preexec () {
       # If the user wants to set the title themselves, they can set the WARP_DISABLE_AUTO_TITLE flag.
       if [ ! -z "$WARP_DISABLE_AUTO_TITLE" ]; then
+        return
+      fi
+
+      # Generator commands (including native-completions requests) are never user-facing;
+      # without this, one briefly sets the tab title to "warp_run_generator_comma...".
+      if [[ "$1" == warp_run_generator_command* ]]; then
         return
       fi
 
@@ -434,13 +573,15 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
         # executed within this block instead of the actual last
         # command that was run.
         local exit_code=$?
+        local next_block_id="precmd-$WARP_SESSION_ID-$((block_id++))"
         if [ "$WARP_IN_MSYS2" = true ]; then
           warp_send_hook_via_kv_pairs_start "CommandFinished"
           warp_send_hook_kv_pair "exit_code" "$exit_code"
-          warp_send_hook_kv_pair "next_block_id" "precmd-$WARP_SESSION_ID-$((block_id++))"
+          warp_send_hook_kv_pair "next_block_id" "$next_block_id"
+          warp_send_hook_kv_pair "session_id" "$WARP_SESSION_ID"
           warp_send_hook_via_kv_pairs_end
         else
-          warp_send_json_message "{\"hook\": \"CommandFinished\", \"value\": {\"exit_code\": $exit_code, \"next_block_id\": \"precmd-$WARP_SESSION_ID-$((block_id++))\"}}"
+          warp_send_json_message "{\"hook\": \"CommandFinished\", \"value\": {\"exit_code\": $exit_code, \"next_block_id\": \"$next_block_id\", \"session_id\": $WARP_SESSION_ID}}"
         fi
 
         warp_maybe_send_reset_grid_osc
@@ -459,10 +600,12 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
         if [ ! -z  $_WARP_GENERATOR_COMMAND ]; then
             # Restore the user's precmd_functions, since they were un-registered prior to executing
             # the generator.
-            precmd_functions=(${_USER_PRECMD_FUNCTIONS[@]})
+            precmd_functions=("${_USER_PRECMD_FUNCTIONS[@]}")
 
             unset _WARP_GENERATOR_COMMAND
             warp_send_json_message "{\"hook\": \"Precmd\", \"value\": {
+            \"exit_code\": $exit_code,
+            \"next_block_id\": \"$next_block_id\",
             \"pwd\": \"\",
             \"ps1\": \"\",
             \"git_head\": \"\",
@@ -488,32 +631,39 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
           WARP_INPUT_REPORTING_SUPPORTED=$(warp_input_reporting_supported)
         fi
 
-        # If we haven't already, cache information about supported features.
-        if [[ -z $WARP_PS1_EXPANSION_SUPPORTED ]]; then
-          WARP_PS1_EXPANSION_SUPPORTED=$(warp_ps1_expanding_supported)
-        fi
-
-        if [[ $WARP_PS1_EXPANSION_SUPPORTED  == "1" ]]; then
-          # When evaluating the PS1, we want to ensure that it's aware of the last exit code.
-          # Since we captured it already and executed multiple other commands, the actual
-          # last exit code has changed. So before the evaluation, we want to trick the shell
-          # into returning the correct value for the $? that may be in PS1
-          exit_code_hack() {
-            return $1
-          }
-          exit_code_hack $exit_code
-          deref_ps1=${WARP_PS1@P}
+        local honor_ps1
+        local deref_ps1=""
+        local escaped_ps1=""
+        if [[ "$WARP_HONOR_PS1" == "1" ]]; then
+          honor_ps1="true"
         else
-          # Tricking the shell into rendering the prompt
-          # Note that in more modern versions of bash we could use ${PS1@P} to achieve the same,
-          # but MacOS comes by default with a much older version of bash, and we want to be compatible.
-          deref_ps1=$(echo -e "\n" | PS1="$WARP_PS1" BASH_SILENCE_DEPRECATION_WARNING=1 "$BASH" --norc -i 2>&1 | command -p head -2 | command -p tail -1)
-        fi
+          honor_ps1="false"
 
-        # Escaped PS1 variable
-        local escaped_ps1
-        if [ "$WARP_IN_MSYS2" = false ]; then
-          escaped_ps1=$(warp_escape_ps1 "$(echo "$deref_ps1")")
+          # If we haven't already, cache information about supported features.
+          if [[ -z $WARP_PS1_EXPANSION_SUPPORTED ]]; then
+            WARP_PS1_EXPANSION_SUPPORTED=$(warp_ps1_expanding_supported)
+          fi
+
+          if [[ $WARP_PS1_EXPANSION_SUPPORTED  == "1" ]]; then
+            # When evaluating the PS1, we want to ensure that it's aware of the last exit code.
+            # Since we captured it already and executed multiple other commands, the actual
+            # last exit code has changed. So before the evaluation, we want to trick the shell
+            # into returning the correct value for the $? that may be in PS1
+            exit_code_hack() {
+              return $1
+            }
+            exit_code_hack $exit_code
+            deref_ps1=${WARP_PS1@P}
+          else
+            # Tricking the shell into rendering the prompt
+            # Note that in more modern versions of bash we could use ${PS1@P} to achieve the same,
+            # but MacOS comes by default with a much older version of bash, and we want to be compatible.
+            deref_ps1=$(echo -e "\n" | PS1="$WARP_PS1" BASH_SILENCE_DEPRECATION_WARNING=1 "$BASH" --norc -i 2>&1 | command -p head -2 | command -p tail -1)
+          fi
+
+          if [ "$WARP_IN_MSYS2" = false ]; then
+            escaped_ps1=$(warp_escape_ps1 "$(echo "$deref_ps1")")
+          fi
         fi
 
         # Flush history
@@ -574,37 +724,56 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
               escaped_conda_env=$(warp_escape_json "$CONDA_DEFAULT_ENV")
           fi
 
-          # Get Node.js version if node is available and we're in a Node.js project
-          if command -v node > /dev/null 2>&1 && [ "$WARP_IN_MSYS2" = false ]; then
+          # Get the Node.js version, but only when the Node.js Version chip is enabled.
+          # Warp sets WARP_PROMPT_NODE_VERSION_ENABLED to "0" when the chip is not in the
+          # prompt (defaulting to enabled when unset), so we avoid spawning `node` on
+          # every prompt when the chip is not shown.
+          if [[ "$WARP_PROMPT_NODE_VERSION_ENABLED" != "0" ]] && command -v node > /dev/null 2>&1 && [ "$WARP_IN_MSYS2" = false ]; then
               # Check for package.json in current directory and parent directories
               local current_dir="$PWD"
               local found_package_json=false
               local package_json_dir=""
-              while [[ "$current_dir" != "/" ]]; do
+              while [[ -n "$current_dir" ]]; do
                   if [[ -f "$current_dir/package.json" ]]; then
                       found_package_json=true
                       package_json_dir="$current_dir"
                       break
                   fi
-                  current_dir=$(dirname "$current_dir")
+                  [[ "$current_dir" == "/" ]] && break
+                  # Strip the last path segment without spawning `dirname`.
+                  current_dir="${current_dir%/*}"
+                  [[ -z "$current_dir" ]] && current_dir="/"
               done
               
               # Only show node version if package.json is within a git repository
               if [[ "$found_package_json" = true ]]; then
                   local git_dir="$package_json_dir"
                   local in_git_repo=false
-                  while [[ "$git_dir" != "/" ]]; do
+                  while [[ -n "$git_dir" ]]; do
                       if [[ -d "$git_dir/.git" ]]; then
                           in_git_repo=true
                           break
                       fi
-                      git_dir=$(dirname "$git_dir")
+                      [[ "$git_dir" == "/" ]] && break
+                      git_dir="${git_dir%/*}"
+                      [[ -z "$git_dir" ]] && git_dir="/"
                   done
                   
                   if [[ "$in_git_repo" = true ]]; then
-                      local node_version=$(node --version 2>/dev/null)
-                      if [[ -n "$node_version" ]]; then
-                          escaped_node_version=$(warp_escape_json "$node_version")
+                      # Cache the resolved version keyed on PWD + PATH so we only spawn
+                      # `node --version` when the directory or PATH changes (PATH changes
+                      # on `nvm use`). The cache vars are global (no `local`) so they
+                      # persist across precmd invocations.
+                      local node_cache_key="$PWD:$PATH"
+                      if [[ "$node_cache_key" == "$_WARP_NODE_VERSION_CACHE_KEY" ]]; then
+                          escaped_node_version="$_WARP_NODE_VERSION_CACHE_VALUE"
+                      else
+                          local node_version=$(node --version 2>/dev/null)
+                          if [[ -n "$node_version" ]]; then
+                              escaped_node_version=$(warp_escape_json "$node_version")
+                          fi
+                          _WARP_NODE_VERSION_CACHE_KEY="$node_cache_key"
+                          _WARP_NODE_VERSION_CACHE_VALUE="$escaped_node_version"
                       fi
                   fi
               fi
@@ -637,18 +806,11 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
         # Note WARP_SESSION_ID doesn't need to be escaped since it's a number
         # We also pass the shell's notion of `honor_ps1` to ensure it's synced correctly on the Warp-side for prompt handling.
         # This is passed as a "real boolean" via the JSON payload (string interpolated into JSON string below).
-        local honor_ps1
-        if [[ "$WARP_HONOR_PS1" == "1" ]]; then
-          honor_ps1="true"
-          # The Warp prompt preview can be rendered using the active prompt in this case (which uses prompt markers).
-          escaped_ps1=""
-          deref_ps1=""
-        else
-          honor_ps1="false"
-        fi
         # We send the escaped PS1, if we are in active Warp prompt mode, for prompt preview rendering (note the shell's PS1 is unset in this case).
         if [ "$WARP_IN_MSYS2" = true ]; then
           warp_send_hook_via_kv_pairs_start "Precmd"
+          warp_send_hook_kv_pair "exit_code" "$exit_code"
+          warp_send_hook_kv_pair "next_block_id" "$next_block_id"
           warp_send_hook_kv_pair "pwd" "$PWD"
           warp_send_hook_kv_pair_escaped "ps1" "$deref_ps1"
           warp_send_hook_kv_pair "ps1_is_encoded" "false"
@@ -662,6 +824,8 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
           warp_send_hook_via_kv_pairs_end
         else
           local escaped_json="{\"hook\": \"Precmd\", \"value\": {
+          \"exit_code\": $exit_code,
+          \"next_block_id\": \"$next_block_id\",
           \"pwd\": \"$escaped_pwd\",
           \"ps1\": \"$escaped_ps1\",
           \"honor_ps1\": $honor_ps1,
@@ -722,21 +886,57 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
     # Afterwards it's decoded in rust and parsed as usual.
     # Accepts one argument: DCS JSON string
     warp_hex_encode_string () {
-      echo "$1" | command -p od -An -v -tx1 | command -p tr -d ' \n'
+      printf '%s' "$1" | command -p od -An -v -tx1 | command -p tr -d ' \n'
+    }
+
+    warp_completions_hex_encode_into () {
+      # `LC_ALL=C` keeps indexing byte-wise, so it stays correct for UTF-8 text.
+      local LC_ALL=C
+      local __warp_hex_var="$1"
+      local __warp_hex_in="$2"
+      # This branch is faster for longer values.
+      if (( ${#__warp_hex_in} > 256 )); then
+        printf -v "$__warp_hex_var" '%s' \
+          "$(printf '%s' "$__warp_hex_in" | command -p od -An -v -tx1 | command -p tr -d ' \n')"
+        return
+      fi
+      # This branch is faster for shorter values. The "for" loop is O(n²) which is fine for short
+      # values, bad for long values. The case above avoids that at the cost of using piping into
+      # subprocesses instead.
+      local __warp_hex_i __warp_hex_byte __warp_hex_acc=""
+      for (( __warp_hex_i = 0; __warp_hex_i < ${#__warp_hex_in}; __warp_hex_i++ )); do
+        printf -v __warp_hex_byte '%02x' "'${__warp_hex_in:__warp_hex_i:1}"
+        # Keep only the low byte. bash 3.2, which macOS still ships, reads a character code above
+        # 0x7f as a negative number, and `%02x` then sign-extends it to sixteen digits.
+        __warp_hex_acc+="${__warp_hex_byte: -2}"
+      done
+      printf -v "$__warp_hex_var" '%s' "$__warp_hex_acc"
+    }
+
+    warp_hex_decode_string () {
+      if command -pv xxd >/dev/null 2>&1; then
+        printf '%s' "$1" | command -p xxd -p -r
+      else
+        local hex="$1" out="" i
+        for (( i = 0; i < ${#hex}; i += 2 )); do
+          out+="\x${hex:$i:2}"
+        done
+        printf '%b' "$out"
+      fi
     }
 
     # Returns encoded InitShell hook
     # Accepts one argument: shell [bash, zsh, fish (future)]
     init_shell_hook () {
       init_shell="{\"hook\": \"InitShell\", \"value\": {\"shell\": \"$1\"}}"
-      echo $(warp_hex_encode_string "$init_shell")
+      echo "$(warp_hex_encode_string "$init_shell")"
     }
 
     # Checks whether the current version of bash is at least as high as the expected ($1) one.
     # To match rest of our codebase, it returns "1" if the bash version is higher or equal, and 
     # 0 otherwise.
     warp_at_least_bash_version () {
-      if [[ $(printf '%s\n%s\n' "$BASH_VERSION" "$1" | command -p sort -rVC ; echo $?) -eq 0 ]]; then
+      if [[ "$(printf '%s\n%s\n' "$BASH_VERSION" "$1" | command -p sort -rVC ; echo $?)" -eq 0 ]]; then
         echo "1"
       else 
         echo "0"
@@ -761,13 +961,48 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
         if [ "$WARP_IN_MSYS2" = true ]; then
             warp_send_hook_via_kv_pairs_start "InputBuffer"
             warp_send_hook_kv_pair "buffer" "$READLINE_LINE"
+            warp_send_hook_kv_pair "session_id" "$WARP_SESSION_ID"
             warp_send_hook_via_kv_pairs_end
         else
             local escaped_input="$(warp_escape_json "$READLINE_LINE")"
-            warp_send_json_message "{ \"hook\": \"InputBuffer\", \"value\": { \"buffer\": \"$escaped_input\" } }"
+            warp_send_json_message "{ \"hook\": \"InputBuffer\", \"value\": { \"buffer\": \"$escaped_input\", \"session_id\": $WARP_SESSION_ID } }"
         fi
         # This prevents bash from re-printing typeahead after we've removed it.
         READLINE_LINE=""
+    }
+
+    # Runs the shell's ctrl-r history widget as a foreground command.
+    warp_run_external_ctrl_r_widget () {
+        local result=""
+        case "$_WARP_EXTERNAL_CTRL_R_WIDGET" in
+          __fzf_history__)
+            result="$(__fzf_history__)"
+            ;;
+          __atuin_history)
+            # Bypass atuin's own bash key-binding machinery entirely and invoke the underlying
+            # `atuin search` command directly, exactly as atuin's own integration does
+            # (__atuin_search_cmd's non-tmux branch).
+            result="$(ATUIN_SHELL=bash atuin search -i 3>&1 1>&2 2>&3 3>&-)"
+            # If the user has atuin's enter_accept config on, Enter both selects and runs the
+            # command, signaled by this prefix; we only ever want the selection, never to run
+            # it, so strip the prefix in both cases (see atuin's __atuin_history for the same
+            # check).
+            result="${result#__atuin_accept__:}"
+            ;;
+        esac
+        local warp_escaped_selection="$(warp_escape_json "$result")"
+        warp_send_json_message "{ \"hook\": \"ExternalShellWidgetSelection\", \"value\": { \"buffer\": \"$warp_escaped_selection\", \"session_id\": $WARP_SESSION_ID } }"
+    }
+
+    # Runs fzf's ctrl-t file-search widget as a foreground command.
+    warp_run_external_ctrl_t_widget () {
+        local result="$(__fzf_select__)"
+        local warp_escaped_selection="$(warp_escape_json "$result")"
+        warp_send_json_message "{ \"hook\": \"ExternalShellWidgetSelection\", \"value\": { \"buffer\": \"$warp_escaped_selection\", \"session_id\": $WARP_SESSION_ID } }"
+    }
+
+    warp_run_external_alt_c_widget () {
+        eval "$(__fzf_cd__)"
     }
 
     # Check whether the prompt-related variables have OSC prompt marker sequences,
@@ -888,9 +1123,10 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
     function clear() {
         if [ "$WARP_IN_MSYS2" = true ]; then
             warp_send_hook_via_kv_pairs_start "Clear"
+            warp_send_hook_kv_pair "session_id" "$WARP_SESSION_ID"
             warp_send_hook_via_kv_pairs_end
         else
-            warp_send_json_message "{\"hook\": \"Clear\", \"value\": {}}"
+            warp_send_json_message "{\"hook\": \"Clear\", \"value\": {\"session_id\": $WARP_SESSION_ID}}"
         fi
     }
 
@@ -899,9 +1135,10 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
       if [ "$WARP_IN_MSYS2" = true ]; then
         warp_send_hook_via_kv_pairs_start "FinishUpdate"
         warp_send_hook_kv_pair "update_id" "$update_id"
+        warp_send_hook_kv_pair "session_id" "$WARP_SESSION_ID"
         warp_send_hook_via_kv_pairs_end
       else
-        warp_send_json_message "{ \"hook\": \"FinishUpdate\", \"value\": { \"update_id\": \"$update_id\"} }"
+        warp_send_json_message "{ \"hook\": \"FinishUpdate\", \"value\": { \"update_id\": \"$update_id\", \"session_id\": $WARP_SESSION_ID} }"
       fi
     }
 
@@ -970,13 +1207,66 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
         }
 
         function warp_ssh_helper() {
+            # shellcheck disable=SC2034
             init_shell_bash=$(init_shell_hook "bash")
+            # shellcheck disable=SC2034
             init_shell_zsh=$(init_shell_hook "zsh")
+            local remote_session_id=$(command -p od -An -N8 -tu8 /dev/urandom 2>/dev/null | command -p tr -d ' \n')
+            if [[ -z "$remote_session_id" || "$remote_session_id" == "0" ]]; then
+                # If we cannot generate a non-zero random token, run plain SSH instead.
+                command ssh "${@:1}"
+                return
+            fi
+
+            # If the user's SSH config sets a RemoteCommand for this destination,
+            # OpenSSH refuses to also run our bootstrap as a command-line remote
+            # command, aborting with "Cannot execute command-line and remote
+            # command." Warpification is structurally impossible there, so fall
+            # back to plain SSH. `ssh -G` prints `remotecommand none` when unset.
+            local user_remote_command=$(command ssh -G "${@:1}" 2>/dev/null | command -p sed -n 's/^remotecommand //p')
+            if [[ -n "$user_remote_command" && "$user_remote_command" != "none" ]]; then
+                command ssh "${@:1}"
+                return
+            fi
 
             # Hex-encode the ZSH environment script we use to bootstrap remote zsh b/c it contains control characters
             # We decode on the SSH server using xxd if its available, otherwise fall back to a for-loop over each byte
             # and use printf to convert back to plaintext
-            local zsh_env_script=$(printf '%s' 'unsetopt ZLE; unset RCS; unset GLOBAL_RCS; WARP_SESSION_ID="$(command -p date +%s)$RANDOM"; WARP_USING_WINDOWS_CON_PTY=@@USING_CON_PTY_BOOLEAN@@; WARP_HONOR_PS1='$WARP_HONOR_PS1'; _hostname=$(command -pv hostname >/dev/null 2>&1 && command -p hostname 2>/dev/null || command -p uname -n); _user=$(command -pv whoami >/dev/null 2>&1 && command -p whoami 2>/dev/null || echo $USER); _msg=$(printf "{\"hook\": \"InitShell\", \"value\": {\"session_id\": $WARP_SESSION_ID, \"shell\": \"zsh\", \"user\": \"%s\", \"hostname\": \"%s\"}}" "$_user" "$_hostname" | command -p od -An -v -tx1 | command -p tr -d '"'"' \n'"'"'); printf '"'"'\e]9278;d;%s\x07'"'"' $_msg; unset _hostname _user _msg' | command -p od -An -v -tx1 | command -p tr -d ' \n')
+            local zsh_env_script=$(printf '%s' 'unsetopt ZLE RCS GLOBAL_RCS; WARP_SESSION_ID='$remote_session_id'; WARP_USING_WINDOWS_CON_PTY=@@USING_CON_PTY_BOOLEAN@@; WARP_HONOR_PS1='$WARP_HONOR_PS1'; _hostname=$(command -pv hostname >/dev/null 2>&1 && command -p hostname 2>/dev/null || command -p uname -n); _user=$(command -pv whoami >/dev/null 2>&1 && command -p whoami 2>/dev/null || echo $USER); _msg=$(printf "{\"hook\": \"InitShell\", \"value\": {\"session_id\": $WARP_SESSION_ID, \"shell\": \"zsh\", \"user\": \"%s\", \"hostname\": \"%s\"}}" "$_user" "$_hostname" | command -p od -An -v -tx1 | command -p tr -d '"'"' \n'"'"'); printf '"'"'\e]9278;d;%s\x07'"'"' $_msg; unset _hostname _user _msg' | command -p od -An -v -tx1 | command -p tr -d ' \n')
+
+            # Optionally attach to an existing ControlMaster the user already
+            # runs for this destination instead of creating our own. Resolve
+            # the user's configured ControlPath with `ssh -G` (which expands
+            # tokens like %h/%p/%r/%C into a literal path), then verify the
+            # master is alive with `ssh -O check`. Both probes are local-only
+            # commands. On any failure we fall back to creating a Warp-owned
+            # master, preserving the existing behavior.
+            local control_path="$SSH_SOCKET_DIR/$WARP_SESSION_ID"
+            local control_master_mode="yes"
+            local external_control_master="false"
+            if [[ "$WARP_SSH_REUSE_CONTROL_MASTER" == "1" ]]; then
+                local user_control_path=$(command ssh -G "${@:1}" 2>/dev/null | command -p sed -n 's/^controlpath //p')
+                case "$user_control_path" in
+                    "" | none)
+                        # No ControlPath configured for this destination.
+                        ;;
+                    *[![:alnum:]._/~@:+,-]*)
+                        # The resolved path contains characters we cannot safely
+                        # embed in the SSH hook JSON below (e.g. an unexpanded %
+                        # token, quotes, or whitespace); fall back to a
+                        # Warp-owned master.
+                        ;;
+                    *)
+                        if command ssh -O check -o ControlPath="$user_control_path" "${@:1}" >/dev/null 2>&1; then
+                            # A live master exists: multiplex through it and let
+                            # the client know Warp does not own it.
+                            control_path="$user_control_path"
+                            control_master_mode="no"
+                            external_control_master="true"
+                        fi
+                        ;;
+                esac
+            fi
 
             # Keep remote commands up-to-date with shell.rs & bash.sh.
             # Note that in this command, we're passing a string to the remote shell. Any variable expansions need to be
@@ -985,7 +1275,7 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
             # determine what shell is the login shell on the remote machine.  We perform a preliminary check to see if
             # the remote shell is the Bourne shell to avoid asking it to parse later lines that use syntax it doesn't
             # support.
-            command ssh -o ControlMaster=yes -o ControlPath=$SSH_SOCKET_DIR/$WARP_SESSION_ID \
+            command ssh -o ControlMaster=$control_master_mode -o ControlPath="$control_path" \
             -t "${@:1}" \
 "
 export TERM_PROGRAM='WarpTerminal'
@@ -997,7 +1287,7 @@ test -n '$WARP_CLIENT_VERSION' && export WARP_CLIENT_VERSION='$WARP_CLIENT_VERSI
 # Only forward the protocol version if it was set locally (i.e. the HOANotifications feature flag is on).
 test -n '$WARP_CLI_AGENT_PROTOCOL_VERSION' && export WARP_CLI_AGENT_PROTOCOL_VERSION='$WARP_CLI_AGENT_PROTOCOL_VERSION'
 
-hook="'$(printf "{\"hook\": \"SSH\", \"value\": {\"socket_path\": \"'$SSH_SOCKET_DIR/$WARP_SESSION_ID'\", \"remote_shell\": \"%s\"}}" "${SHELL##*/}" | command -p od -An -v -tx1 | command -p tr -d " \n")'"
+hook="'$(printf "{\"hook\": \"SSH\", \"value\": {\"socket_path\": \"'$control_path'\", \"remote_shell\": \"%s\", \"session_id\": '"$WARP_SESSION_ID"', \"remote_session_id\": '"$remote_session_id"', \"external_control_master\": '"$external_control_master"'}}" "${SHELL##*/}" | command -p od -An -v -tx1 | command -p tr -d " \n")'"
 printf '$OSC_START$DCS_JSON_MARKER$OSC_PARAM_SEPARATOR%s$OSC_END' "'$hook'"
 
 if test "'"${SHELL##*/}" != "bash" -a "${SHELL##*/}" != "zsh"'"; then
@@ -1032,7 +1322,7 @@ case "'${SHELL##*/}'" in
       command -p stty raw
       HISTCONTROL=ignorespace
       HISTIGNORE=" *"
-      WARP_SESSION_ID="$(command -p date +%s)$RANDOM"
+      WARP_SESSION_ID='$remote_session_id'
       WARP_HONOR_PS1="'$WARP_HONOR_PS1'"
       _hostname=$(command -pv hostname >/dev/null 2>&1 && command -p hostname 2>/dev/null || command -p uname -n)
       _user=$(command -v whoami >/dev/null 2>&1 && command whoami 2>/dev/null || echo $USER)
@@ -1063,7 +1353,7 @@ esac
 
         function ssh() {
             if is_interactive_ssh_session "$@"; then
-                warp_send_json_message "{\"hook\": \"PreInteractiveSSHSession\", \"value\": {}}"
+                warp_send_json_message "{\"hook\": \"PreInteractiveSSHSession\", \"value\": {\"session_id\": $WARP_SESSION_ID}}"
 
                 # If the SSH wrapper is not enabled for this session, don't use it.
                 if [ "$WARP_USE_SSH_WRAPPER" = "1" ]; then
@@ -1122,40 +1412,45 @@ esac
             source /etc/bash.bashrc
         fi
 
-        if [[ -e $HOME/.bash_profile ]]; then
-            source $HOME/.bash_profile
-        elif [[ -e $HOME/.bash_login ]]; then
-            source $HOME/.bash_login
-        elif [[ -e $HOME/.profile ]]; then
-            source $HOME/.profile
+        if [[ -e "$HOME/.bash_profile" ]]; then
+            source "$HOME/.bash_profile"
+        elif [[ -e "$HOME/.bash_login" ]]; then
+            source "$HOME/.bash_login"
+        elif [[ -e "$HOME/.profile" ]]; then
+            source "$HOME/.profile"
         fi
 
         rcfiles_end_time="$(LC_ALL="C"; echo $EPOCHREALTIME)"
     fi
 
-    # Unset HISTFILESIZE if the user rcfiles didn't change it away from our
-    # very large sentinel value.  We need to set the initial value of HISTSIZE
-    # to ensure that the user's history file doesn't get truncated when we spawn
-    # the shell, but once bootstrap has completes, we want the value to be what
-    # it would have been if we hadn't set an initial value.
+    # Unset HISTFILESIZE and HISTSIZE if the user rcfiles didn't change them
+    # away from our very large sentinel values.  We need to set the initial
+    # values to ensure that the user's history file and in-memory history list
+    # don't get truncated when we spawn the shell, but once bootstrap has
+    # completed, we want the values to be what they would have been if we hadn't
+    # set initial values.
     #
     # For more context, see: https://github.com/warpdotdev/Warp/issues/1262
-    if [[ $HISTFILESIZE == $WARP_INITIAL_HISTFILESIZE ]]; then
+    if [[ $HISTFILESIZE == "$WARP_INITIAL_HISTFILESIZE" ]]; then
         unset HISTFILESIZE
     fi
     unset WARP_INITIAL_HISTFILESIZE
+    if [[ $HISTSIZE == "$WARP_INITIAL_HISTSIZE" ]]; then
+        unset HISTSIZE
+    fi
+    unset WARP_INITIAL_HISTSIZE
 
     # Save the value of HISTCONTROL as it existed just after reading the user's
     # rcfiles.
     USER_HISTCONTROL="$HISTCONTROL"
 
-    # Add a pattern to ignore in-band commands in shell history, while preserving the user's
+    # Add patterns to ignore in-band commands in shell history, while preserving the user's
     # HISTIGNORE value which may been set in an RC file sourced above. It is important to
     # ensure that this happens _after_ the user's RC files have been sourced.
     if [[ ! -z $HISTIGNORE ]]; then
-        HISTIGNORE="*warp_run_generator_command*:$HISTIGNORE"
+        HISTIGNORE="*warp_run_generator_command*:*warp_run_external_ctrl_r_widget*:*warp_run_external_ctrl_t_widget*:*warp_run_external_alt_c_widget*:$HISTIGNORE"
     else
-        HISTIGNORE="*warp_run_generator_command*"
+        HISTIGNORE="*warp_run_generator_command*:*warp_run_external_ctrl_r_widget*:*warp_run_external_ctrl_t_widget*:*warp_run_external_alt_c_widget*"
     fi
 
     # If the user has PROMPT_COMMAND set in their bootstrap scripts,
@@ -1222,6 +1517,22 @@ esac
         export PATH="$PATH:$WARP_PATH_APPEND"
         unset WARP_PATH_APPEND
     fi
+    # Direct non-root cloud containers use a private command directory when system installation fails.
+    # Restore the entrypoint-provided directory's precedence after profiles reset PATH.
+    if [[ "${WARP_CLOUD_AGENT_FALLBACK_BIN:-}" == /* && "$WARP_CLOUD_AGENT_FALLBACK_BIN" != *:* \
+        && -d "$WARP_CLOUD_AGENT_FALLBACK_BIN" && "$(command -p uname -s)" == Linux ]]; then
+        _warp_runtime_remaining="$PATH:"
+        _warp_runtime_path="$WARP_CLOUD_AGENT_FALLBACK_BIN"
+        while [[ -n "$_warp_runtime_remaining" ]]; do
+            _warp_runtime_entry="${_warp_runtime_remaining%%:*}"
+            _warp_runtime_remaining="${_warp_runtime_remaining#*:}"
+            if [[ "$_warp_runtime_entry" != "$WARP_CLOUD_AGENT_FALLBACK_BIN" ]]; then
+                _warp_runtime_path="$_warp_runtime_path:$_warp_runtime_entry"
+            fi
+        done
+        export PATH="$_warp_runtime_path"
+        unset _warp_runtime_remaining _warp_runtime_path _warp_runtime_entry
+    fi
 
     # Read through shell options to determine if the user has enabled vi mode.
     vi_mode_enabled=0
@@ -1257,7 +1568,7 @@ esac
     precmd_functions+=(warp_set_title_idle_on_precmd)
     preexec_functions+=(warp_set_title_active_on_preexec)
 
-    if declare -f user_prompt_command 2>&1 >/dev/null; then
+    if declare -F user_prompt_command >/dev/null; then
         precmd_functions+=(user_prompt_command)
     fi
 
@@ -1269,6 +1580,39 @@ esac
     shopt -s histappend
 
     shell_plugins=()
+
+    # Detect whether ctrl-r has been rebound to fzf's or atuin's bash history widget.
+    _WARP_EXTERNAL_CTRL_R_WIDGET=""
+    if [ "$WARP_IN_MSYS2" = false ]; then
+      warp_ctrl_r_binding="$(bind -X 2>/dev/null | command -p sed -n 's/^"\\C-r"[ :] *"\(.*\)"$/\1/p')"
+      if [ -z "$warp_ctrl_r_binding" ] && declare -F __fzf_history__ >/dev/null; then
+        warp_ctrl_r_macro="$(bind -s 2>/dev/null | command -p sed -n 's/^"\\C-r"[ :] *"\(.*\)"$/\1/p')"
+        case "$warp_ctrl_r_macro" in
+          *'`__fzf_history__`'*)
+            warp_ctrl_r_binding="__fzf_history__"
+            ;;
+        esac
+      fi
+      case "$warp_ctrl_r_binding" in
+        __fzf_history__)
+          _WARP_EXTERNAL_CTRL_R_WIDGET="$warp_ctrl_r_binding"
+          shell_plugins+=(fzf)
+          ;;
+        __atuin_history)
+          _WARP_EXTERNAL_CTRL_R_WIDGET="$warp_ctrl_r_binding"
+          shell_plugins+=(atuin)
+          ;;
+      esac
+      # atuin >= 18.10 binds ctrl-r through the indirect dispatcher above rather than a plain
+      # `bind -x`. Instead use atuin's own init-time flag ($__atuin_bind_ctrl_r) plus
+        # __atuin_history being defined.
+      # shellcheck disable=SC2154
+      if [ -z "$_WARP_EXTERNAL_CTRL_R_WIDGET" ] && [ "$__atuin_bind_ctrl_r" = true ] &&
+        declare -F __atuin_history >/dev/null; then
+        _WARP_EXTERNAL_CTRL_R_WIDGET="__atuin_history"
+        shell_plugins+=(atuin)
+      fi
+    fi
 
     function warp_bootstrapped () {
         local aliases="`alias`"
@@ -1301,8 +1645,10 @@ esac
           shell_plugins+=("starship")
         fi
 
+        local shell_plugins_list="$(printf '%s\n' "${shell_plugins[@]}")"
+
         if [ "$WARP_IN_MSYS2" = false ]; then
-          local escaped_shell_plugins=$(warp_escape_json "$shell_plugins")
+          local escaped_shell_plugins=$(warp_escape_json "$shell_plugins_list")
           local escaped_path="$(warp_escape_json "$PATH")"
           local escaped_shell_options=$(warp_escape_json "$shell_options")
         fi
@@ -1318,13 +1664,14 @@ esac
           warp_send_hook_kv_pair "user" "$_user"
           warp_send_hook_kv_pair "hostname" "$_hostname"
           warp_send_hook_kv_pair "path" "$PATH"
+          warp_send_hook_kv_pair "cdpath" "$CDPATH"
           warp_send_hook_kv_pair_escaped "env_var_names" "$env_var_names"
           warp_send_hook_kv_pair "abbreviations" ""
           warp_send_hook_kv_pair_escaped "aliases" "$aliases"
           warp_send_hook_kv_pair_escaped "function_names" "$function_names"
           warp_send_hook_kv_pair_escaped "builtins" "$builtins"
           warp_send_hook_kv_pair_escaped "keywords" "$keywords"
-          warp_send_hook_kv_pair "shell_plugins" "$shell_plugins"
+          warp_send_hook_kv_pair_escaped "shell_plugins" "$shell_plugins_list"
           warp_send_hook_kv_pair "shell_version" "$BASH_VERSION"
           warp_send_hook_kv_pair "shell_options" "$shell_options"
           warp_send_hook_kv_pair "rcfiles_start_time" "$rcfiles_start_time"
@@ -1338,7 +1685,8 @@ esac
         else
           local escaped_editor="$(warp_escape_json "$EDITOR")"
           local escaped_shell_path="$(warp_escape_json "$BASH")"
-          local escaped_json="{\"hook\": \"Bootstrapped\", \"value\": {\"histfile\": \"$escaped_histfile\", \"session_id\": $WARP_SESSION_ID, \"shell\": \"bash\",  \"home_dir\": \"$HOME\", \"user\":\"$_user\", \"host\":\"$_hostname\", \"path\": \"$escaped_path\", \"editor\": \"$escaped_editor\", \"env_var_names\": \"$escaped_env_var_names\", \"abbreviations\": \"$escaped_abbrs\", \"aliases\": \"$escaped_aliases\", \"function_names\": \"$escaped_function_names\", \"builtins\": \"$escaped_builtins\", \"keywords\": \"$escaped_keywords\", \"shell_version\": \"$BASH_VERSION\", \"shell_options\": \"$escaped_shell_options\", \"rcfiles_start_time\": \"$rcfiles_start_time\", \"rcfiles_end_time\": \"$rcfiles_end_time\", \"vi_mode_enabled\": \"$vi_mode_enabled\", \"os_category\": \"$os_category\", \"linux_distribution\": \"$linux_distribution\", \"wsl_name\": \"$WSL_DISTRO_NAME\", \"shell_path\": \"$escaped_shell_path\"}}"
+          local escaped_cdpath="$(warp_escape_json "$CDPATH")"
+          local escaped_json="{\"hook\": \"Bootstrapped\", \"value\": {\"histfile\": \"$escaped_histfile\", \"session_id\": $WARP_SESSION_ID, \"shell\": \"bash\",  \"home_dir\": \"$HOME\", \"user\":\"$_user\", \"host\":\"$_hostname\", \"path\": \"$escaped_path\", \"cdpath\": \"$escaped_cdpath\", \"editor\": \"$escaped_editor\", \"env_var_names\": \"$escaped_env_var_names\", \"abbreviations\": \"$escaped_abbrs\", \"aliases\": \"$escaped_aliases\", \"function_names\": \"$escaped_function_names\", \"builtins\": \"$escaped_builtins\", \"keywords\": \"$escaped_keywords\", \"shell_version\": \"$BASH_VERSION\", \"shell_options\": \"$escaped_shell_options\", \"rcfiles_start_time\": \"$rcfiles_start_time\", \"rcfiles_end_time\": \"$rcfiles_end_time\", \"shell_plugins\": \"$escaped_shell_plugins\", \"vi_mode_enabled\": \"$vi_mode_enabled\", \"os_category\": \"$os_category\", \"linux_distribution\": \"$linux_distribution\", \"wsl_name\": \"$WSL_DISTRO_NAME\", \"shell_path\": \"$escaped_shell_path\"}}"
           warp_send_json_message "$escaped_json"
         fi
     }

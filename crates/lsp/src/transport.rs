@@ -3,17 +3,14 @@ use std::sync::Arc;
 use async_process::{Child, ChildStdin, ChildStdout, Stdio};
 use async_trait::async_trait;
 use command::r#async::Command;
+use futures::future::FutureExt;
+use futures::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use futures::lock::Mutex;
-use futures::{
-    future::FutureExt,
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
-};
 use jsonrpc::Transport;
 use simple_logger::SimpleLogger;
-use warpui::r#async::{
-    executor::{Background, BackgroundTask},
-    Timer,
-};
+use warp_errors::report_error;
+use warpui_core::r#async::Timer;
+use warpui_core::r#async::executor::{Background, BackgroundTask};
 
 /// Transport implementation for LSP communication over process stdin/stdout.
 /// Also manages the LSP server process lifecycle with graceful shutdown capabilities.
@@ -78,12 +75,14 @@ impl ProcessTransport {
                         log::debug!("ProcessTransport [pid: {child_pid}] stderr: {message}");
                     }
                     Err(e) => {
-                        log::error!(
-                            "ProcessTransport [pid: {child_pid}]: Error reading stderr: {e}"
-                        );
                         if let Some(ref logger) = logger {
                             logger.log(format!("[error] Error reading stderr: {e}"));
                         }
+                        report_error!(
+                            anyhow::Error::new(e)
+                                .context("ProcessTransport: Error reading stderr"),
+                            extra: { "pid" => %child_pid }
+                        );
                         break;
                     }
                 }
@@ -187,10 +186,10 @@ impl Transport for ProcessTransport {
         // Wait for the stderr task because it owns the last logger clone.
         // Joining it ensures that clone is dropped before restart so the same
         // log path can be registered again without colliding with a stale entry.
-        if let Some(stderr_task) = self.stderr_task.lock().await.take() {
-            if let Err(e) = stderr_task.await {
-                log::warn!("LSP: Failed to join stderr task: {e}");
-            }
+        if let Some(stderr_task) = self.stderr_task.lock().await.take()
+            && let Err(e) = stderr_task.await
+        {
+            log::warn!("LSP: Failed to join stderr task: {e}");
         }
         log::info!("LSP: Server shut down.");
         Ok(())

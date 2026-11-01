@@ -1,34 +1,34 @@
 use std::fmt;
 use std::fmt::{Debug, Formatter};
-use std::num::ParseIntError;
-use std::string::FromUtf8Error;
 use std::sync::Arc;
 use std::time::Duration;
 
 use instant::Instant;
+pub use remote_server::setup::RemoteServerSetupState;
+pub use warp_terminal::event::{
+    ExecutedExecutorCommandEvent, ObservedExitStatus, ParseGeneratorOutputError,
+};
+use warp_util::lazy::Lazy;
 
+use super::history::HistoryEntry;
+use super::model::ansi::{ExternalShellWidgetSelectionValue, FinishUpdateValue};
+use super::model::block::BlockId;
+use super::model::lifecycle::LifecycleRecoveryRecord;
+use super::model::session::{SessionId, SessionInfo};
+use super::model::terminal_model::{BlockIndex, ExitReason};
 use crate::server::ids::SyncId;
 use crate::server::telemetry::ImageProtocol;
-use crate::terminal::model::block::BlockMetadata;
-use crate::terminal::model::block::SerializedBlock;
+use crate::terminal::ClipboardType;
+use crate::terminal::model::block::{BlockMetadata, SerializedBlock};
+use crate::terminal::model::blocks::BlockList;
 use crate::terminal::model::completions::ShellCompletion;
 use crate::terminal::model::terminal_model::HandlerEvent;
 use crate::terminal::shell::ShellType;
-use crate::terminal::ClipboardType;
-use crate::util::AsciiDebug;
-
-use super::history::HistoryEntry;
-use super::model::ansi::{FinishUpdateValue, WarpificationUnavailableReason};
-use super::model::block::BlockId;
-use super::model::session::{SessionId, SessionInfo};
-use super::model::terminal_model::{BlockIndex, ExitReason, TmuxInstallationState};
-
-pub use remote_server::setup::RemoteServerSetupState;
 
 #[derive(Clone)]
 /// Events sent to the main thread by the terminal model & event loop.
 pub enum Event {
-    CompletionsFinished(Vec<ShellCompletion>),
+    CompletionsFinished(Vec<ShellCompletion>, Option<warp_completer::meta::Span>),
     MouseCursorDirty,
     Title(String),
     VisibleBootstrapBlock,
@@ -46,6 +46,13 @@ pub enum Event {
     },
     /// Sent when a new block is created.
     BlockMetadataReceived(BlockMetadataReceivedEvent),
+    /// Sent when a block's working directory has been updated outside of the
+    /// normal precmd path (e.g. via an OSC 7 escape sequence). Subscribers
+    /// that only care about CWD changes should listen for this in addition to
+    /// `BlockMetadataReceived`; subscribers tied to precmd semantics (such as
+    /// the requested-command finish detector) should keep listening only to
+    /// `BlockMetadataReceived` so they preserve their once-per-block contract.
+    BlockWorkingDirectoryUpdated(BlockWorkingDirectoryUpdatedEvent),
     /// Sent after a background block is started and added to the block list.
     BackgroundBlockStarted,
     ClipboardStore(ClipboardType, String),
@@ -56,6 +63,11 @@ pub enum Event {
     CursorBlinkingChange(bool),
     TerminalClear,
     Bell,
+    /// The shell process exited but the terminal has not been finalized yet; the surface must
+    /// either recover the shell or call `TerminalModel::finalize_exit`.
+    ShellExitObserved {
+        status: ObservedExitStatus,
+    },
     Exit {
         reason: ExitReason,
     },
@@ -77,18 +89,8 @@ pub enum Event {
     SSHControlMasterError,
     TerminalModeSwapped(TerminalMode),
     ExecutedInBandCommand(ExecutedExecutorCommandEvent),
-    TmuxControlModeReady {
-        primary_pane: u32,
-    },
     /// See comment above [crate::terminal::ModelEvent::DetectedEndOfSshLogin].
     DetectedEndOfSshLogin(SshLoginStatus),
-    RemoteWarpificationIsUnavailable(WarpificationUnavailableReason),
-    SshTmuxInstaller(TmuxInstallationState),
-    TmuxInstallFailed {
-        line: String,
-        command: String,
-    },
-    InitSsh(InitSshEvent),
     InitSubshell(InitSubshellEvent),
     /// Emitted when the user's RC file has been executed in a subshell.
     SourcedRcFileInSubshell(SourcedRcFileInSubshellEvent),
@@ -109,9 +111,12 @@ pub enum Event {
     /// Users "Tag an agent in" when they ask the agent to take over a long running command
     /// that was started outside of a conversation (and they tag the agent out when they take control back).
     AgentTaggedInChanged {
+        block_id: BlockId,
         is_tagged_in: bool,
     },
     Handler(HandlerEvent),
+    /// Carries non-UGC lifecycle diagnostics to the model dispatcher for telemetry.
+    LifecycleRecovery(LifecycleRecoveryRecord),
     /// Emitted when the remote server binary has been successfully checked or
     /// installed and is ready. The session is initialized independently on
     /// `Bootstrapped`; when the remote server later connects, the client is
@@ -130,9 +135,9 @@ pub enum Event {
     /// Emitted when the assisted auto-update has completed and we're ready to
     /// relaunch the app.
     FinishUpdate(FinishUpdateValue),
+    ExternalShellWidgetSelection(ExternalShellWidgetSelectionValue),
     TextSelectionChanged,
     ShellSpawned(ShellType),
-    SendCompletionsPrompt,
     ImageReceived {
         image_id: u32,
         image_data: Vec<u8>,
@@ -151,6 +156,33 @@ pub enum Event {
     },
 }
 
+impl From<warp_terminal::event::Event> for Event {
+    fn from(event: warp_terminal::event::Event) -> Self {
+        match event {
+            warp_terminal::event::Event::MouseCursorDirty => Self::MouseCursorDirty,
+            warp_terminal::event::Event::ClipboardStore(clipboard, text) => {
+                Self::ClipboardStore(clipboard, text)
+            }
+            warp_terminal::event::Event::ClipboardLoad(clipboard, load) => {
+                Self::ClipboardLoad(clipboard, load)
+            }
+            warp_terminal::event::Event::CursorBlinkingChange(blinking) => {
+                Self::CursorBlinkingChange(blinking)
+            }
+            warp_terminal::event::Event::Bell => Self::Bell,
+            warp_terminal::event::Event::ImageReceived {
+                image_id,
+                image_data,
+                image_protocol,
+            } => Self::ImageReceived {
+                image_id,
+                image_data,
+                image_protocol,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InitSubshellEvent {
     pub shell_type: ShellType,
@@ -159,13 +191,6 @@ pub struct InitSubshellEvent {
 
 #[derive(Debug, Clone)]
 pub struct SourcedRcFileInSubshellEvent {
-    pub shell_type: ShellType,
-    pub uname: Option<String>,
-    pub tmux: Option<bool>,
-}
-
-#[derive(Debug, Clone)]
-pub struct InitSshEvent {
     pub shell_type: ShellType,
     pub uname: Option<String>,
 }
@@ -204,9 +229,6 @@ pub struct BootstrappedEvent {
 
 #[derive(Clone)]
 pub struct BlockCompletedEvent {
-    /// This will be None when we don't want to collect telemetry
-    /// for this block's latency.
-    pub block_latency_data: Option<BlockLatencyData>,
     pub block_type: BlockType,
     pub num_secrets_obfuscated: usize,
     pub block_index: BlockIndex,
@@ -230,13 +252,6 @@ pub struct AfterBlockCompletedEvent {
 
     /// If the completed block had an env var object associated.
     pub cloud_env_var_collection_id: Option<SyncId>,
-}
-
-#[derive(Clone)]
-pub struct BlockLatencyData {
-    pub command: &'static str,
-    /// When the block's command grid was started (i.e. when the user hit enter).
-    pub started_at: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -283,26 +298,49 @@ pub struct BlockMetadataReceivedEvent {
 }
 
 #[derive(Clone, Debug)]
+/// A notification that an existing block's working directory has been updated
+/// out-of-band (e.g. by an OSC 7 escape sequence) without a fresh precmd. The
+/// payload mirrors `BlockMetadataReceivedEvent` so CWD-dependent listeners can
+/// reuse the same handling, but listeners that rely on precmd semantics should
+/// keep using `BlockMetadataReceivedEvent`.
+///
+/// Note: `is_for_in_band_command` here describes the block carrying the update,
+/// while the similarly-spelled `is_after_in_band_command` on
+/// `BlockMetadataReceivedEvent` describes the *previous* block. The semantics
+/// differ because precmd fires after a block runs, while OSC 7 fires while the
+/// block is alive.
+pub struct BlockWorkingDirectoryUpdatedEvent {
+    pub block_metadata: BlockMetadata,
+    pub block_index: BlockIndex,
+    /// Whether the block carrying this update is for an in-band command.
+    pub is_for_in_band_command: bool,
+    /// Whether the session has fully completed the bootstrapping process.
+    pub is_done_bootstrapping: bool,
+}
+
+#[derive(Clone, Debug)]
 /// Contents of a normal block that a user executed.
 pub struct UserBlockCompleted {
     pub index: BlockIndex,
 
-    pub serialized_block: Arc<SerializedBlock>,
+    /// The block's serialized representation. Cheap to clone once computed, since it's wrapped
+    /// in an `Arc`.
+    pub serialized_block: Lazy<Arc<SerializedBlock>, BlockList>,
 
     /// The input lines for a block without any escape sequences.
-    pub command: String,
+    pub command: Lazy<String, BlockList>,
 
     /// The command with secrets obfuscated.
-    pub command_with_obfuscated_secrets: String,
+    pub command_with_obfuscated_secrets: Lazy<String, BlockList>,
 
     /// The output lines for a block without any escape sequences.
     /// They are truncated to the number of lines specificed by the caller.
-    pub output_truncated: String,
+    pub output_truncated: Lazy<String, BlockList>,
 
     /// The output lines for a block without any escape sequences.
     /// They are truncated to the number of lines specificed by the caller.
     /// Forced secrets to be obfuscated as well.
-    pub output_truncated_with_obfuscated_secrets: String,
+    pub output_truncated_with_obfuscated_secrets: Lazy<String, BlockList>,
 
     /// `true` if the block was run as a requested command or was part of a CLI subagent interaction.
     pub was_part_of_agent_interaction: bool,
@@ -319,96 +357,78 @@ pub struct UserBlockCompleted {
     pub num_output_lines_truncated: u64,
 }
 
-/// Emitted upon completion of an executor command that goes through the pty, such as the
-/// InBandCommandExecutor or the TmuxCommandExecutor.
-#[derive(Clone)]
-pub struct ExecutedExecutorCommandEvent {
-    pub command_id: String,
-    pub exit_code: usize,
-    pub output: Vec<u8>,
-}
+impl UserBlockCompleted {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        index: BlockIndex,
+        serialized_block: Lazy<Arc<SerializedBlock>, BlockList>,
+        command: Lazy<String, BlockList>,
+        command_with_obfuscated_secrets: Lazy<String, BlockList>,
+        output_truncated: Lazy<String, BlockList>,
+        output_truncated_with_obfuscated_secrets: Lazy<String, BlockList>,
+        was_part_of_agent_interaction: bool,
+        started_at: Option<Instant>,
+        num_output_lines: u64,
+        num_output_lines_truncated: u64,
+    ) -> Self {
+        Self {
+            index,
+            serialized_block,
+            command,
+            command_with_obfuscated_secrets,
+            output_truncated,
+            output_truncated_with_obfuscated_secrets,
+            was_part_of_agent_interaction,
+            started_at,
+            num_output_lines,
+            num_output_lines_truncated,
+        }
+    }
 
-impl ExecutedExecutorCommandEvent {
-    /// Parses the given `payload` (expected to be the payload of a generator output OSC) into a
-    /// `ExecutedGeneratorCommandValue`.
-    ///
-    /// The given `string` is expected to follow the following format:
-    ///     <commmand_id>;<output>;<exit_code>
-    ///
-    /// Returns a `ParseGeneratorCommandValueError` if payload cannot be successfully parsed.
-    ///
-    pub fn parse_generator_payload(payload: Vec<u8>) -> Result<Self, ParseGeneratorOutputError> {
-        // Break the payload apart at the first and last semicolons.
-        let mut payload_initial_split = payload.splitn(2, |&byte| byte == b';');
-
-        let Some(before_first_semicolon) = payload_initial_split.next() else {
-            return Err(ParseGeneratorOutputError::Corrupted);
-        };
-
-        let Some(after_first_semicolon) = payload_initial_split.next() else {
-            return Err(ParseGeneratorOutputError::Corrupted);
-        };
-
-        let mut payload_final_split = after_first_semicolon.rsplitn(2, |&byte| byte == b';');
-        let Some(after_final_semicolon) = payload_final_split.next() else {
-            return Err(ParseGeneratorOutputError::Corrupted);
-        };
-
-        let Some(payload_middle) = payload_final_split.next() else {
-            return Err(ParseGeneratorOutputError::Corrupted);
-        };
-
-        let command_id = String::from_utf8(before_first_semicolon.to_vec())
-            .map_err(ParseGeneratorOutputError::Utf8DecodingFailure)?;
-
-        let exit_code = String::from_utf8(after_final_semicolon.to_vec())
-            .map_err(ParseGeneratorOutputError::Utf8DecodingFailure)?
-            .parse::<usize>()
-            .map_err(ParseGeneratorOutputError::ExitCodeParseFailure)?;
-
-        // The output of the command remains as bytes. This is so we can operate on the bytes higher in
-        // the stack if we need to, such as in the case of parsing out the zsh history file where we want to
-        // transform the byte array before converting to a string.
-        let output = payload_middle.to_vec();
-
-        Ok(Self {
-            command_id,
-            exit_code,
-            output,
-        })
+    /// Test-only constructor that treats every lazy field as already computed.
+    #[cfg(any(test, feature = "test-util"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_test(
+        index: BlockIndex,
+        serialized_block: Arc<SerializedBlock>,
+        command: String,
+        command_with_obfuscated_secrets: String,
+        output_truncated: String,
+        output_truncated_with_obfuscated_secrets: String,
+        was_part_of_agent_interaction: bool,
+        started_at: Option<Instant>,
+        num_output_lines: u64,
+        num_output_lines_truncated: u64,
+    ) -> Self {
+        Self::new(
+            index,
+            Lazy::provided(serialized_block),
+            Lazy::provided(command),
+            Lazy::provided(command_with_obfuscated_secrets),
+            Lazy::provided(output_truncated),
+            Lazy::provided(output_truncated_with_obfuscated_secrets),
+            was_part_of_agent_interaction,
+            started_at,
+            num_output_lines,
+            num_output_lines_truncated,
+        )
     }
 }
-
-impl Debug for ExecutedExecutorCommandEvent {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExecutedExecutorCommandEvent")
-            .field("command_id", &self.command_id)
-            .field("exit_code", &self.exit_code)
-            .field("output", &AsciiDebug(&self.output))
-            .finish()
-    }
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum ParseGeneratorOutputError {
-    #[error("Failed to parse exit code: {0:?}")]
-    ExitCodeParseFailure(ParseIntError),
-    #[error("Corrupted DCS. Should be of the format <command_id>;<exit_code>;<output>. ")]
-    Corrupted,
-    #[error("Failed to convert to Utf8: {0:?}")]
-    Utf8DecodingFailure(FromUtf8Error),
-}
-
 impl Debug for Event {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Event::CompletionsFinished(_) => write!(f, "CompletionsFinished"),
+            Event::CompletionsFinished(..) => write!(f, "CompletionsFinished"),
             Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             Event::BlockCompleted(_) => write!(f, "BlockCompleted"),
             Event::AfterBlockCompleted(_) => write!(f, "AfterBlockCompleted"),
             Event::BlockMetadataReceived(event) => write!(
                 f,
                 "BlockStarted({:?}, Done bootstrapping: {:?})",
+                event.block_metadata, event.is_done_bootstrapping
+            ),
+            Event::BlockWorkingDirectoryUpdated(event) => write!(
+                f,
+                "BlockWorkingDirectoryUpdated({:?}, Done bootstrapping: {:?})",
                 event.block_metadata, event.is_done_bootstrapping
             ),
             Event::AfterBlockStarted { .. } => write!(f, "BlockExecutionStarted"),
@@ -419,26 +439,15 @@ impl Debug for Event {
             Event::ClipboardLoad(_, _) => write!(f, "ClipboardLoad()"),
             Event::TerminalClear => write!(f, "TerminalClear"),
             Event::Bell => write!(f, "Bell"),
+            Event::ShellExitObserved { status } => write!(f, "ShellExitObserved({status:?})"),
             Event::Exit { reason } => write!(f, "Exit({reason:?})"),
             Event::CursorBlinkingChange(blinking) => write!(f, "CursorBlinking({blinking})"),
             Event::PreInteractiveSSHSession => write!(f, "Pre-Interactive SSH Session"),
             Event::SSH(remote_shell) => write!(f, "SSH(remote shell: {remote_shell}"),
             Event::SSHControlMasterError => write!(f, "SSH ControlMaster error"),
             Event::TerminalModeSwapped(_) => write!(f, "Terminal mode swapped"),
-            Event::TmuxControlModeReady { primary_pane } => {
-                write!(f, "TmuxControlModeReady(primary_pane: {primary_pane})")
-            }
             Event::DetectedEndOfSshLogin(check_type) => {
                 write!(f, "DetectedEndOfSshLogin: {check_type:?}")
-            }
-            Event::RemoteWarpificationIsUnavailable(_) => {
-                write!(f, "RemoteWarpificationIsUnavailable")
-            }
-            Event::SshTmuxInstaller(installer) => {
-                write!(f, "SshTmuxInstaller({installer:?})")
-            }
-            Event::TmuxInstallFailed { line, command } => {
-                write!(f, "TmuxInstallFailed(line: {line}, command: {command})")
             }
             Event::ExecutedInBandCommand(event) => write!(
                 f,
@@ -451,42 +460,51 @@ impl Debug for Event {
             Event::SourcedRcFileInSubshell(event) => {
                 write!(f, "SourcedRcFileInSubshell({event:?})")
             }
-            Event::InitSsh(event) => {
-                write!(f, "InitSsh({event:?})")
-            }
             Event::PromptUpdated => write!(f, "PromptUpdated"),
             Event::HonorPS1OutOfSync => write!(f, "HonorPS1OutOfSync"),
             Event::Typeahead => write!(f, "Typeahead"),
-            Event::AgentTaggedInChanged { is_tagged_in } => {
-                write!(f, "AgentTaggedInChanged(is_tagged_in: {is_tagged_in})")
+            Event::AgentTaggedInChanged {
+                block_id,
+                is_tagged_in,
+            } => {
+                write!(
+                    f,
+                    "AgentTaggedInChanged(block_id: {block_id:?}, is_tagged_in: {is_tagged_in})"
+                )
             }
             Event::Handler(handler_event) => write!(f, "Handler({handler_event:?}))"),
+            Event::LifecycleRecovery(record) => write!(f, "LifecycleRecovery({record:?})"),
             Event::RemoteServerReady { session_id } => {
                 write!(f, "RemoteServerReady(session: {session_id:?})")
             }
-            Event::RemoteServerFailed {
-                session_id,
-                ref error,
-            } => {
+            Event::RemoteServerFailed { session_id, error } => {
                 write!(
                     f,
                     "RemoteServerFailed(session: {session_id:?}, error: {error})"
                 )
             }
             Event::FinishUpdate(data) => write!(f, "FinishUpdate({})", data.update_id),
+            Event::ExternalShellWidgetSelection(data) => {
+                write!(
+                    f,
+                    "ExternalShellWidgetSelection(buffer_len: {})",
+                    data.buffer.len()
+                )
+            }
             Event::TextSelectionChanged => write!(f, "TextSelectionChanged"),
             Event::ShellSpawned(shell_type) => write!(f, "ShellSpawned({shell_type:?})"),
-            Event::SendCompletionsPrompt => write!(f, "SendCompletionsPrompt"),
             Event::ImageReceived { image_id, .. } => {
                 write!(f, "ImageReceived(image_id: {image_id})")
             }
             Event::BootstrapPrecmdDone => write!(f, "BootstrapPrecmdDone"),
-            Event::PluggableNotification { title, body } => {
-                write!(f, "PluggableNotification(title: {title:?}, body: {body})")
-            }
+            Event::PluggableNotification { .. } => write!(f, "PluggableNotification"),
             Event::ExitShell { session_id } => {
                 write!(f, "ExitShell(session: {session_id:?})")
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "event_tests.rs"]
+mod tests;

@@ -2,13 +2,13 @@ use std::ops::Range;
 
 use ai::diff_validation::DiffType;
 use warp_editor::render::element::VerticalExpansionBehavior;
-use warpui::elements::new_scrollable::ScrollableAppearance;
 use warpui::elements::ScrollbarWidth;
+use warpui::elements::new_scrollable::ScrollableAppearance;
 use warpui::{AppContext, View, ViewContext, ViewHandle};
 
+use super::editor::NavBarBehavior;
 use super::editor::scroll::ScrollWheelBehavior;
 use super::editor::view::CodeEditorView;
-use super::editor::NavBarBehavior;
 use crate::editor::InteractionState;
 
 /// Whether a view is displayed in a full pane or embedded in another view, like the blocklist.
@@ -152,11 +152,5 @@ where
             .update(ctx, |editor, ctx| editor.navigate_previous_diff_hunk(ctx));
     }
 
-    fn accept_and_save_diff(&self, _ctx: &mut ViewContext<Self>) {}
-
     fn reject_diff(&mut self, _ctx: &mut ViewContext<Self>) {}
-
-    fn restore_diff_base(&mut self, _ctx: &mut ViewContext<Self>) -> Result<(), String> {
-        Ok(())
-    }
 }

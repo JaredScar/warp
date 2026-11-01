@@ -1,70 +1,65 @@
-use crate::ai::mcp::file_based_manager::FileBasedMCPManagerEvent;
-use crate::ai::mcp::templatable_manager::oauth::{
-    load_credentials_from_secure_storage, write_to_secure_storage, FILE_BASED_MCP_CREDENTIALS_KEY,
-    TEMPLATABLE_MCP_CREDENTIALS_KEY,
-};
-use crate::ai::mcp::FileBasedMCPManager;
-use core::fmt;
-use itertools::Itertools;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
-use crate::ai::mcp::http_client::build_client_with_headers;
-use crate::ai::mcp::templatable::GalleryData;
-use crate::ai::mcp::templatable_manager::FigmaMcpStatus;
-use crate::ai::mcp::{
-    Author, CloudMCPServer, JsonTemplate, MCPGalleryManager, MCPServerUpdate,
-    ParsedTemplatableMCPServerResult,
-};
-
-use crate::ai::mcp::parsing::resolve_json;
-use crate::ai::mcp::TemplatableMCPServer;
-use crate::auth::AuthStateProvider;
-use crate::cloud_object::model::persistence::{CloudModel, CloudModelEvent};
-use crate::cloud_object::{CloudObject, CloudObjectLocation, CloudObjectMetadataExt, Space};
-use crate::server::cloud_objects::update_manager::InitiatedBy;
-use crate::server::ids::{ClientId, ServerId};
-use crate::server::telemetry::{
-    MCPServerModel, MCPServerTelemetryTransportType, MCPTemplateCreationSource,
-};
-use crate::workspaces::user_workspaces::UserWorkspaces;
-use crate::{
-    ai::mcp::{
-        logs, templatable::CloudTemplatableMCPServer, templatable_installation::VariableValue,
-        MCPServer, StaticEnvVar, TemplatableMCPServerInstallation, TransportType,
-    },
-    cloud_object::{GenericStringObjectFormat, JsonObjectType},
-    drive::CloudObjectTypeAndId,
-    persistence::ModelEvent,
-    send_telemetry_from_ctx,
-    server::{
-        cloud_objects::update_manager::UpdateManager, ids::SyncId, telemetry::TelemetryEvent,
-    },
-    settings::AISettings,
-    view_components::DismissibleToast,
-    workspace::ToastStack,
-    GlobalResourceHandlesProvider,
-};
 use async_compat::CompatExt as _;
-use cfg_if::cfg_if;
-use futures::FutureExt as _;
+use futures::channel::oneshot;
+use mcp::oauth::{
+    self, AuthContext, CallbackResult, FILE_BASED_MCP_CREDENTIALS_KEY,
+    FileBasedPersistedCredentialsMap, OAuthCallbackMode, PersistedCredentials,
+    PersistedCredentialsMap, TEMPLATABLE_MCP_CREDENTIALS_KEY, load_credentials_from_secure_storage,
+    write_to_secure_storage,
+};
+use mcp::runtime::{error_to_user_message, spawn_server};
 use parking_lot::Mutex;
-use rmcp::{transport::ConfigureCommandExt as _, ServiceExt as _};
 use simple_logger::manager::LogManager;
-use simple_logger::SimpleLogger;
-use tokio::io::AsyncBufReadExt as _;
+use url::Url;
 use uuid::Uuid;
+use warp_core::channel::ChannelState;
+use warp_core::execution_mode::AppExecutionMode;
+use warp_core::features::FeatureFlag;
 use warp_core::safe_error;
-use warp_core::{execution_mode::AppExecutionMode, features::FeatureFlag, settings::Setting as _};
-use warpui::AppContext;
-use warpui::{windowing::WindowManager, ModelContext, SingletonEntity};
+use warp_core::settings::Setting as _;
+use warp_errors::report_error;
+use warp_server_client::auth::AuthEvent;
+use warpui::windowing::WindowManager;
+use warpui::{AppContext, ModelContext, SingletonEntity};
 
 use super::{
-    oauth::{self, AuthContext, FileBasedPersistedCredentialsMap, PersistedCredentialsMap},
     MCPServerState, SpawnedServerInfo, TemplatableMCPServerInfo, TemplatableMCPServerManager,
     TemplatableMCPServerManagerEvent,
 };
+use crate::ai::mcp::file_based_manager::FileBasedMCPManagerEvent;
+use crate::ai::mcp::parsing::resolve_json;
+use crate::ai::mcp::templatable::{CloudTemplatableMCPServer, GalleryData};
+use crate::ai::mcp::templatable_installation::VariableValue;
+use crate::ai::mcp::templatable_manager::FigmaMcpStatus;
+use crate::ai::mcp::{
+    Author, CloudMCPServer, FileBasedMCPManager, JsonTemplate, MCPGalleryManager, MCPServer,
+    MCPServerExt, MCPServerUpdate, ParsedTemplatableMCPServerResult, StaticEnvVar,
+    TemplatableMCPServer, TemplatableMCPServerInstallation, TransportType, builtin, logs,
+};
+use crate::auth::AuthStateProvider;
+use crate::auth::auth_manager::{AuthManager, AuthManagerEvent};
+use crate::cloud_object::model::persistence::{CloudModel, CloudModelEvent};
+use crate::cloud_object::{
+    CloudObject, CloudObjectLocation, CloudObjectLookup as _, CloudObjectMetadataExt,
+    CloudObjectUuidLookup as _, GenericStringObjectFormat, JsonObjectType, Space,
+};
+use crate::drive::CloudObjectTypeAndId;
+use crate::persistence::{
+    ModelEvent, database_file_path_for_current_scope, establish_ro_connection,
+};
+use crate::server::cloud_objects::update_manager::{InitiatedBy, UpdateManager};
+use crate::server::ids::{ClientId, ServerId, SyncId};
+use crate::server::server_api::ServerApiProvider;
+use crate::server::telemetry::{
+    MCPServerModel, MCPServerTelemetryTransportType, MCPTemplateCreationSource, TelemetryEvent,
+};
+use crate::settings::AISettings;
+use crate::view_components::DismissibleToast;
+use crate::workspace::ToastStack;
+use crate::workspaces::user_workspaces::UserWorkspaces;
+use crate::{GlobalResourceHandlesProvider, send_telemetry_from_ctx};
 
 /// Controls the behavior of `spawn_server_impl`.
 enum SpawnMode {
@@ -74,8 +69,6 @@ enum SpawnMode {
         persist_running_state_to_sqlite: bool,
     },
     /// Reconnection after transport closed - preserves logs, no telemetry.
-    ///
-    /// Waiters are notified via `pending_reconnections` when the connection completes.
     Reconnect,
 }
 
@@ -92,72 +85,16 @@ impl SpawnMode {
             }
         )
     }
-
-    fn is_reconnect(&self) -> bool {
-        matches!(self, SpawnMode::Reconnect)
-    }
 }
 
+#[derive(Debug, thiserror::Error)]
 enum LegacyToTemplatableMCPConversionError {
+    #[error("templatable MCP server already exists")]
     TemplateAlreadyExists,
+    #[error("failed to connect to database")]
     NoDBConnection,
+    #[error("created template successfully, but could not create installation")]
     InstallationFailed,
-}
-
-impl fmt::Display for LegacyToTemplatableMCPConversionError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::TemplateAlreadyExists => write!(f, "templatable MCP server already exists"),
-            Self::NoDBConnection => write!(f, "failed to connect to database"),
-            Self::InstallationFailed => write!(
-                f,
-                "created template successfully, but could not create installation"
-            ),
-        }
-    }
-}
-
-/// Convert an rmcp error to a user-friendly error message.
-fn error_to_user_message(error: &rmcp::RmcpError) -> String {
-    match error {
-        rmcp::RmcpError::ClientInitialize(err) => {
-            format!("Failed to initialize client: {}", err)
-        }
-        rmcp::RmcpError::ServerInitialize(err) => {
-            format!("Failed to initialize server: {}", err)
-        }
-        rmcp::RmcpError::TransportCreation { error, .. } => {
-            format!("Failed to establish connection: {}", error)
-        }
-        rmcp::RmcpError::Runtime(err) => {
-            format!("Runtime error: {}", err)
-        }
-        rmcp::RmcpError::Service(err) => match err {
-            rmcp::ServiceError::McpError(_) => {
-                "Server returned an error. Please check server logs for details.".to_string()
-            }
-            rmcp::ServiceError::TransportSend(_) => {
-                "Failed to send data to server. Connection may have been lost.".to_string()
-            }
-            rmcp::ServiceError::TransportClosed => {
-                "Connection closed unexpectedly. The server may have crashed.".to_string()
-            }
-            rmcp::ServiceError::UnexpectedResponse => {
-                "Server sent an unexpected response. The server may be incompatible.".to_string()
-            }
-            rmcp::ServiceError::Cancelled { reason } => format!(
-                "Operation was cancelled with reason: {}",
-                reason.clone().unwrap_or("Unknown reason".to_string())
-            ),
-            rmcp::ServiceError::Timeout { timeout } => {
-                format!(
-                    "Connection timed out after {} seconds. The server may be unresponsive.",
-                    timeout.as_secs()
-                )
-            }
-            _ => format!("Service error: {}", err),
-        },
-    }
 }
 
 /// An MCP server integration that Warp ships with bundled skills for.
@@ -167,10 +104,167 @@ pub enum McpIntegration {
 }
 
 impl TemplatableMCPServerManager {
+    pub(crate) fn replace_runtime_environment(
+        &mut self,
+        environment: HashMap<String, String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> (
+        Vec<TemplatableMCPServerInstallation>,
+        Vec<oneshot::Receiver<()>>,
+    ) {
+        let uuids: HashSet<_> = self
+            .active_servers
+            .keys()
+            .chain(self.spawned_servers.keys())
+            .copied()
+            .collect();
+        let retained = uuids
+            .iter()
+            .filter(|uuid| {
+                !self.cli_spawned_server_uuids.contains(uuid)
+                    && !self.builtin_server_uuids.contains(uuid)
+            })
+            .filter_map(|uuid| self.reconnectable_installation(*uuid).cloned())
+            .collect();
+        self.runtime_environment = environment;
+        let stopped = uuids
+            .into_iter()
+            .map(|uuid| self.shutdown_server_and_wait(uuid, ctx))
+            .collect();
+        (retained, stopped)
+    }
+
     /// Returns `true` if the given MCP integration is currently running.
     pub fn is_mcp_server_running(&self, integration: McpIntegration) -> bool {
         match integration {
             McpIntegration::Figma => self.get_figma_mcp_status() == FigmaMcpStatus::Running,
+        }
+    }
+
+    /// Handles an incoming OAuth callback URL.
+    ///
+    /// Routes the callback to the correct in-flight OAuth flow using the `state` query
+    /// parameter (the CSRF token that rmcp embedded in the authorization URL). This avoids
+    /// encoding routing data in the redirect URI, keeping it RFC 6749 §3.1.2.2 compliant.
+    pub fn handle_oauth_callback(&mut self, url: &Url) -> anyhow::Result<()> {
+        // Ensure the URL has the expected path
+        if url.path() != "/oauth2callback" {
+            anyhow::bail!(
+                "Invalid OAuth callback path: expected '/oauth2callback', got '{}'",
+                url.path()
+            );
+        }
+
+        let query_params: HashMap<_, _> = url.query_pairs().collect();
+
+        let Some(state) = query_params.get("state") else {
+            anyhow::bail!("Missing 'state' parameter in OAuth callback");
+        };
+
+        let code = query_params.get("code");
+        let error = query_params.get("error");
+
+        let result = match code {
+            Some(code) => CallbackResult::Success {
+                code: code.to_string(),
+                // Pass the state value through as the CSRF token; rmcp will validate it
+                // against the token it stored when generating the authorization URL.
+                csrf_token: state.to_string(),
+                issuer: query_params.get("iss").map(|issuer| issuer.to_string()),
+            },
+            None => CallbackResult::Error {
+                error: error.map(|e| e.to_string()),
+            },
+        };
+
+        let Some(&server_uuid) = self.pending_oauth_csrf.get(state.as_ref() as &str) else {
+            anyhow::bail!("No active OAuth flow found for state={state}");
+        };
+
+        let Some(server_info) = self.spawned_servers.get(&server_uuid) else {
+            anyhow::bail!("No spawned server found for uuid={server_uuid}");
+        };
+
+        warpui::r#async::block_on(server_info.oauth_result_tx.send(result)).map_err(|_| {
+            anyhow::anyhow!(
+                "Failed to send OAuth result to server {server_uuid} - receiver dropped"
+            )
+        })?;
+
+        self.pending_oauth_csrf.remove(state.as_ref() as &str);
+        Ok(())
+    }
+
+    fn save_credentials_to_secure_storage(
+        &mut self,
+        app: &mut ModelContext<Self>,
+        installation_uuid: Uuid,
+        credentials: PersistedCredentials,
+    ) {
+        if let Some(hash) = FileBasedMCPManager::as_ref(app).get_hash_by_uuid(installation_uuid) {
+            self.file_based_server_credentials.insert(hash, credentials);
+            write_to_secure_storage(
+                app,
+                FILE_BASED_MCP_CREDENTIALS_KEY,
+                &self.file_based_server_credentials,
+            );
+            app.emit(TemplatableMCPServerManagerEvent::CredentialsChanged {
+                uuid: installation_uuid,
+            });
+            return;
+        }
+
+        if let Some(template_uuid) = self.get_template_uuid(installation_uuid) {
+            self.server_credentials.insert(template_uuid, credentials);
+            write_to_secure_storage(
+                app,
+                TEMPLATABLE_MCP_CREDENTIALS_KEY,
+                &self.server_credentials,
+            );
+            app.emit(TemplatableMCPServerManagerEvent::CredentialsChanged {
+                uuid: installation_uuid,
+            });
+        } else {
+            report_error!(
+                "Corresponding file or cloud-based server not found for installation UUID",
+                extra: { "installation_uuid" => %installation_uuid }
+            );
+        }
+    }
+
+    pub fn delete_credentials_from_secure_storage(
+        &mut self,
+        installation_uuid: Uuid,
+        app: &mut ModelContext<Self>,
+    ) {
+        if let Some(hash) = FileBasedMCPManager::as_ref(app).get_hash_by_uuid(installation_uuid) {
+            self.file_based_server_credentials.remove(&hash);
+            write_to_secure_storage(
+                app,
+                FILE_BASED_MCP_CREDENTIALS_KEY,
+                &self.file_based_server_credentials,
+            );
+            app.emit(TemplatableMCPServerManagerEvent::CredentialsChanged {
+                uuid: installation_uuid,
+            });
+            return;
+        }
+        if let Some(template_uuid) = self.get_template_uuid(installation_uuid) {
+            self.server_credentials.remove(&template_uuid);
+            write_to_secure_storage(
+                app,
+                TEMPLATABLE_MCP_CREDENTIALS_KEY,
+                &self.server_credentials,
+            );
+            app.emit(TemplatableMCPServerManagerEvent::CredentialsChanged {
+                uuid: installation_uuid,
+            });
+        } else {
+            report_error!(
+                "No template UUID found for installation UUID",
+                extra: { "installation_uuid" => %installation_uuid },
+                warp_errors::ReportErrorLogMode::OncePerRun
+            );
         }
     }
 
@@ -183,7 +277,7 @@ impl TemplatableMCPServerManager {
     ) -> Self {
         // Subscribe to FileBasedMCPManager events.
         let file_based_mcp_manager = FileBasedMCPManager::handle(ctx);
-        ctx.subscribe_to_model(&file_based_mcp_manager, |me, event, ctx| match event {
+        ctx.subscribe_to_model(&file_based_mcp_manager, |me, _, event, ctx| match event {
             FileBasedMCPManagerEvent::SpawnServers { installations } => {
                 me.spawn_file_based_servers(installations, ctx);
             }
@@ -195,13 +289,17 @@ impl TemplatableMCPServerManager {
             } => {
                 me.purge_file_based_server_credentials(installation_hashes, ctx);
             }
-            // Notification for cloud-environment readiness; handled by the AgentDriver.
-            FileBasedMCPManagerEvent::CloudEnvMcpScanComplete { .. } => {}
+            // Notification for cloud-environment / initial-global-scan readiness; handled by
+            // the AgentDriver.
+            FileBasedMCPManagerEvent::CloudEnvMcpScanComplete { .. }
+            | FileBasedMCPManagerEvent::InitialGlobalMcpScanComplete { .. }
+            | FileBasedMCPManagerEvent::ServersChanged
+            | FileBasedMCPManagerEvent::ConfigDiagnosticChanged => {}
         });
 
         // TemplatableMCPServerManager is the source of truth for templatable MCP servers stored on the cloud
         let cloud_model = CloudModel::handle(ctx);
-        ctx.subscribe_to_model(&cloud_model, |me, event, ctx| match event {
+        ctx.subscribe_to_model(&cloud_model, |me, _, event, ctx| match event {
             CloudModelEvent::ObjectUpdated {
                 type_and_id:
                     CloudObjectTypeAndId::GenericStringObject {
@@ -284,11 +382,43 @@ impl TemplatableMCPServerManager {
             _ => {}
         });
 
+        // Built-in Warp-hosted MCP servers follow the user's auth lifecycle:
+        // attach after login, re-attach with fresh credentials when the
+        // access token rotates, and detach on logout. Skipped in tests, which
+        // construct the manager without the auth singletons.
+        if !cfg!(test) {
+            let auth_manager = AuthManager::handle(ctx);
+            ctx.subscribe_to_model(&auth_manager, |me, _, event, ctx| match event {
+                // Fires on login and on user refresh; the credentials may
+                // have rotated either way, so respawn with the current token.
+                AuthManagerEvent::AuthComplete => me.sync_builtin_servers(true, ctx),
+                AuthManagerEvent::AuthFailed(_)
+                | AuthManagerEvent::NeedsReauth
+                | AuthManagerEvent::SkippedLogin => me.sync_builtin_servers(false, ctx),
+                AuthManagerEvent::CreateAnonymousUserFailed
+                | AuthManagerEvent::AttemptedLoginGatedFeature { .. }
+                | AuthManagerEvent::LoginOverrideDetected(_)
+                | AuthManagerEvent::MintCustomTokenFailed(_)
+                | AuthManagerEvent::ReceivedDeviceAuthorizationCode { .. } => {}
+            });
+
+            let server_api_provider = ServerApiProvider::handle(ctx);
+            ctx.subscribe_to_model(&server_api_provider, |me, _, event, ctx| match event {
+                // The transport captured the token it was spawned with, so a
+                // rotated token requires a respawn.
+                AuthEvent::AccessTokenRefreshed { .. } => me.sync_builtin_servers(true, ctx),
+                AuthEvent::StagingAccessBlocked
+                | AuthEvent::NeedsReauth
+                | AuthEvent::UserAccountDisabled
+                | AuthEvent::IapChallengeReceived => {}
+            });
+        }
+
         let database_connection =
-            crate::persistence::database_file_path()
+            database_file_path_for_current_scope()
                 .to_str()
                 .and_then(|db_url| {
-                    crate::persistence::establish_ro_connection(db_url)
+                    establish_ro_connection(db_url)
                         .ok()
                         .map(|conn| Arc::new(Mutex::new(conn)))
                 });
@@ -297,7 +427,9 @@ impl TemplatableMCPServerManager {
             cloud_templatable_mcp_servers: Default::default(),
             server_states: Default::default(),
             active_servers: Default::default(),
+            runtime_environment: Default::default(),
             spawned_servers: Default::default(),
+            reconnectable_ephemeral_installations: Default::default(),
             server_credentials: Default::default(),
             file_based_server_credentials: Default::default(),
             locally_installed_servers,
@@ -306,7 +438,11 @@ impl TemplatableMCPServerManager {
             spawner: Some(ctx.spawner()),
             pending_reconnections: Default::default(),
             pending_oauth_csrf: Default::default(),
+            authorization_urls: Default::default(),
             cli_spawned_server_uuids: Default::default(),
+            builtin_server_uuids: Default::default(),
+            builtin_server_token: Default::default(),
+            server_loggers: Default::default(),
         };
 
         me.fetch_cloud_servers(ctx);
@@ -331,6 +467,12 @@ impl TemplatableMCPServerManager {
             for installation_uuid in running_server_uuids {
                 me.spawn_server(installation_uuid, ctx)
             }
+        }
+
+        // Attach built-in Warp-hosted servers for already-logged-in users
+        // (fresh logins are handled by the AuthManager subscription above).
+        if !cfg!(test) {
+            me.sync_builtin_servers(false, ctx);
         }
 
         // Migrate legacy MCPs to be templatables on app start. Uses UpdateManager
@@ -490,7 +632,7 @@ impl TemplatableMCPServerManager {
                 update_manager.update_templatable_mcp_server(
                     template_server,
                     cloud_templatable_mcp_server.id,
-                    cloud_templatable_mcp_server.metadata.revision.clone(),
+                    cloud_templatable_mcp_server.metadata.revision,
                     ctx,
                 );
             });
@@ -616,9 +758,9 @@ impl TemplatableMCPServerManager {
             running,
         };
         if let Err(err) = sender.send(event) {
-            log::error!(
-                "Failed to save TemplatableMCPServerInstallation running status to database: {err}"
-            );
+            report_error!(anyhow::Error::new(err).context(
+                "Failed to save TemplatableMCPServerInstallation running status to database"
+            ));
         }
     }
 
@@ -634,6 +776,8 @@ impl TemplatableMCPServerManager {
     ) {
         let installation_uuid = installation.uuid();
         log::debug!("Spawning ephemeral server with installation_uuid {installation_uuid}");
+        self.reconnectable_ephemeral_installations
+            .insert(installation_uuid, installation.clone());
 
         self.spawn_server_impl(
             installation,
@@ -652,6 +796,75 @@ impl TemplatableMCPServerManager {
     ) {
         self.cli_spawned_server_uuids.insert(installation.uuid());
         self.spawn_ephemeral_server(installation, ctx);
+    }
+
+    /// Reconciles built-in Warp-hosted MCP servers (currently the Factory
+    /// MCP) with the feature-flag and auth state: spawns the server when it
+    /// should be running and isn't, and shuts it down when it shouldn't be.
+    /// Safe to call repeatedly.
+    ///
+    /// `force_respawn` restarts an already-running server so it picks up
+    /// rotated credentials: the transport keeps the `Authorization` header it
+    /// was spawned with.
+    pub fn sync_builtin_servers(&mut self, force_respawn: bool, ctx: &mut ModelContext<Self>) {
+        let installation_uuid = builtin::FACTORY_MCP_INSTALLATION_UUID;
+        let auth_state = AuthStateProvider::as_ref(ctx).get().clone();
+        // Built-ins attach only in interactive clients (GUI and TUI); CLI
+        // agent runs manage their MCP servers explicitly.
+        let eligible = FeatureFlag::FactoryMcp.is_enabled()
+            && AppExecutionMode::as_ref(ctx).can_autostart_mcp_servers()
+            && !auth_state.is_anonymous_or_logged_out();
+        let is_active = self.is_server_active_or_pending(installation_uuid);
+
+        if !eligible {
+            // Only tear down a built-in this manager attached itself
+            // (tracked in `builtin_server_uuids`). CLI agent runs spawn a
+            // run-scoped installation with the same UUID through the
+            // AgentDriver (see `AgentDriver::builtin_factory_mcp_for_run`),
+            // and auth events delivered in SDK mode (e.g. a mid-run token
+            // refresh) must not shut that driver-owned server down.
+            if is_active && self.builtin_server_uuids.contains(&installation_uuid) {
+                log::info!("Shutting down the built-in Factory MCP server (no longer eligible)");
+                self.shutdown_server(installation_uuid, ctx);
+            }
+            self.builtin_server_uuids.remove(&installation_uuid);
+            self.builtin_server_token = None;
+            return;
+        }
+
+        if is_active && !force_respawn {
+            return;
+        }
+
+        // A missing token here means the current one is about to expire; the
+        // AccessTokenRefreshed subscription calls back in with a fresh one
+        // once the app's request layer refreshes it.
+        let Some(token) = auth_state
+            .credentials()
+            .and_then(|credentials| builtin::builtin_bearer_token(&credentials))
+        else {
+            log::debug!("Built-in Factory MCP server: no usable bearer token yet; waiting");
+            return;
+        };
+
+        // Auth events cluster at startup (login completion, user refresh,
+        // token refresh) and usually carry the same credential. Respawning
+        // for each would open a redundant server-side MCP session per event,
+        // so only respawn when the effective bearer actually changed.
+        if is_active && self.builtin_server_token.as_deref() == Some(token.as_str()) {
+            return;
+        }
+
+        if is_active {
+            self.shutdown_server(installation_uuid, ctx);
+        }
+        log::info!("Spawning the built-in Factory MCP server");
+        self.builtin_server_uuids.insert(installation_uuid);
+        self.builtin_server_token = Some(token.clone());
+        // No ambient headers here: this path only ever runs for interactive (GUI/TUI)
+        // clients, which have no active ambient task. CLI/cloud agent runs attach their
+        // own run-scoped installation instead (see AgentDriver::builtin_factory_mcp_for_run).
+        self.spawn_ephemeral_server(builtin::factory_mcp_installation(&token, &[]), ctx);
     }
 
     /// Spawns a new MCP server from a given installation UUID.
@@ -673,8 +886,9 @@ impl TemplatableMCPServerManager {
             .get(&installation_uuid)
             .cloned()
         else {
-            log::error!(
-                "No templatable MCP installation found for installation_uuid {installation_uuid}; cannot resolve template variables"
+            report_error!(
+                "No templatable MCP installation found; cannot resolve template variables",
+                extra: { "installation_uuid" => %installation_uuid }
             );
 
             self.change_server_state(installation_uuid, MCPServerState::FailedToStart, ctx);
@@ -711,39 +925,38 @@ impl TemplatableMCPServerManager {
                     s
                 }
                 None => {
-                    log::error!(
-                        "Templatable MCP server template contains no servers: {template_uuid}",
+                    report_error!(
+                        "Templatable MCP server template contains no servers",
+                        extra: { "template_uuid" => %template_uuid }
                     );
                     self.change_server_state(installation_uuid, MCPServerState::FailedToStart, ctx);
-                    if mode.is_reconnect() {
-                        self.notify_reconnect_waiters(
-                            installation_uuid,
-                            Err("Template contains no servers".to_string()),
-                        );
-                    }
+                    self.notify_reconnect_waiters(
+                        installation_uuid,
+                        Err("Template contains no servers".to_string()),
+                    );
                     return;
                 }
             },
             Err(err) => {
-                log::error!(
-                    "Failed to parse resolved MCP server JSON for '{template_uuid}': {err:#}",
+                let detail = format!("Failed to parse MCP server: {err:#}");
+                report_error!(
+                    anyhow::Error::new(err).context("Failed to parse resolved MCP server JSON"),
+                    extra: { "template_uuid" => %template_uuid }
                 );
                 self.change_server_state(installation_uuid, MCPServerState::FailedToStart, ctx);
-                if mode.is_reconnect() {
-                    self.notify_reconnect_waiters(
-                        installation_uuid,
-                        Err(format!("Failed to parse MCP server: {err:#}")),
-                    );
-                }
+                self.notify_reconnect_waiters(installation_uuid, Err(detail));
                 return;
             }
         };
 
+        self.apply_runtime_environment(&mut server.transport_type);
         // If we're executing a CLI MCP server, ensure that the environment variables includes
         // PATH.
         if let TransportType::CLIServer(cli_server) = &mut server.transport_type {
-            let Some(execution_path) = AISettings::as_ref(ctx).mcp_execution_path.value().clone()
-            else {
+            let execution_path = AISettings::as_ref(ctx).mcp_execution_path.value().clone();
+            let can_inherit_process_path =
+                AppExecutionMode::as_ref(ctx).can_inherit_process_path_for_mcp();
+            if execution_path.is_none() && !can_inherit_process_path {
                 // This can only happen if the user is trying to launch an MCP server
                 // without ever having had a successfully bootstrapped session, which
                 // should basically never happen.
@@ -764,24 +977,27 @@ impl TemplatableMCPServerManager {
                     });
                 }
 
-                if mode.is_reconnect() {
-                    self.notify_reconnect_waiters(
-                        installation_uuid,
-                        Err("PATH not available".to_string()),
-                    );
-                }
+                self.notify_reconnect_waiters(
+                    installation_uuid,
+                    Err("PATH not available".to_string()),
+                );
                 return;
-            };
+            }
 
-            // Prepend our PATH to the static env vars, in case the user has
-            // specified a custom PATH in the MCP server settings.
-            cli_server.static_env_vars.insert(
-                0,
-                StaticEnvVar {
-                    name: "PATH".to_string(),
-                    value: execution_path,
-                },
-            );
+            // Prepend our PATH to the static env vars, in case the user has specified a
+            // custom PATH in the MCP server settings. Execution modes that can inherit the
+            // process PATH (`AppExecutionMode::can_inherit_process_path_for_mcp`) instead pick
+            // it up from their own launching environment, without converting an OsString PATH
+            // into a persisted setting.
+            if let Some(execution_path) = execution_path {
+                cli_server.static_env_vars.insert(
+                    0,
+                    StaticEnvVar {
+                        name: "PATH".to_string(),
+                        value: execution_path,
+                    },
+                );
+            }
 
             // For file-based MCP installations without an explicit `working_directory`,
             // default the spawn cwd to the directory the config was discovered in
@@ -789,22 +1005,22 @@ impl TemplatableMCPServerManager {
             // matches user expectations for repo-relative commands in `.mcp.json`.
             // Cloud-templated installations (lookup returns None) are unaffected and
             // continue to inherit Warp's process cwd.
-            if cli_server.cwd_parameter.is_none() {
-                if let Some(spawn_root) =
+            if cli_server.cwd_parameter.is_none()
+                && let Some(spawn_root) =
                     FileBasedMCPManager::as_ref(ctx).spawn_root_for_installation(installation_uuid)
-                {
-                    cli_server.cwd_parameter = Some(spawn_root.to_string_lossy().into_owned());
-                }
+            {
+                cli_server.cwd_parameter = Some(spawn_root.to_string_lossy().into_owned());
             }
         }
 
         let executor = ctx.background_executor().clone();
         let logger = match LogManager::handle(ctx).update(ctx, |mgr, _| {
             mgr.register_namespace("mcp", true);
-            mgr.register(
+            mgr.register_with_rotation(
                 "mcp",
                 logs::relative_log_file_path_from_uuid(&template_uuid),
                 executor,
+                logs::mcp_log_rotation_config(),
             )
         }) {
             Ok(logger) => logger,
@@ -813,9 +1029,16 @@ impl TemplatableMCPServerManager {
                     safe: ("Failed to register MCP log file: {}", e.safe_message()),
                     full: ("Failed to register MCP log file for {template_uuid}: {e}")
                 );
+                self.change_server_state(installation_uuid, MCPServerState::FailedToStart, ctx);
+                self.notify_reconnect_waiters(
+                    installation_uuid,
+                    Err("Failed to register MCP log file".to_string()),
+                );
                 return;
             }
         };
+        self.server_loggers
+            .insert(installation_uuid, logger.clone());
         let logger_clone = logger.clone();
 
         // Create channel that we can use to send OAuth callback results
@@ -823,6 +1046,7 @@ impl TemplatableMCPServerManager {
         let (oauth_result_tx, oauth_result_rx) = async_channel::unbounded();
 
         let is_headless = AppExecutionMode::as_ref(ctx).is_autonomous();
+        let use_tui_loopback = settings::settings_mode() == settings::SettingsMode::Tui;
 
         let mut persisted_credentials = self.server_credentials.get(&template_uuid).cloned();
         if persisted_credentials.is_none() && FeatureFlag::FileBasedMcp.is_enabled() {
@@ -836,22 +1060,108 @@ impl TemplatableMCPServerManager {
                 .get_hash_by_uuid(installation_uuid)
                 .is_some();
 
-        let auth_context = AuthContext {
-            oauth_result_rx,
-            spawner: ctx.spawner(),
-            uuid: installation_uuid,
-            persisted_credentials,
-            is_headless,
-            is_file_based,
-        };
-
         let server_name = server.name.clone();
         let description = installation.templatable_mcp_server().description.clone();
+        let auth_context = FeatureFlag::McpOauth.is_enabled().then(|| {
+            let persist_spawner = ctx.spawner();
+            let requires_authentication_spawner = ctx.spawner();
+            let authenticated_spawner = ctx.spawner();
+            let callback_mode = if use_tui_loopback {
+                OAuthCallbackMode::Loopback
+            } else {
+                OAuthCallbackMode::CustomScheme {
+                    redirect_uri: format!(
+                        "{}://mcp/oauth2callback",
+                        ChannelState::url_scheme()
+                    ),
+                    result_rx: oauth_result_rx,
+                }
+            };
+
+            AuthContext {
+                callback_mode,
+                uuid: installation_uuid,
+                persisted_credentials,
+                is_headless,
+                is_file_based,
+                persist_credentials: Box::new(move |installation_uuid, credentials| {
+                    let spawner = persist_spawner.clone();
+                    Box::pin(async move {
+                        spawner
+                            .spawn(move |manager, ctx| {
+                                manager.save_credentials_to_secure_storage(
+                                    ctx,
+                                    installation_uuid,
+                                    credentials,
+                                );
+                            })
+                            .await
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "Failed to persist auto-refreshed MCP credentials: {err:?}"
+                                )
+                            })?;
+                        Ok(())
+                    })
+                }),
+                requires_authentication: Box::new(move |uuid, csrf_state, auth_url| {
+                    let spawner = requires_authentication_spawner.clone();
+                    Box::pin(async move {
+                        spawner
+                            .spawn(move |manager, ctx| {
+                                if !use_tui_loopback && !csrf_state.is_empty() {
+                                    manager.pending_oauth_csrf.insert(csrf_state, uuid);
+                                }
+                                manager.authorization_urls.insert(uuid, auth_url.clone());
+                                ctx.emit(
+                                    TemplatableMCPServerManagerEvent::AuthenticationRequired {
+                                        uuid,
+                                    },
+                                );
+                                ctx.open_url(&auth_url);
+                                manager.change_server_state(uuid, MCPServerState::Authenticating, ctx);
+                            })
+                            .await
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "Failed to emit MCP authentication-required state: {err:?}"
+                                )
+                            })?;
+                        Ok(())
+                    })
+                }),
+                authenticated: Some(Box::new(move |server_name| {
+                    let spawner = authenticated_spawner.clone();
+                    Box::pin(async move {
+                        spawner
+                            .spawn(move |_, ctx| {
+                                if let Some(active_window_id) = ctx.windows().active_window() {
+                                    ToastStack::handle(ctx).update(ctx, |stack, ctx| {
+                                        stack.add_ephemeral_toast(
+                                            DismissibleToast::default(format!(
+                                                "Successfully authenticated {server_name} MCP server"
+                                            )),
+                                            active_window_id,
+                                            ctx,
+                                        );
+                                    });
+                                }
+                            })
+                            .await
+                            .map_err(|err| {
+                                anyhow::anyhow!(
+                                    "Failed to emit MCP authenticated notification: {err:?}"
+                                )
+                            })?;
+                        Ok(())
+                    })
+                })),
+            }
+        });
 
         // Extract values from mode before moving it into the closure.
         let should_persist = mode.should_persist_running_state_to_sqlite();
         let should_send_telemetry = mode.should_send_telemetry();
-        let is_reconnect = mode.is_reconnect();
 
         self.change_server_state(installation_uuid, MCPServerState::Starting, ctx);
         let task = ctx.spawn(
@@ -859,6 +1169,7 @@ impl TemplatableMCPServerManager {
                 server_name,
                 description,
                 installation_uuid,
+                installation.warp_id().map(str::to_owned),
                 server.transport_type.clone(),
                 logger.clone(),
                 auth_context,
@@ -867,10 +1178,11 @@ impl TemplatableMCPServerManager {
             move |me, server_info: Result<_, rmcp::RmcpError>, ctx| {
                 me.spawned_servers.remove(&installation_uuid);
                 me.pending_oauth_csrf.retain(|_, v| *v != installation_uuid);
+                me.authorization_urls.remove(&installation_uuid);
 
                 let error = match server_info {
                     Ok(info) => {
-                        let peer = info.service.clone();
+                        let peer = info.peer();
                         me.active_servers.insert(installation_uuid, info);
 
                         // Clear any previous error message on successful connection.
@@ -881,10 +1193,7 @@ impl TemplatableMCPServerManager {
                             Self::persist_is_mcp_running(installation_uuid, true, ctx);
                         }
                         me.change_server_state(installation_uuid, MCPServerState::Running, ctx);
-
-                        if is_reconnect {
-                            me.notify_reconnect_waiters(installation_uuid, Ok(peer));
-                        }
+                        me.notify_reconnect_waiters(installation_uuid, Ok(peer));
                         None
                     }
                     Err(e) => {
@@ -892,6 +1201,7 @@ impl TemplatableMCPServerManager {
                             .log(format!("[error] MCP: Failed to connect to server: {e:#}"));
                         // Close the logger to make sure we flush any remaining data.
                         logger_clone.close();
+                        me.server_loggers.remove(&installation_uuid);
                         log::warn!("Failed to spawn MCP server: {e:#}");
 
                         // Store user-friendly error message.
@@ -907,9 +1217,7 @@ impl TemplatableMCPServerManager {
 
                         me.delete_credentials_from_secure_storage(installation_uuid, ctx);
 
-                        if is_reconnect {
-                            me.notify_reconnect_waiters(installation_uuid, Err(error_message));
-                        }
+                        me.notify_reconnect_waiters(installation_uuid, Err(error_message));
 
                         Some(e.into())
                     }
@@ -948,6 +1256,15 @@ impl TemplatableMCPServerManager {
 
     /// Shuts down a running MCP server.
     pub fn shutdown_server(&mut self, installation_uuid: Uuid, ctx: &mut ModelContext<'_, Self>) {
+        drop(self.shutdown_server_and_wait(installation_uuid, ctx));
+    }
+
+    fn shutdown_server_and_wait(
+        &mut self,
+        installation_uuid: Uuid,
+        ctx: &mut ModelContext<Self>,
+    ) -> oneshot::Receiver<()> {
+        let (complete, receiver) = oneshot::channel();
         log::debug!("Trying to shut down a MCP server with installation uuid {installation_uuid}");
 
         Self::persist_is_mcp_running(installation_uuid, false, ctx);
@@ -959,20 +1276,36 @@ impl TemplatableMCPServerManager {
         if let Some(spawned_info) = self.spawned_servers.remove(&installation_uuid) {
             spawned_info.abort_handle.abort();
         }
+        self.reconnectable_ephemeral_installations
+            .remove(&installation_uuid);
+        self.notify_reconnect_waiters(installation_uuid, Err("Server shut down".to_string()));
+        // Close the log stream now rather than when async teardown drops the
+        // last logger clone, so an immediate respawn of the same server can
+        // re-register its log path.
+        if let Some(logger) = self.server_loggers.remove(&installation_uuid) {
+            logger.close();
+        }
         self.pending_oauth_csrf
             .retain(|_, v| *v != installation_uuid);
-        if let Some(server_info) = self.active_servers.remove(&installation_uuid) {
-            self.change_server_state(installation_uuid, MCPServerState::ShuttingDown, ctx);
-            // Cancel the server, and emit NotRunning state once it has stopped.
-            ctx.spawn(server_info.service.cancel(), move |me, _, ctx| {
-                me.change_server_state(installation_uuid, MCPServerState::NotRunning, ctx);
-                ctx.dispatch_global_action("workspace:save_app", ());
-            });
-        } else {
-            self.change_server_state(installation_uuid, MCPServerState::NotRunning, ctx);
+        self.authorization_urls.remove(&installation_uuid);
+        match self.active_servers.remove(&installation_uuid) {
+            Some(server_info) => {
+                self.change_server_state(installation_uuid, MCPServerState::ShuttingDown, ctx);
+                // Cancel the server, and emit NotRunning state once it has stopped.
+                ctx.spawn(server_info.shutdown(), move |me, _, ctx| {
+                    me.change_server_state(installation_uuid, MCPServerState::NotRunning, ctx);
+                    ctx.dispatch_global_action("workspace:save_app", ());
+                    let _ = complete.send(());
+                });
+            }
+            _ => {
+                self.change_server_state(installation_uuid, MCPServerState::NotRunning, ctx);
+                let _ = complete.send(());
+            }
         }
 
         log::debug!("Successfully shut down server with installation uuid {installation_uuid}");
+        receiver
     }
 
     pub fn get_installation_by_template_uuid(
@@ -1024,7 +1357,10 @@ impl TemplatableMCPServerManager {
                 mcp_server_installation: mcp_server_installation.clone(),
             };
             if let Err(err) = sender.send(event) {
-                log::error!("Failed to save TemplatableMCPServerInstallation to database: {err}");
+                report_error!(
+                    anyhow::Error::new(err)
+                        .context("Failed to save TemplatableMCPServerInstallation to database")
+                );
             }
         }
 
@@ -1107,7 +1443,10 @@ impl TemplatableMCPServerManager {
                 installation_uuids: installation_uuids.clone(),
             };
             if let Err(err) = sender.send(event) {
-                log::error!("Failed to delete installations from local database: {err}");
+                report_error!(
+                    anyhow::Error::new(err)
+                        .context("Failed to delete installations from local database")
+                );
             }
         }
 
@@ -1185,7 +1524,10 @@ impl TemplatableMCPServerManager {
         updates: Vec<MCPServerUpdate>,
     ) -> Vec<MCPServerUpdate> {
         let Some(installation) = self.get_installed_server(&installation_uuid) else {
-            log::error!("Could not find installed server {installation_uuid}");
+            report_error!(
+                "Could not find installed server",
+                extra: { "installation_uuid" => %installation_uuid }
+            );
             return updates.to_vec();
         };
 
@@ -1293,28 +1635,31 @@ impl TemplatableMCPServerManager {
 
         self.delete_templatable_mcp_server_installation(installation_uuid, ctx);
 
-        if reuse_variable_values {
-            if let Some(existing_variable_values) = existing_variable_values {
-                self.install_from_template(
-                    templatable_mcp_server.clone(),
-                    existing_variable_values,
-                    true,
-                    ctx,
-                );
-            }
+        if reuse_variable_values && let Some(existing_variable_values) = existing_variable_values {
+            self.install_from_template(
+                templatable_mcp_server.clone(),
+                existing_variable_values,
+                true,
+                ctx,
+            );
         }
     }
 
-    pub fn is_authorized_editor(&self, template_uuid: Uuid, ctx: &AppContext) -> bool {
+    pub fn is_authorized_editor(
+        &self,
+        template_uuid: Uuid,
+        team_uid: Option<ServerId>,
+        ctx: &AppContext,
+    ) -> bool {
         let cloud_templatable_mcp_server = self.get_cloud_templatable_mcp_server(template_uuid);
 
         if let Some(cloud_templatable_mcp_server) = cloud_templatable_mcp_server {
             let auth_state = AuthStateProvider::as_ref(ctx).get();
-            let current_team = UserWorkspaces::as_ref(ctx).current_team();
-
-            let has_admin_permissions = current_team.is_some_and(|team| {
-                team.has_admin_permissions(&auth_state.user_email().unwrap_or_default())
-            });
+            let has_admin_permissions = team_uid
+                .and_then(|team_uid| UserWorkspaces::as_ref(ctx).team_from_uid(team_uid))
+                .is_some_and(|team| {
+                    team.has_admin_permissions(&auth_state.user_email().unwrap_or_default())
+                });
             let is_author = cloud_templatable_mcp_server.metadata().creator_uid
                 == auth_state.user_id().map(|user_id| user_id.as_string());
 
@@ -1388,6 +1733,7 @@ impl TemplatableMCPServerManager {
         let ParsedTemplatableMCPServerResult {
             templatable_mcp_server,
             templatable_mcp_server_installation,
+            ..
         } = parsed_result.clone();
         let template_uuid = templatable_mcp_server.uuid;
         self.create_templatable_mcp_server(templatable_mcp_server, space, initiated_by, ctx);
@@ -1417,8 +1763,6 @@ impl TemplatableMCPServerManager {
         servers_to_restart: HashSet<Uuid>,
         ctx: &mut ModelContext<Self>,
     ) {
-        // Import inline because of circular dependencies
-        use crate::ai::mcp::CloudMCPServer;
         let cloud_legacy_servers = CloudMCPServer::get_all(ctx);
         log::info!(
             "Converting {} legacy MCP servers into templatable MCP servers",
@@ -1447,7 +1791,10 @@ impl TemplatableMCPServerManager {
                         ctx
                     );
                 }
-                Err(e) => log::error!("{e}"),
+                Err(e) => report_error!(
+                    anyhow::Error::new(e)
+                        .context("Failed to convert legacy MCP server to templatable")
+                ),
             }
         }
     }
@@ -1455,41 +1802,38 @@ impl TemplatableMCPServerManager {
     pub fn share_templatable_mcp_server(
         &mut self,
         template_uuid: Uuid,
+        team_uid: ServerId,
         ctx: &mut ModelContext<Self>,
     ) {
         let sync_id = self
             .get_cloud_templatable_mcp_server(template_uuid)
             .map(|server| server.sync_id());
-        let team_uid = TemplatableMCPServerManager::get_first_team_space_id(ctx);
 
         if let Some(sync_id) = sync_id {
-            if let Some(team_uid) = team_uid {
-                let object_type_and_id = CloudObjectTypeAndId::GenericStringObject {
-                    object_type: GenericStringObjectFormat::Json(
-                        JsonObjectType::TemplatableMCPServer,
-                    ),
-                    id: sync_id,
-                };
-                UpdateManager::handle(ctx).update(ctx, |update_manager, ctx| {
-                    update_manager.move_object_to_location(
-                        object_type_and_id,
-                        CloudObjectLocation::Space(Space::Team { team_uid }),
-                        ctx,
-                    );
-                });
-                send_telemetry_from_ctx!(TelemetryEvent::MCPTemplateShared, ctx);
-            }
+            let object_type_and_id = CloudObjectTypeAndId::GenericStringObject {
+                object_type: GenericStringObjectFormat::Json(JsonObjectType::TemplatableMCPServer),
+                id: sync_id,
+            };
+            UpdateManager::handle(ctx).update(ctx, |update_manager, ctx| {
+                update_manager.move_object_to_location(
+                    object_type_and_id,
+                    CloudObjectLocation::Space(Space::Team { team_uid }),
+                    ctx,
+                );
+            });
+            send_telemetry_from_ctx!(TelemetryEvent::MCPTemplateShared, ctx);
         }
     }
 
     pub fn share_templatable_mcp_server_installation(
         &mut self,
         installation_uuid: Uuid,
+        team_uid: ServerId,
         ctx: &mut ModelContext<Self>,
     ) {
         let template_uuid = self.get_template_uuid(installation_uuid);
         if let Some(template_uuid) = template_uuid {
-            self.share_templatable_mcp_server(template_uuid, ctx);
+            self.share_templatable_mcp_server(template_uuid, team_uid, ctx);
         }
     }
 
@@ -1528,15 +1872,6 @@ impl TemplatableMCPServerManager {
         }
     }
 
-    pub fn get_first_team_space_id(app: &AppContext) -> Option<ServerId> {
-        let user_workspaces = UserWorkspaces::as_ref(app);
-        let all_user_spaces = user_workspaces.all_user_spaces(app);
-        all_user_spaces.into_iter().find_map(|space| match space {
-            Space::Team { team_uid } => Some(team_uid),
-            _ => None,
-        })
-    }
-
     pub fn has_oauth_credentials_for_server(&self, template_uuid: Uuid) -> bool {
         self.server_credentials.contains_key(&template_uuid)
     }
@@ -1548,13 +1883,7 @@ impl TemplatableMCPServerManager {
     ) -> Option<rmcp::Peer<rmcp::RoleClient>> {
         self.active_servers
             .get(&installation_uuid)
-            .and_then(|server| {
-                if server.service.is_transport_closed() {
-                    None
-                } else {
-                    Some(server.service.clone())
-                }
-            })
+            .and_then(TemplatableMCPServerInfo::peer_if_connected)
     }
 
     /// Triggers reconnection of a server by its installation UUID.
@@ -1572,35 +1901,25 @@ impl TemplatableMCPServerManager {
     ) {
         log::debug!("Reconnecting MCP server with installation uuid {installation_uuid}");
 
-        // If a reconnection is already in progress, add this caller to the waiting list.
-        if let Some(waiters) = self.pending_reconnections.get_mut(&installation_uuid) {
+        if let Some(peer) = self.get_peer_if_connected(installation_uuid) {
+            let _ = result_tx.send(Ok(peer));
+            return;
+        }
+        if !self.register_reconnect_waiter(installation_uuid, result_tx) {
             log::debug!(
-                "Reconnection already in progress for {installation_uuid}, adding to waiters"
+                "Connection already in progress for {installation_uuid}, adding to waiters"
             );
-            waiters.push(result_tx);
             return;
         }
 
-        // Start tracking this reconnection with this caller as the first waiter.
-        self.pending_reconnections
-            .insert(installation_uuid, vec![result_tx]);
-
-        // Remove the old server from active_servers if it exists.
         self.active_servers.remove(&installation_uuid);
-
-        // Cancel any in-flight spawn.
-        if let Some(spawned_info) = self.spawned_servers.remove(&installation_uuid) {
-            spawned_info.abort_handle.abort();
+        if let Some(logger) = self.server_loggers.remove(&installation_uuid) {
+            logger.close();
         }
         self.pending_oauth_csrf
             .retain(|_, v| *v != installation_uuid);
 
-        // Look up the installation to get server details.
-        let Some(installation) = self
-            .locally_installed_servers
-            .get(&installation_uuid)
-            .cloned()
-        else {
+        let Some(installation) = self.reconnectable_installation(installation_uuid).cloned() else {
             self.notify_reconnect_waiters(
                 installation_uuid,
                 Err("Installation not found".to_string()),
@@ -1609,23 +1928,6 @@ impl TemplatableMCPServerManager {
         };
 
         self.spawn_server_impl(installation, SpawnMode::Reconnect, ctx);
-    }
-
-    /// Notifies all pending reconnection waiters for the given installation UUID.
-    ///
-    /// This removes the waiters from `pending_reconnections` and sends the result to each.
-    fn notify_reconnect_waiters(
-        &mut self,
-        installation_uuid: Uuid,
-        result: Result<rmcp::Peer<rmcp::RoleClient>, String>,
-    ) {
-        if let Some(waiters) = self.pending_reconnections.remove(&installation_uuid) {
-            for tx in waiters {
-                // Clone the result for each waiter. For Ok, we clone the peer.
-                // For Err, we clone the error message.
-                let _ = tx.send(result.clone());
-            }
-        }
     }
 
     /// Returns a reconnecting peer for a server that has the given tool.
@@ -1638,7 +1940,7 @@ impl TemplatableMCPServerManager {
         let spawner = self.spawner.as_ref()?;
         self.active_servers
             .iter()
-            .find(|(_, server)| server.tools.iter().any(|t| t.name == tool_name))
+            .find(|(_, server)| server.has_tool(&tool_name))
             .map(|(installation_uuid, _)| {
                 crate::ai::mcp::reconnecting_peer::ReconnectingPeer::new(
                     *installation_uuid,
@@ -1657,7 +1959,7 @@ impl TemplatableMCPServerManager {
     ) -> Option<crate::ai::mcp::reconnecting_peer::ReconnectingPeer> {
         let spawner = self.spawner.as_ref()?;
         let server = self.active_servers.get(&installation_id)?;
-        if server.tools.iter().any(|t| t.name == tool_name) {
+        if server.has_tool(&tool_name) {
             Some(crate::ai::mcp::reconnecting_peer::ReconnectingPeer::new(
                 installation_id,
                 spawner.clone(),
@@ -1673,15 +1975,25 @@ impl TemplatableMCPServerManager {
         ctx: &mut ModelContext<Self>,
     ) {
         // First, check if the servers are already spawned.
-        let new_installations = installations
-            .iter()
-            .filter(|installation| {
-                let uuid = installation.uuid();
-                !self.active_servers.contains_key(&uuid)
-                    && !self.spawned_servers.contains_key(&uuid)
-            })
-            .cloned()
-            .collect_vec();
+        let mut new_installations = Vec::new();
+        for installation in installations {
+            let uuid = installation.uuid();
+            let server_name = &installation.templatable_mcp_server().name;
+            if self.active_servers.contains_key(&uuid) {
+                log::info!(
+                    "Skipping file-based MCP server '{server_name}' ({uuid}); already running"
+                );
+                continue;
+            }
+            if self.spawned_servers.contains_key(&uuid) {
+                log::info!(
+                    "Skipping file-based MCP server '{server_name}' ({uuid}); already starting"
+                );
+                continue;
+            }
+            log::info!("Spawning file-based MCP server '{server_name}' ({uuid})");
+            new_installations.push(installation.clone());
+        }
 
         // If not, spawn them.
         for installation in new_installations {
@@ -1717,442 +2029,5 @@ impl TemplatableMCPServerManager {
     pub fn has_oauth_credentials_for_file_based_server(&self, installation_hash: u64) -> bool {
         self.file_based_server_credentials
             .contains_key(&installation_hash)
-    }
-}
-
-type ReqwestHttpTransport = rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
-type ReqwestSseTransport = rmcp::transport::SseClientTransport<reqwest::Client>;
-
-/// Spawns a new MCP server from a given [`TransportType`].
-async fn spawn_server(
-    server_name: String,
-    description: Option<String>,
-    uuid: Uuid,
-    transport_type: TransportType,
-    logger: SimpleLogger,
-    auth_context: AuthContext,
-) -> Result<TemplatableMCPServerInfo, rmcp::RmcpError> {
-    logger.log("[note] Attention! There may be sensitive information (such as API keys) in these logs. Make sure to redact any secrets before sharing with others.".to_string());
-
-    let mut is_authenticated_transport = false;
-    let service = match transport_type {
-        TransportType::CLIServer(cli_server) => {
-            logger.log("[info] MCP: Using stdio transport".to_string());
-
-            cfg_if! {
-                if #[cfg(windows)] {
-                    // We wrap the command in cmd.exe /c to allow Windows to be responsible for resolving the
-                    // PATH variable rather than depending on the `Command` implementation, which only looks for
-                    // `.exe` files in directories found in PATH.
-                    // https://github.com/rust-lang/rust/issues/37519
-                    let command = "cmd.exe".to_owned();
-                    let args = std::iter::once("/c".to_owned())
-                        .chain(std::iter::once(cli_server.command))
-                        .chain(cli_server.args)
-                        .collect::<Vec<String>>();
-                } else {
-                    let command = cli_server.command;
-                    let args = cli_server.args;
-                }
-            }
-
-            // Capture the command and configured cwd for diagnostics before they're
-            // moved into the Command builder closure.
-            let command_for_log = command.clone();
-            let cwd_for_log = cli_server.cwd_parameter.clone();
-
-            // Try to spawn the child process.
-            let (transport, stderr) = rmcp::transport::TokioChildProcess::builder(
-                tokio::process::Command::new(command).configure(|cmd| {
-                    cmd.args(args);
-                    if let Some(cwd) = cli_server.cwd_parameter {
-                        cmd.current_dir(cwd);
-                    }
-                    for StaticEnvVar { name, value } in cli_server.static_env_vars.iter() {
-                        if value.is_empty() {
-                            // Skip empty/unset environment variables so that, in the CLI, they can be inherited.
-                            logger.log(format!(
-                                "[warn] MCP: Skipping empty environment variable: {name}"
-                            ));
-                            continue;
-                        }
-                        cmd.env(name, value);
-                    }
-
-                    // On Windows, ensure that no console window is shown.
-                    #[cfg(windows)]
-                    cmd.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
-                }),
-            )
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|err| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    let cwd_display = cwd_for_log
-                        .as_deref()
-                        .unwrap_or("<inherited from Warp's process cwd>");
-                    logger.log(format!(
-                        "[error] MCP: Failed to spawn '{server_name}': command '{command_for_log}' \
-                         not found (cwd: {cwd_display}). If your MCP server depends on a specific \
-                         working directory, set the `working_directory` field in your config to \
-                         override the default."
-                    ));
-                }
-                rmcp::RmcpError::transport_creation::<rmcp::transport::TokioChildProcess>(err)
-            })?;
-
-            let pid = transport
-                .id()
-                .map(|pid| pid.to_string())
-                .unwrap_or("??".to_string());
-
-            // We always expect to have an stderr, but this is marginally safer than unwrapping.
-            if let Some(stderr) = stderr {
-                let logger = logger.clone();
-                // Spawn a background task to forward from the child process's stderr to our logger.
-                tokio::spawn(async move {
-                    let mut buf = String::new();
-                    let mut reader = tokio::io::BufReader::new(stderr);
-                    loop {
-                        match reader.read_line(&mut buf).await {
-                            // EOF.
-                            Ok(0) => return,
-                            // Read some data.
-                            Ok(_) => logger.log(format!("[info] MCP [pid: {pid}] stderr: {buf}")),
-                            // Failed to read from the child process's stderr.
-                            Err(e) => {
-                                log::error!("Failed to read stderr: {e}");
-                                return;
-                            }
-                        }
-                    }
-                });
-            }
-
-            // Wrap the transport in a logging wrapper.
-            let transport = TransportLoggingWrapper {
-                transport,
-                logger: logger.clone(),
-            };
-
-            // Create the MCP client and connect to the server.
-            Ok::<_, rmcp::RmcpError>(make_client_info().into_dyn().serve(transport).await?)
-        }
-        TransportType::ServerSentEvents(sse_server) => {
-            let headers: std::collections::HashMap<String, String> = sse_server
-                .headers
-                .iter()
-                .map(|h| (h.name.clone(), h.value.clone()))
-                .collect();
-            match determine_transport(server_name.clone(), &sse_server.url, &headers, auth_context)
-                .await
-            {
-                // TODO: these need headers also?
-                Ok(Transport::Http(Some(client))) => {
-                    is_authenticated_transport = true;
-
-                    logger.log("[info] MCP: Using Streaming HTTP transport".to_string());
-                    let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
-                        client,
-                        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
-                            sse_server.url.clone(),
-                        ),
-                    );
-                    let transport = TransportLoggingWrapper {
-                        transport,
-                        logger: logger.clone(),
-                    };
-                    Ok(make_client_info().into_dyn().serve(transport).await?)
-                }
-                Ok(Transport::Http(None)) => {
-                    logger.log("[info] MCP: Using Streaming HTTP transport".to_string());
-                    let transport = if headers.is_empty() {
-                        rmcp::transport::StreamableHttpClientTransport::from_uri(
-                            sse_server.url.clone(),
-                        )
-                    } else {
-                        let client = build_client_with_headers(&headers)?;
-                        rmcp::transport::StreamableHttpClientTransport::with_client(
-                            client,
-                            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
-                                sse_server.url.clone(),
-                            ),
-                        )
-                    };
-                    let transport = TransportLoggingWrapper {
-                        transport,
-                        logger: logger.clone(),
-                    };
-                    Ok(make_client_info().into_dyn().serve(transport).await?)
-                }
-                Ok(Transport::Sse(Some(client))) => {
-                    is_authenticated_transport = true;
-
-                    logger.log("[info] MCP: Using (legacy) SSE transport (due to preflight failing with a 404)".to_string());
-                    let transport = rmcp::transport::SseClientTransport::start_with_client(
-                        client,
-                        rmcp::transport::sse_client::SseClientConfig {
-                            sse_endpoint: sse_server.url.into(),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(rmcp::RmcpError::transport_creation::<ReqwestSseTransport>)?;
-                    let transport = TransportLoggingWrapper {
-                        transport,
-                        logger: logger.clone(),
-                    };
-                    Ok(make_client_info().into_dyn().serve(transport).await?)
-                }
-                Ok(Transport::Sse(None)) => {
-                    logger.log("[info] MCP: Using (legacy) SSE transport (due to preflight failing with a 404)".to_string());
-                    let transport = if headers.is_empty() {
-                        rmcp::transport::SseClientTransport::start(sse_server.url.clone())
-                            .await
-                            .map_err(|e| {
-                                rmcp::RmcpError::transport_creation::<ReqwestSseTransport>(e)
-                            })?
-                    } else {
-                        let client = build_client_with_headers(&headers)?;
-                        rmcp::transport::SseClientTransport::start_with_client(
-                            client,
-                            rmcp::transport::sse_client::SseClientConfig {
-                                sse_endpoint: sse_server.url.clone().into(),
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .map_err(rmcp::RmcpError::transport_creation::<ReqwestSseTransport>)?
-                    };
-                    let transport = TransportLoggingWrapper {
-                        transport,
-                        logger: logger.clone(),
-                    };
-                    Ok(make_client_info().into_dyn().serve(transport).await?)
-                }
-                Err(err) => {
-                    logger.log(format!(
-                        "[error] MCP: preflight connection to MCP server failed: {err:#}"
-                    ));
-                    Err(err)?
-                }
-            }
-        }
-    }?;
-
-    let server_info = service.peer_info();
-    logger.log(format!("[info] MCP: Connected to server: {server_info:#?}"));
-
-    let resources = if server_info.is_some_and(|info| info.capabilities.resources.is_some()) {
-        match service.list_all_resources().await {
-            Ok(result) => result,
-            Err(err) => {
-                log::warn!("Failed to list resources for MCP server '{server_name}': {err}");
-                vec![]
-            }
-        }
-    } else {
-        vec![]
-    };
-    let tools = match service.list_all_tools().await {
-        Ok(result) => result,
-        Err(rmcp::ServiceError::McpError(rmcp::model::ErrorData { code, .. }))
-            if code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
-        {
-            vec![]
-        }
-        Err(err) => {
-            return Err(err.into());
-        }
-    };
-
-    Ok(TemplatableMCPServerInfo {
-        name: server_name,
-        service,
-        resources,
-        tools,
-        installation_id: uuid,
-        description,
-        is_authenticated_transport,
-    })
-}
-
-/// The transport to use for MCP.
-enum Transport {
-    /// The HTTP transport, with an optional authenticated client.
-    Http(Option<rmcp::transport::auth::AuthClient<reqwest::Client>>),
-    /// The SSE transport, with an optional authenticated client.
-    Sse(Option<rmcp::transport::auth::AuthClient<reqwest::Client>>),
-}
-
-/// Determines which transport to use.
-///
-/// This sends a "preflight" InitializeRequest to the server to determine whether the
-/// server supports the HTTP transport (or needs to use the SSE transport), and if
-/// authentication is required.
-async fn determine_transport(
-    server_name: String,
-    url: &str,
-    headers: &std::collections::HashMap<String, String>,
-    auth_context: AuthContext,
-) -> Result<Transport, rmcp::RmcpError> {
-    use reqwest::StatusCode;
-
-    fn unexpected_error(status: reqwest::StatusCode) -> rmcp::RmcpError {
-        rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>(format!(
-            "Unexpected status code: {status}"
-        ))
-    }
-    match send_initialize_request(url, headers, None).await? {
-        StatusCode::OK => Ok(Transport::Http(None)),
-        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => Ok(Transport::Sse(None)),
-        StatusCode::UNAUTHORIZED => {
-            if !FeatureFlag::McpOauth.is_enabled() {
-                return Err(rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>(
-                    "Server requires authentication, which is not yet supported.".to_string(),
-                ));
-            }
-
-            let spawner = auth_context.spawner.clone();
-            // Go through the OAuth flow to get an authenticated client.
-            // This will first attempt to use cached credentials before starting interactive OAuth.
-            let (client, did_require_login) = oauth::make_authenticated_client(url, auth_context)
-                .boxed()
-                .await
-                .map_err(rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>)?;
-            let transport = match send_initialize_request(url, headers, Some(&client)).await? {
-                StatusCode::OK => Ok(Transport::Http(Some(client))),
-                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => {
-                    Ok(Transport::Sse(Some(client)))
-                }
-                other => Err(unexpected_error(other)),
-            };
-            if transport.is_ok() && did_require_login {
-                let _ = spawner
-                    .spawn(move |_, ctx| {
-                        if let Some(active_window_id) = ctx.windows().active_window() {
-                            ToastStack::handle(ctx).update(ctx, |stack, ctx| {
-                                stack.add_ephemeral_toast(
-                                    DismissibleToast::default(format!(
-                                        "Successfully authenticated {server_name} MCP server"
-                                    )),
-                                    active_window_id,
-                                    ctx,
-                                );
-                            });
-                        }
-                    })
-                    .await;
-            }
-
-            transport
-        }
-        status => Err(unexpected_error(status)),
-    }
-}
-
-/// Sends an InitializeRequest to the server, and returns the HTTP status code from the response.
-async fn send_initialize_request(
-    url: &str,
-    headers: &std::collections::HashMap<String, String>,
-    auth_client: Option<&rmcp::transport::auth::AuthClient<reqwest::Client>>,
-) -> Result<reqwest::StatusCode, rmcp::RmcpError> {
-    use rmcp::transport::common::http_header::{EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE};
-
-    let request = rmcp::model::InitializeRequest::new(make_client_info());
-    let request = rmcp::model::ClientJsonRpcMessage::request(
-        rmcp::model::ClientRequest::InitializeRequest(request),
-        rmcp::model::RequestId::Number(0),
-    );
-
-    let mut request = build_client_with_headers(headers)?
-        .post(url)
-        .header(
-            http::header::ACCEPT,
-            [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "),
-        )
-        .json(&request);
-
-    if let Some(auth_client) = auth_client.as_ref() {
-        let access_token = auth_client
-            .get_access_token()
-            .await
-            .map_err(rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>)?;
-        request = request.bearer_auth(access_token);
-    }
-
-    let response = request
-        .send()
-        .await
-        .map_err(rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>)?;
-
-    Ok(response.status())
-}
-
-/// Creates a [`ClientInfo`] for the MCP client.
-///
-/// This tells the MCP server who we are and what capabilities we have.
-fn make_client_info() -> rmcp::model::ClientInfo {
-    rmcp::model::ClientInfo {
-        protocol_version: Default::default(),
-        capabilities: Default::default(),
-        client_info: rmcp::model::Implementation {
-            name: warp_core::channel::ChannelState::app_id().to_string(),
-            version: warp_core::channel::ChannelState::app_version()
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            title: None,
-            icons: None,
-            website_url: None,
-        },
-    }
-}
-
-/// A wrapper around a [`rmcp::transport::Transport`] that logs all requests and responses.
-struct TransportLoggingWrapper<T> {
-    transport: T,
-    logger: SimpleLogger,
-}
-
-impl<T: rmcp::transport::Transport<R>, R: rmcp::service::ServiceRole> rmcp::transport::Transport<R>
-    for TransportLoggingWrapper<T>
-{
-    type Error = T::Error;
-
-    fn send(
-        &mut self,
-        item: rmcp::service::TxJsonRpcMessage<R>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-        if let Ok(json) = serde_json::to_string(&item) {
-            self.logger
-                .log(format!("[info] MCP: Sending request: {json}"));
-        }
-
-        let logger = self.logger.clone();
-        self.transport.send(item).map(move |result| {
-            if let Err(e) = &result {
-                logger.log(format!("[warn] MCP: Failed to send request: {e:#}"));
-            }
-            result
-        })
-    }
-
-    fn receive(
-        &mut self,
-    ) -> impl Future<Output = Option<rmcp::service::RxJsonRpcMessage<R>>> + Send {
-        let logger = self.logger.clone();
-        async move {
-            let result = self.transport.receive().await;
-            if let Some(item) = &result {
-                if let Ok(json) = serde_json::to_string(item) {
-                    logger.log(format!("[info] MCP: Received response: {json}"));
-                }
-            }
-            result
-        }
-    }
-
-    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.transport.close()
     }
 }

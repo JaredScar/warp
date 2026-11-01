@@ -1,3 +1,6 @@
+// The test harness in this file is adapted from the alacritty_terminal crate
+// under the Apache license; see: crates/warp_terminal/src/model/LICENSE-ALACRITTY.
+
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::Path;
@@ -5,17 +8,15 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json as json;
-
 use warpui::r#async::executor::Background;
 
-use crate::terminal::color;
 use crate::terminal::color::Colors;
 use crate::terminal::event_listener::ChannelEventListener;
+use crate::terminal::model::block::BlockSize;
 use crate::terminal::model::grid::{Dimensions, GridStorage};
-use crate::terminal::model::{ansi, block::BlockSize, ObfuscateSecrets};
+use crate::terminal::model::{ObfuscateSecrets, ansi};
 use crate::terminal::shell::{ShellName, ShellType};
-use crate::terminal::ShellLaunchState;
-use crate::terminal::{BlockPadding, SizeInfo, TerminalModel};
+use crate::terminal::{BlockPadding, ShellLaunchState, SizeInfo, TerminalModel, color};
 
 macro_rules! ref_tests {
     ($($name:ident)*) => {
@@ -103,7 +104,7 @@ fn ref_test(dir: &Path) {
     let history_size = ref_config.history_size;
 
     let (wakeups_tx, _) = async_channel::unbounded();
-    let (events_tx, _) = async_channel::unbounded();
+    let (events_tx, _) = async_channel::unbounded::<crate::terminal::event::Event>();
     let (pty_reads_tx, _) = async_broadcast::broadcast(1000);
 
     let channel_event_proxy = ChannelEventListener::new(wakeups_tx, events_tx, pty_reads_tx);

@@ -1,6 +1,5 @@
+use fuzzy_match::{FuzzyMatchResult, match_indices_case_insensitive};
 use serde::{Deserialize, Serialize};
-
-use fuzzy_match::{match_indices_case_insensitive, FuzzyMatchResult};
 
 /// Determine if `from` starts with `partial` in a case insensitive manner.
 /// Returns None if `partial` does not start with `from`, otherwise specifying
@@ -70,6 +69,12 @@ impl MatchStrategy {
                     return case_insensitive_match;
                 }
 
+                // Only fall back to a subsequence match for a query with at least one alphanumeric
+                // character. Fuzzy matches on punctuation produce poor results.
+                if !partial.chars().any(|c| c.is_alphanumeric()) {
+                    return None;
+                }
+
                 match_indices_case_insensitive(from, partial)
                     .map(|match_result| Fuzzy { match_result })
             }
@@ -110,5 +115,5 @@ impl From<Match> for MatchType {
 }
 
 #[cfg(test)]
-#[path = "matchers_test.rs"]
+#[path = "matchers_tests.rs"]
 mod tests;

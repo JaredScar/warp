@@ -1,48 +1,40 @@
 //! This module contains state management logic for pending context, where "pending context"
 //! is defined as additional context to be attached to the next AI query.
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::ai::{
-    agent::{AnyFileContent, FileContext},
-    block_context::BlockContext,
-};
-
-use super::agent_view::{AgentViewController, AgentViewEntryOrigin, EnterAgentViewError};
 use ai::project_context::model::ProjectContextModel;
 use parking_lot::FairMutex;
 use warp_core::features::FeatureFlag;
-use warpui::{AppContext, Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
-
-use crate::ai::agent::conversation::{AIConversationAutoexecuteMode, ConversationStatus};
-use crate::{
-    ai::{
-        agent::todos::AIAgentTodoList,
-        agent::{
-            conversation::{AIConversation, AIConversationId},
-            AIAgentAttachment, AIAgentContext, ImageContext,
-        },
-        document::ai_document_model::AIDocumentId,
-        llms::{LLMPreferences, LLMPreferencesEvent},
-        outline::RepoOutlines,
-    },
-    terminal::{
-        event::{BlockCompletedEvent, BlockType},
-        model::{block::BlockId, session::Sessions},
-        model_events::{ModelEvent, ModelEventDispatcher},
-        TerminalModel,
-    },
-    workspaces::user_workspaces::UserWorkspaces,
+use warp_util::local_or_remote_path::LocalOrRemotePath;
+use warpui::{
+    AppContext, Entity, EntityId, ModelContext, ModelHandle, SingletonEntity, WeakModelHandle,
 };
 
-use super::{
-    block::DirectoryContext, history_model::BlocklistAIHistoryModel, BlocklistAIHistoryEvent,
+use super::agent_view::{AgentViewEntryOrigin, EnterAgentViewError};
+use super::block::DirectoryContext;
+use super::{ConversationSelectionEvent, ConversationSelectionHandle};
+use crate::ai::agent::conversation::{
+    AIConversation, AIConversationAutoexecuteMode, AIConversationId, ConversationStatus,
 };
+use crate::ai::agent::todos::AIAgentTodoList;
+use crate::ai::agent::{
+    AIAgentAttachment, AIAgentContext, AnyFileContent, FileContext, ImageContext,
+};
+use crate::ai::block_context::BlockContext;
+use crate::ai::document::ai_document_model::AIDocumentId;
+use crate::ai::llms::{LLMPreferences, LLMPreferencesEvent};
+use crate::ai::outline::RepoOutlines;
+use crate::code_review::github_repo_model::GitHubRepoModel;
+use crate::terminal::TerminalModel;
+use crate::terminal::event::{BlockCompletedEvent, BlockType};
+use crate::terminal::model::block::{BlockId, BlockMetadata};
+use crate::terminal::model::session::Sessions;
+use crate::terminal::model_events::{ModelEvent, ModelEventDispatcher};
+use crate::util::git::{PrInfo, RepositoryInfo};
+use crate::workspaces::user_workspaces::{TeamContextResolver, UserWorkspaces};
 
 /// A non-image file picked via the "attach file" button, stored until query submission.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +48,14 @@ pub struct PendingFile {
 pub enum AttachmentType {
     Image,
     File,
+}
+
+/// Lightweight metadata for rendering a pending attachment without cloning its payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingAttachmentSummary {
+    pub index: usize,
+    pub attachment_type: AttachmentType,
+    pub file_name: String,
 }
 
 /// A pending attachment — either an image (base64 in memory) or a file (path reference).
@@ -81,35 +81,11 @@ impl PendingAttachment {
     }
 }
 
-/// The state the pending query is in.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum PendingQueryState {
-    /// The next query will continue an existing conversation.
-    Existing { conversation_id: AIConversationId },
-    New {
-        /// Autoexecute override for the new conversation to be started.
-        autoexecute_override: AIConversationAutoexecuteMode,
-    },
-}
-
-impl Default for PendingQueryState {
-    fn default() -> Self {
-        Self::New {
-            autoexecute_override: AIConversationAutoexecuteMode::default(),
-        }
-    }
-}
-
-impl PendingQueryState {
-    pub fn targets_existing_conversation(&self) -> bool {
-        matches!(self, PendingQueryState::Existing { .. })
-    }
-}
-
 /// Model responsible for keeping track of session context to be attached to the next AI query.
 pub struct BlocklistAIContextModel {
     terminal_model: Arc<FairMutex<TerminalModel>>,
     directory_context: DirectoryContext,
+    github_repo_model: Option<WeakModelHandle<GitHubRepoModel>>,
 
     /// `BlockId`s corresponding to blocks to be included as context with the next AI query.
     pending_context_block_ids: HashSet<BlockId>,
@@ -123,32 +99,21 @@ pub struct BlocklistAIContextModel {
     /// Storage for diff hunk attachments that can be referenced in queries
     pending_inline_diff_hunk_attachments: HashMap<String, AIAgentAttachment>,
 
-    /// The pending query could be new, which means it starts a new conversation, or follow-up, which means
-    /// it continues the selected conversation.
-    ///
-    /// Note that this is intentionally decoupled from the active conversation in the HistoryModel.
-    /// The active conversation (the one that agent outputs are being streamed to) can be different from the
-    /// conversation we're following up in for the next query.
-    pending_query_state: PendingQueryState,
+    conversation_selection: ConversationSelectionHandle,
 
-    /// The ID of the terminal view this controller is associated with.
-    terminal_view_id: EntityId,
+    /// The ID of the terminal surface this model is associated with.
+    terminal_surface_id: EntityId,
+
+    team_context_resolver: TeamContextResolver,
 
     /// AI document ID to be included as context with the next AI query.
     /// When set, the document content will be attached as plain text context.
     pending_document_id: Option<AIDocumentId>,
 
-    agent_view_controller: ModelHandle<AgentViewController>,
-
     /// Block IDs of user-executed commands to be auto-attached as context.
     /// When `AgentViewBlockContext` is enabled, completed user commands are tracked here
     /// and automatically included as context with the next user query.
     auto_attached_agent_view_user_block_ids: Vec<BlockId>,
-
-    /// When true, submitting a prompt while the agent is responding will queue it
-    /// instead of sending it immediately.
-    /// Persists across exchanges in the same conversation (like fast-forward).
-    queue_next_prompt_enabled: bool,
 }
 
 pub fn block_context_from_terminal_model(
@@ -185,136 +150,114 @@ pub fn block_context_from_terminal_model(
 }
 
 impl BlocklistAIContextModel {
+    /// Creates pending context state for a terminal surface.
     pub fn new(
         sessions: ModelHandle<Sessions>,
         model_event_dispatcher: &ModelHandle<ModelEventDispatcher>,
         terminal_model: Arc<FairMutex<TerminalModel>>,
-        terminal_view_id: EntityId,
-        agent_view_controller: ModelHandle<AgentViewController>,
+        terminal_surface_id: EntityId,
+        team_context_resolver: TeamContextResolver,
+        conversation_selection: ConversationSelectionHandle,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
-        ctx.subscribe_to_model(model_event_dispatcher, move |me, event, ctx| match event {
-            ModelEvent::BlockCompleted(BlockCompletedEvent {
-                block_type: BlockType::User(user_block_completed),
-                block_id,
-                ..
-            }) => {
-                // If AgentViewBlockContext is enabled and we're in agent view, track user-executed
-                // blocks for auto-attachment as context.
-                if FeatureFlag::AgentViewBlockContext.is_enabled()
-                    && me.agent_view_controller.as_ref(ctx).is_fullscreen()
-                    && !user_block_completed.was_part_of_agent_interaction
-                {
-                    me.auto_attached_agent_view_user_block_ids
-                        .push(block_id.clone());
-                }
-
-                // If the block that finished was part of an agent interaction (i.e. LRC finishing),
-                // we should preserve input context.
-                if !FeatureFlag::AgentViewBlockContext.is_enabled()
-                    && !user_block_completed.was_part_of_agent_interaction
-                {
-                    me.reset_context_to_default(ctx);
-                }
-            }
-            ModelEvent::BlockMetadataReceived(block_metadata_received) => {
-                let pwd = block_metadata_received
-                    .block_metadata
-                    .current_working_directory()
-                    .map(|s| PathBuf::from(s.to_owned()));
-                let session_id = block_metadata_received.block_metadata.session_id();
-
-                if let Some(session_id) = session_id {
-                    let active_session = sessions.as_ref(ctx).get(session_id);
-                    if let Some(active_session) = active_session {
-                        me.update_directory_context(
-                            pwd.map(|p| p.to_string_lossy().to_string()),
-                            active_session.home_dir().map(|sq| sq.to_owned()),
-                            ctx,
-                        );
-                    }
-                }
-            }
-            _ => {}
-        });
-
-        ctx.subscribe_to_model(&BlocklistAIHistoryModel::handle(ctx), |me, event, ctx| {
-            if event
-                .terminal_view_id()
-                .is_some_and(|id| id != me.terminal_view_id)
-            {
-                return;
-            }
-
-            match event {
-                BlocklistAIHistoryEvent::ClearedConversationsInTerminalView { .. } => {
-                    me.set_pending_query_state(PendingQueryState::default(), ctx);
-                    if FeatureFlag::AgentView.is_enabled() {
-                        me.agent_view_controller.update(ctx, |controller, ctx| {
-                            controller.exit_agent_view(ctx);
-                        });
-                    }
-                }
-                BlocklistAIHistoryEvent::SplitConversation {
-                    new_conversation_id,
+        ctx.subscribe_to_model(
+            model_event_dispatcher,
+            move |me, _, event, ctx| match event {
+                ModelEvent::BlockCompleted(BlockCompletedEvent {
+                    block_type: BlockType::User(user_block_completed),
+                    block_id,
                     ..
-                } => {
-                    me.set_pending_query_state_for_existing_conversation(
-                        *new_conversation_id,
-                        AgentViewEntryOrigin::AgentRequestedNewConversation,
-                        ctx,
-                    );
+                }) => {
+                    // If AgentViewBlockContext is enabled and we're in agent view, track user-executed
+                    // blocks for auto-attachment as context.
+                    if FeatureFlag::AgentViewBlockContext.is_enabled()
+                        && me
+                            .conversation_selection
+                            .as_ref(ctx)
+                            .is_conversation_fullscreen(ctx)
+                        && !user_block_completed.was_part_of_agent_interaction
+                    {
+                        me.auto_attached_agent_view_user_block_ids
+                            .push(block_id.clone());
+                    }
+
+                    // If the block that finished was part of an agent interaction (i.e. LRC finishing),
+                    // we should preserve input context.
+                    if !FeatureFlag::AgentViewBlockContext.is_enabled()
+                        && !user_block_completed.was_part_of_agent_interaction
+                    {
+                        me.reset_context_to_default(ctx);
+                    }
+                }
+                ModelEvent::BlockMetadataReceived(e) => {
+                    me.apply_block_metadata_directory_context(&e.block_metadata, &sessions, ctx);
+                }
+                ModelEvent::BlockWorkingDirectoryUpdated(e) => {
+                    me.apply_block_metadata_directory_context(&e.block_metadata, &sessions, ctx);
                 }
                 _ => {}
-            }
-        });
+            },
+        );
 
-        ctx.subscribe_to_model(&LLMPreferences::handle(ctx), |me, event, ctx| {
+        ctx.subscribe_to_model(&LLMPreferences::handle(ctx), |me, _, event, ctx| {
             if let LLMPreferencesEvent::UpdatedActiveAgentModeLLM = event {
-                let llm_prefs = LLMPreferences::as_ref(ctx);
-                let vision_supported = llm_prefs.vision_supported(ctx, Some(me.terminal_view_id));
+                let vision_supported = LLMPreferences::as_ref(ctx).vision_supported(
+                    &(me.team_context_resolver)(ctx),
+                    ctx,
+                    Some(me.terminal_surface_id),
+                );
                 if !vision_supported {
                     me.clear_pending_images(ctx);
                 }
             }
         });
 
-        // Clear auto-attached blocks when exiting agent view or switching conversations
-        ctx.subscribe_to_model(&agent_view_controller, |me, event, _ctx| {
-            use super::agent_view::AgentViewControllerEvent;
-            match event {
-                AgentViewControllerEvent::ExitedAgentView { .. }
-                | AgentViewControllerEvent::EnteredAgentView { .. } => {
-                    me.auto_attached_agent_view_user_block_ids.clear();
-                }
-                AgentViewControllerEvent::ExitConfirmed { .. } => {}
+        ctx.subscribe_to_model(&conversation_selection, |me, _, event, ctx| match event {
+            ConversationSelectionEvent::Changed => {
+                ctx.emit(BlocklistAIContextEvent::PendingQueryStateUpdated);
+            }
+            ConversationSelectionEvent::Activated { .. }
+            | ConversationSelectionEvent::Deactivated { .. } => {
+                me.auto_attached_agent_view_user_block_ids.clear();
             }
         });
-
-        // In sandboxed/autonomous mode (SDK mode with --sandboxed flag), automatically set
-        // conversations to RunToCompletion mode so they don't wait for user confirmation.
-        let pending_query_state =
-            if warp_core::execution_mode::AppExecutionMode::as_ref(ctx).is_sandboxed() {
-                PendingQueryState::New {
-                    autoexecute_override: AIConversationAutoexecuteMode::RunToCompletion,
-                }
-            } else {
-                Default::default()
-            };
 
         Self {
             terminal_model,
             directory_context: Default::default(),
+            github_repo_model: None,
             pending_context_block_ids: HashSet::new(),
             pending_context_selected_text: None,
             pending_attachments: Default::default(),
-            pending_query_state,
-            terminal_view_id,
-            agent_view_controller,
+            conversation_selection,
+            terminal_surface_id,
+            team_context_resolver,
             pending_inline_diff_hunk_attachments: Default::default(),
             pending_document_id: None,
             auto_attached_agent_view_user_block_ids: Vec::new(),
-            queue_next_prompt_enabled: false,
+        }
+    }
+
+    /// Test-only constructor that skips production subscriptions and singleton lookups.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn new_for_test(
+        terminal_model: Arc<FairMutex<TerminalModel>>,
+        terminal_surface_id: EntityId,
+        conversation_selection: ConversationSelectionHandle,
+    ) -> Self {
+        Self {
+            terminal_model,
+            directory_context: Default::default(),
+            github_repo_model: None,
+            pending_context_block_ids: HashSet::new(),
+            pending_context_selected_text: None,
+            pending_attachments: Default::default(),
+            conversation_selection,
+            terminal_surface_id,
+            team_context_resolver: UserWorkspaces::teamless_context_resolver_for_test(),
+            pending_inline_diff_hunk_attachments: Default::default(),
+            pending_document_id: None,
+            auto_attached_agent_view_user_block_ids: Vec::new(),
         }
     }
 
@@ -327,6 +270,12 @@ impl BlocklistAIContextModel {
         self.clear_diff_hunk_attachments();
         self.set_pending_document(None, ctx);
         self.auto_attached_agent_view_user_block_ids.clear();
+    }
+
+    /// Returns `true` if the next AI query has any context that should force the input to be
+    /// locked in AI mode (skipping NLD): a pending image or file attachment.
+    pub fn has_locking_attachment(&self) -> bool {
+        !self.pending_attachments.is_empty()
     }
 
     /// Returns the set `BlockId`s corresponding to blocks to be included as context with the next
@@ -343,6 +292,19 @@ impl BlocklistAIContextModel {
     /// Returns all pending attachments (images and files) for the next query.
     pub fn pending_attachments(&self) -> &[PendingAttachment] {
         &self.pending_attachments
+    }
+
+    /// Returns lightweight metadata for all pending attachments.
+    pub fn pending_attachment_summaries(&self) -> Vec<PendingAttachmentSummary> {
+        self.pending_attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| PendingAttachmentSummary {
+                index,
+                attachment_type: attachment.attachment_type(),
+                file_name: attachment.file_name().to_owned(),
+            })
+            .collect()
     }
 
     /// Returns only the pending images for the next query.
@@ -382,7 +344,14 @@ impl BlocklistAIContextModel {
     /// Returns `AIAgentContext` for the blocks to be included in the current AI query.
     /// If `is_user_query` is true, includes blocks, selected text, and images as context.
     /// If false, excludes these user-specific contexts but includes everything else.
-    pub fn pending_context(&self, app: &AppContext, is_user_query: bool) -> Vec<AIAgentContext> {
+    pub fn pending_context(
+        &self,
+        app: &AppContext,
+        is_user_query: bool,
+        current_working_directory_location: Option<&LocalOrRemotePath>,
+    ) -> Vec<AIAgentContext> {
+        // `pwd` is the shell-reported path used for directory context and local indexing.
+        // The location is passed separately because it preserves remote host identity for rules.
         let pwd = self.current_pwd();
         let is_pwd_indexed = if cfg!(feature = "agent_mode_evals") {
             // In evals, we want to disable file outline based search. Full
@@ -395,15 +364,8 @@ impl BlocklistAIContextModel {
                 })
         };
 
-        let project_rules = if let Some(pwd) = pwd.clone().and_then(|path| {
-            PathBuf::from_str(&path)
-                .ok()
-                .and_then(|s| s.canonicalize().ok())
-        }) {
-            ProjectContextModel::as_ref(app).find_applicable_rules(&pwd)
-        } else {
-            None
-        };
+        let project_rules = current_working_directory_location
+            .and_then(|pwd| ProjectContextModel::as_ref(app).find_applicable_rules(pwd));
 
         let mut context = Vec::new();
 
@@ -429,17 +391,25 @@ impl BlocklistAIContextModel {
             });
         }
 
+        // Include repository info from the origin remote URL if available.
+        if let Some(repo_context) = self.repository_context(app) {
+            context.push(repo_context);
+        }
+        if let Some(pull_request_context) = self.pull_request_context(app) {
+            context.push(pull_request_context);
+        }
+
         // Always include project rules if available
         if let Some(rules) = project_rules {
             context.push(AIAgentContext::ProjectRules {
-                root_path: rules.root_path.to_string_lossy().into(),
+                root_path: rules.root_path.display_path(),
                 active_rules: rules
                     .active_rules
                     .into_iter()
                     .map(|rule| {
                         let line_count = rule.content.lines().count();
                         FileContext {
-                            file_name: rule.path.to_string_lossy().into(),
+                            file_name: rule.path.display_path(),
                             content: AnyFileContent::StringContent(rule.content.clone()),
                             line_range: None,
                             last_modified: None,
@@ -464,11 +434,10 @@ impl BlocklistAIContextModel {
             if FeatureFlag::AgentViewBlockContext.is_enabled() {
                 for block_id in &self.auto_attached_agent_view_user_block_ids {
                     // Skip if already in pending_context_block_ids to avoid duplicates
-                    if !self.pending_context_block_ids.contains(block_id) {
-                        if let Some(block_context) = self.transform_block_to_context(block_id, true)
-                        {
-                            context.push(block_context);
-                        }
+                    if !self.pending_context_block_ids.contains(block_id)
+                        && let Some(block_context) = self.transform_block_to_context(block_id, true)
+                    {
+                        context.push(block_context);
                     }
                 }
             }
@@ -476,13 +445,6 @@ impl BlocklistAIContextModel {
             // Add selected text
             if let Some(selected_text) = &self.pending_context_selected_text {
                 context.push(AIAgentContext::SelectedText(selected_text.clone()));
-            }
-
-            // Add images from pending attachments
-            for attachment in &self.pending_attachments {
-                if let PendingAttachment::Image(image) = attachment {
-                    context.push(AIAgentContext::Image(image.clone()));
-                }
             }
         }
 
@@ -512,6 +474,26 @@ impl BlocklistAIContextModel {
         });
     }
 
+    fn apply_block_metadata_directory_context(
+        &mut self,
+        block_metadata: &BlockMetadata,
+        sessions: &ModelHandle<Sessions>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let pwd = block_metadata
+            .current_working_directory()
+            .map(|s| PathBuf::from(s.to_owned()));
+        if let Some(session_id) = block_metadata.session_id()
+            && let Some(active_session) = sessions.as_ref(ctx).get(session_id)
+        {
+            self.update_directory_context(
+                pwd.map(|p| p.to_string_lossy().to_string()),
+                active_session.home_dir().map(|sq| sq.to_owned()),
+                ctx,
+            );
+        }
+    }
+
     /// Set `requires_visual_resync` to `false` only if the pending context was modified as a result
     /// of manual user selections. In such cases, a visual resync won't be required because the
     /// pending context was synchronized to the manual selection.
@@ -530,7 +512,7 @@ impl BlocklistAIContextModel {
                         .block_list()
                         .block_with_id(block_id)
                         .map(|block| {
-                            block.can_be_ai_context(terminal_model.block_list().agent_view_state())
+                            block.can_be_ai_context(terminal_model.block_list().transcript_scope())
                         })
                         .unwrap_or(false)
                 })
@@ -680,10 +662,6 @@ impl BlocklistAIContextModel {
         to_remove
     }
 
-    pub fn pending_query_state(&self) -> &PendingQueryState {
-        &self.pending_query_state
-    }
-
     /// Convenience function to set pending query state to continue an existing conversation by ID.
     pub fn set_pending_query_state_for_existing_conversation(
         &mut self,
@@ -691,14 +669,9 @@ impl BlocklistAIContextModel {
         origin: AgentViewEntryOrigin,
         ctx: &mut ModelContext<Self>,
     ) {
-        self.set_pending_query_state(PendingQueryState::Existing { conversation_id }, ctx);
-        if FeatureFlag::AgentView.is_enabled() {
-            if let Err(e) = self.agent_view_controller.update(ctx, |controller, ctx| {
-                controller.try_enter_agent_view(Some(conversation_id), origin, ctx)
-            }) {
-                log::error!("Failed to enter agent view for existing conversation: {e}");
-            }
-        }
+        self.conversation_selection.update(ctx, |selection, ctx| {
+            selection.select_existing_conversation(conversation_id, origin, ctx);
+        });
     }
 
     /// Sets the pending query state to the defaults for a *new* conversation (i.e. not a
@@ -708,40 +681,20 @@ impl BlocklistAIContextModel {
         origin: AgentViewEntryOrigin,
         ctx: &mut ModelContext<Self>,
     ) {
-        self.set_pending_query_state(PendingQueryState::default(), ctx);
-
-        if FeatureFlag::AgentView.is_enabled() {
-            if let Err(e) = self.agent_view_controller.update(ctx, |controller, ctx| {
-                controller.try_enter_agent_view(None, origin, ctx)
-            }) {
-                log::error!("Failed to enter agent view for new conversation: {e}");
-            }
-        }
+        self.conversation_selection.update(ctx, |selection, ctx| {
+            selection.select_new_conversation(origin, ctx);
+        });
     }
 
-    /// Attempts to enter agent view for a new conversation and returns the conversation ID.
-    /// This should be used when a slash command needs to create a new conversation
-    /// and the AgentView feature flag is enabled.
-    ///
-    /// Returns `Ok(conversation_id)` on success, or `Err` if entry is blocked.
-    pub fn try_enter_agent_view_for_new_conversation(
+    /// Starts and selects a new conversation, entering Agent View when this is a GUI selection.
+    pub(crate) fn try_start_new_conversation(
         &mut self,
         origin: AgentViewEntryOrigin,
         ctx: &mut ModelContext<Self>,
     ) -> Result<AIConversationId, EnterAgentViewError> {
-        let conversation_id = self.agent_view_controller.update(ctx, |controller, ctx| {
-            controller.try_enter_agent_view(None, origin, ctx)
-        })?;
-        self.set_pending_query_state(PendingQueryState::default(), ctx);
-        Ok(conversation_id)
-    }
-
-    /// Sets the value of `pending_query_state`, emitting an event if it changed.
-    fn set_pending_query_state(&mut self, state: PendingQueryState, ctx: &mut ModelContext<Self>) {
-        if self.pending_query_state != state {
-            self.pending_query_state = state;
-            ctx.emit(BlocklistAIContextEvent::PendingQueryStateUpdated);
-        }
+        self.conversation_selection.update(ctx, |selection, ctx| {
+            selection.try_start_new_conversation(origin, ctx)
+        })
     }
 
     /// Returns `true` if a new conversation may be created.
@@ -763,28 +716,15 @@ impl BlocklistAIContextModel {
     /// Returns the conversation ID the pending query is following up for, if any.
     /// None if the pending query should start a new conversation.
     pub fn selected_conversation_id(&self, ctx: &AppContext) -> Option<AIConversationId> {
-        if FeatureFlag::AgentView.is_enabled() {
-            return self
-                .agent_view_controller
-                .as_ref(ctx)
-                .agent_view_state()
-                .active_conversation_id();
-        }
-
-        match self.pending_query_state {
-            PendingQueryState::Existing {
-                conversation_id, ..
-            } => Some(conversation_id),
-            PendingQueryState::New { .. } => None,
-        }
+        self.conversation_selection
+            .as_ref(ctx)
+            .selected_conversation_id(ctx)
     }
 
     pub fn selected_conversation<'a>(&self, ctx: &'a AppContext) -> Option<&'a AIConversation> {
-        self.selected_conversation_id(ctx)
-            .as_ref()
-            .and_then(|conversation_id| {
-                BlocklistAIHistoryModel::as_ref(ctx).conversation(conversation_id)
-            })
+        self.conversation_selection
+            .as_ref(ctx)
+            .selected_conversation(ctx)
     }
 
     pub fn selected_conversation_todolist<'a>(
@@ -807,81 +747,24 @@ impl BlocklistAIContextModel {
         &self,
         ctx: &AppContext,
     ) -> AIConversationAutoexecuteMode {
-        match &self.pending_query_state {
-            PendingQueryState::New {
-                autoexecute_override,
-            } => *autoexecute_override,
-            PendingQueryState::Existing {
-                conversation_id, ..
-            } => BlocklistAIHistoryModel::as_ref(ctx)
-                .conversation(conversation_id)
-                .map(|conversation| conversation.autoexecute_override())
-                .unwrap_or_default(),
-        }
-    }
-
-    pub fn is_queue_next_prompt_enabled(&self) -> bool {
-        self.queue_next_prompt_enabled
-    }
-
-    pub fn toggle_queue_next_prompt(&mut self, ctx: &mut ModelContext<Self>) {
-        self.queue_next_prompt_enabled = !self.queue_next_prompt_enabled;
-        ctx.emit(BlocklistAIContextEvent::QueueNextPromptToggled);
+        self.conversation_selection
+            .as_ref(ctx)
+            .pending_query_autoexecute_override(ctx)
     }
 
     pub fn toggle_pending_query_autoexecute(&mut self, ctx: &mut ModelContext<Self>) {
-        // When AgentView is enabled, the autoexecution toggle should apply to the active agent view
-        // conversation -- even when starting a new conversation, the agent view always has a conversation
-        // ID.
-        if FeatureFlag::AgentView.is_enabled() {
-            if let Some(conversation_id) = self
-                .agent_view_controller
-                .as_ref(ctx)
-                .agent_view_state()
-                .active_conversation_id()
-            {
-                BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                    history.toggle_autoexecute_override(
-                        &conversation_id,
-                        self.terminal_view_id,
-                        ctx,
-                    );
-                });
-            }
-            return;
-        }
-
-        match &mut self.pending_query_state {
-            PendingQueryState::New {
-                autoexecute_override,
-            } => {
-                *autoexecute_override = if *autoexecute_override
-                    == AIConversationAutoexecuteMode::RespectUserSettings
-                {
-                    AIConversationAutoexecuteMode::RunToCompletion
-                } else {
-                    AIConversationAutoexecuteMode::RespectUserSettings
-                };
-                ctx.emit(BlocklistAIContextEvent::PendingQueryStateUpdated);
-            }
-            PendingQueryState::Existing {
-                conversation_id, ..
-            } => {
-                BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                    history.toggle_autoexecute_override(
-                        conversation_id,
-                        self.terminal_view_id,
-                        ctx,
-                    );
-                });
-            }
-        }
+        self.conversation_selection.update(ctx, |selection, ctx| {
+            selection.toggle_pending_query_autoexecute(ctx);
+        });
     }
 
     /// Returns true if the pending query targets an existing conversation
     /// (as opposed to starting a new one).
-    pub fn is_targeting_existing_conversation(&self) -> bool {
-        self.pending_query_state.targets_existing_conversation()
+    pub fn is_targeting_existing_conversation(&self, ctx: &AppContext) -> bool {
+        self.conversation_selection
+            .as_ref(ctx)
+            .selected_conversation_id(ctx)
+            .is_some()
     }
 
     /// Returns the status of the selected conversation for purposes of rendering the input hint
@@ -910,7 +793,7 @@ impl BlocklistAIContextModel {
             .block_list()
             .blocks()
             .iter()
-            .any(|block| block.can_be_ai_context(terminal_model.block_list().agent_view_state()))
+            .any(|block| block.can_be_ai_context(terminal_model.block_list().transcript_scope()))
     }
 
     /// Register a diff hunk attachment that can be referenced in future queries
@@ -961,6 +844,41 @@ impl BlocklistAIContextModel {
         }
     }
 
+    pub fn set_github_repo_model(&mut self, handle: Option<WeakModelHandle<GitHubRepoModel>>) {
+        self.github_repo_model = handle;
+    }
+
+    /// Builds an `AIAgentContext::Repository` from cached git remote metadata, if available.
+    fn repository_context(&self, app: &AppContext) -> Option<AIAgentContext> {
+        let handle = self.github_repo_model.as_ref()?.upgrade(app)?;
+        let repository_info = handle.as_ref(app).repository_info(app)?;
+        Some(Self::repository_context_from_repository_info(
+            repository_info,
+        ))
+    }
+    fn repository_context_from_repository_info(repository_info: &RepositoryInfo) -> AIAgentContext {
+        AIAgentContext::Repository {
+            name: repository_info.name.clone(),
+            owner: repository_info.owner.clone(),
+            host: repository_info.host.clone(),
+        }
+    }
+
+    fn pull_request_context(&self, app: &AppContext) -> Option<AIAgentContext> {
+        let handle = self.github_repo_model.as_ref()?.upgrade(app)?;
+        let pr_info = handle.as_ref(app).pr_info(app)?;
+        Self::pull_request_context_from_pr_info(pr_info)
+    }
+    fn pull_request_context_from_pr_info(pr_info: &PrInfo) -> Option<AIAgentContext> {
+        Some(AIAgentContext::PullRequest {
+            number: i32::try_from(pr_info.number).ok()?,
+            state: pr_info.state.clone(),
+            draft: pr_info.draft,
+            base_branch: pr_info.base_branch.clone(),
+            url: pr_info.url.clone(),
+        })
+    }
+
     /// Clears all pending attachments.
     pub fn clear_pending_attachments(&mut self, ctx: &mut ModelContext<Self>) {
         if !self.pending_attachments.is_empty() {
@@ -971,6 +889,23 @@ impl BlocklistAIContextModel {
             });
         }
         self.pending_attachments.clear();
+    }
+
+    /// Drains all pending attachments, returning them, and emits the same update event as
+    /// [`Self::clear_pending_attachments`] so the input's attachment chips disappear. Used to
+    /// move staged attachments onto a queued prompt row at enqueue time.
+    pub fn take_pending_attachments(
+        &mut self,
+        ctx: &mut ModelContext<Self>,
+    ) -> Vec<PendingAttachment> {
+        if !self.pending_attachments.is_empty() {
+            ctx.emit(BlocklistAIContextEvent::UpdatedPendingContext {
+                previous_block_ids: self.pending_context_block_ids.clone(),
+                requires_block_resync: false,
+                requires_text_resync: false,
+            });
+        }
+        std::mem::take(&mut self.pending_attachments)
     }
 }
 
@@ -985,9 +920,12 @@ pub enum BlocklistAIContextEvent {
     },
     /// Emitted whenever the value changes.
     PendingQueryStateUpdated,
-    QueueNextPromptToggled,
 }
 
 impl Entity for BlocklistAIContextModel {
     type Event = BlocklistAIContextEvent;
 }
+
+#[cfg(test)]
+#[path = "context_model_tests.rs"]
+mod tests;

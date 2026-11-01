@@ -6,6 +6,78 @@ mod snapshot;
 #[cfg(feature = "voice_input")]
 mod voice;
 
+use core::f32;
+use std::borrow::Cow;
+use std::cmp::{self, Ordering};
+use std::collections::HashMap;
+use std::fmt;
+use std::ops::Range;
+use std::path::Path;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use async_fs;
+use base64::Engine as _;
+use base64::engine::general_purpose;
+use element::CommandXRayMouseStateHandle;
+use figma_utils::is_figma_png;
+use itertools::{Either, Itertools};
+use mime_guess::from_path;
+use model::{
+    Anchor, AnchorBias, Bias, DisplayMap, DrawableSelection, EditorModel, EditorModelEvent, Edits,
+    LocalPendingSelection, LocalSelection, MarkedTextState, MovementResult, SelectionMode,
+    SubwordBoundaries, ToBufferOffset, ToCharOffset, ToDisplayPoint, ToPoint,
+};
+use num_traits::SaturatingSub;
+use parking_lot::Mutex;
+use pathfinder_color::ColorU;
+use pathfinder_geometry::vector::Vector2F;
+use settings::Setting as _;
+use snapshot::{EditorHeightShrinkDelay, ViewSnapshot};
+use string_offset::{ByteOffset, CharOffset};
+use vec1::{Vec1, vec1};
+use vim::vim::{
+    BracketChar, CharacterMotion, Direction, FindCharMotion, FirstNonWhitespaceMotion,
+    InsertPosition, LineMotion, ModeTransition, MotionType, TextObjectInclusion, TextObjectType,
+    VimHandler, VimMode, VimModel, VimMotion, VimOperand, VimOperator, VimState, VimSubscriber,
+    VimTextObject, WordBound, WordMotion, WordType,
+};
+use vim::{
+    vim_a_block, vim_a_paragraph, vim_a_quote, vim_a_word, vim_all_lines, vim_inner_block,
+    vim_inner_line, vim_inner_paragraph, vim_inner_quote, vim_inner_word,
+    vim_word_iterator_from_offset,
+};
+use warp_completer::completer::Description;
+use warp_core::semantic_selection::SemanticSelection;
+use warp_core::{safe_error, send_telemetry_from_ctx};
+use warp_editor::editor::NavigationKey;
+use warp_util::path::ShellFamily;
+use warp_util::user_input::UserInput;
+use warpui::accessibility::{AccessibilityContent, ActionAccessibilityContent, WarpA11yRole};
+use warpui::actions::StandardAction;
+use warpui::r#async::{SpawnedFutureHandle, Timer};
+use warpui::clipboard::ClipboardContent;
+use warpui::elements::{
+    ChildView, Container, CornerRadius, CrossAxisAlignment, DEFAULT_UI_LINE_HEIGHT_RATIO, Flex,
+    Hoverable, MainAxisSize, MouseStateHandle, ParentElement, Radius, Shrinkable,
+};
+use warpui::fonts::{Cache as FontCache, FamilyId, Properties, Weight};
+use warpui::keymap::{EditableBinding, FixedBinding, Keystroke, PerPlatformKeystroke};
+use warpui::platform::keyboard::KeyCode;
+use warpui::platform::{Cursor, FilePickerConfiguration, OperatingSystem};
+use warpui::text::TextBuffer;
+use warpui::text::word_boundaries::WordBoundariesPolicy;
+use warpui::text_layout::TextStyle;
+use warpui::ui_components::button::ButtonTooltipPosition;
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
+use warpui::windowing::WindowManager;
+use warpui::{
+    AppContext, BlurContext, CursorInfo, Element, Entity, EntityId, FocusContext, ModelAsRef,
+    ModelContext, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
+    WindowId, elements, windowing,
+};
 /// The editor interfaces that we publicly expose to consumers.
 /// This should be a very limited set; if you need to add something here,
 /// you should carefully consider if it leaks the internal details of the editor.
@@ -19,126 +91,47 @@ pub use {
 };
 
 use self::model::{LocalSelections, Selection, UpdateBufferOption};
-use super::soft_wrap::{ClampDirection, DisplayPointAndClampDirection};
 use super::Point;
-#[cfg(feature = "voice_input")]
-use crate::view_components::FeaturePopup;
-use base64::{engine::general_purpose, Engine as _};
-use element::CommandXRayMouseStateHandle;
-use figma_utils::is_figma_png;
-use itertools::{Either, Itertools};
-use mime_guess::from_path;
-use model::{
-    Anchor, AnchorBias, Bias, DisplayMap, DrawableSelection, LocalPendingSelection, LocalSelection,
-    MarkedTextState, MovementResult, SelectionMode, SubwordBoundaries, ToBufferOffset,
-    ToCharOffset, ToDisplayPoint, ToPoint,
-};
-use model::{EditorModel, EditorModelEvent, Edits};
-use pathfinder_color::ColorU;
-use settings::Setting as _;
-use snapshot::{EditorHeightShrinkDelay, ViewSnapshot};
-use vec1::{vec1, Vec1};
-use warp_core::{safe_error, send_telemetry_from_ctx};
-use warp_util::{path::ShellFamily, user_input::UserInput};
-use warpui::platform::keyboard::KeyCode;
-use warpui::ui_components::button::ButtonTooltipPosition;
-use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
-use warpui::{elements, ViewHandle};
-
+use super::soft_wrap::{ClampDirection, DisplayPointAndClampDirection};
+use crate::BlocklistAIHistoryModel;
 use crate::ai::agent::ImageContext;
-use crate::ai::blocklist::{BlocklistAIContextModel, PendingAttachment, PendingFile};
+use crate::ai::blocklist::{BlocklistAIContextModel, InputType, PendingAttachment, PendingFile};
 use crate::ai::predict::next_command_model::{NextCommandModel, NextCommandSuggestionState};
 use crate::appearance::Appearance;
 use crate::channel::{Channel, ChannelState};
+use crate::editor::RangeExt;
 use crate::editor::accept_autosuggestion_keybinding_view::AcceptAutosuggestionKeybinding;
 use crate::editor::autosuggestion_ignore_view::{AutosuggestionIgnore, AutosuggestionIgnoreEvent};
+use crate::features::FeatureFlag;
 use crate::search::ai_context_menu::mixer::AIContextMenuSearchableAction;
 use crate::search::ai_context_menu::view::{
     AIContextMenu, AIContextMenuCategory, AIContextMenuEvent,
 };
 use crate::server::telemetry::TelemetryEvent;
-use crate::settings_view::flags;
-use crate::suggestions::ignored_suggestions_model::{IgnoredSuggestionsModel, SuggestionType};
-use crate::ui_components::buttons::icon_button;
-use crate::ui_components::icons;
-use crate::view_components::DismissibleToast;
-use crate::vim_registers::{RegisterContent, VimRegisters};
-use crate::workspace::ToastStack;
-use crate::{ai::blocklist::InputType, settings::AISettings};
-
-use crate::editor::RangeExt;
-use crate::features::FeatureFlag;
 #[cfg(feature = "voice_input")]
 use crate::settings::AISettingsChangedEvent;
-use crate::settings::{AppEditorSettings, CursorBlink};
 use crate::settings::{
-    AppEditorSettingsChangedEvent, CursorDisplayType, InputSettings, SelectionSettings,
+    AISettings, AppEditorSettings, AppEditorSettingsChangedEvent, CursorBlink, CursorDisplayType,
+    InputSettings, SelectionSettings,
 };
+use crate::settings_view::flags;
+use crate::suggestions::ignored_suggestions_model::{IgnoredSuggestionsModel, SuggestionType};
 use crate::terminal::grid_size_util::grid_cell_dimensions;
 use crate::terminal::model::block::BlockId;
 use crate::themes::theme::Fill;
 use crate::ui_components::avatar::{Avatar, AvatarContent};
-use crate::util::bindings::{cmd_or_ctrl_shift, keybinding_name_to_keystroke, CustomAction};
+use crate::ui_components::buttons::icon_button;
+use crate::ui_components::icons;
+use crate::util::bindings::{CustomAction, cmd_or_ctrl_shift, keybinding_name_to_keystroke};
 use crate::util::clipboard::clipboard_content_with_escaped_paths;
 use crate::util::color::{ContrastingColor, MinimumAllowedContrast};
-use crate::util::image::{resize_image, MAX_IMAGE_COUNT_FOR_QUERY, MAX_IMAGE_SIZE_BYTES};
+use crate::util::image::{MAX_IMAGE_COUNT_FOR_QUERY, MAX_IMAGE_SIZE_BYTES, resize_image};
 use crate::util::merge_ranges;
-use crate::{workspace::Workspace, BlocklistAIHistoryModel};
-use anyhow::Result;
-use core::f32;
-use std::path::Path;
-use vim::vim::{
-    BracketChar, CharacterMotion, Direction, FindCharMotion, FirstNonWhitespaceMotion,
-    InsertPosition, LineMotion, ModeTransition, MotionType, TextObjectInclusion, TextObjectType,
-    VimHandler, VimMode, VimModel, VimMotion, VimOperand, VimOperator, VimState, VimSubscriber,
-    VimTextObject, WordBound, WordMotion, WordType,
-};
-use vim::{
-    vim_a_block, vim_a_paragraph, vim_a_quote, vim_a_word, vim_inner_block, vim_inner_paragraph,
-    vim_inner_quote, vim_inner_word, vim_word_iterator_from_offset,
-};
-use warp_core::semantic_selection::SemanticSelection;
-
-use num_traits::SaturatingSub;
-use parking_lot::Mutex;
-use pathfinder_geometry::vector::Vector2F;
-
-use async_fs;
-use std::collections::HashMap;
-use std::{borrow::Cow, rc::Rc};
-use std::{
-    cmp::{self, Ordering},
-    fmt,
-    ops::Range,
-    sync::Arc,
-    time::Duration,
-};
-use string_offset::{ByteOffset, CharOffset};
-use warp_completer::completer::Description;
-use warp_editor::editor::NavigationKey;
-use warpui::actions::StandardAction;
-use warpui::clipboard::ClipboardContent;
-use warpui::elements::{
-    ChildView, Container, CornerRadius, CrossAxisAlignment, Flex, Hoverable, MainAxisSize,
-    ParentElement, Shrinkable, DEFAULT_UI_LINE_HEIGHT_RATIO,
-};
-use warpui::elements::{MouseStateHandle, Radius};
-use warpui::fonts::{FamilyId, Properties, Weight};
-use warpui::keymap::{Keystroke, PerPlatformKeystroke};
-use warpui::platform::{Cursor, FilePickerConfiguration, OperatingSystem};
-use warpui::r#async::{SpawnedFutureHandle, Timer};
-use warpui::text::word_boundaries::WordBoundariesPolicy;
-use warpui::text::TextBuffer;
-use warpui::text_layout::TextStyle;
-use warpui::windowing::WindowManager;
-use warpui::{
-    accessibility::{AccessibilityContent, ActionAccessibilityContent, WarpA11yRole},
-    fonts::Cache as FontCache,
-    keymap::{EditableBinding, FixedBinding},
-    AppContext, Element, Entity, ModelAsRef, ModelHandle, View, ViewContext, WindowId,
-};
-use warpui::{windowing, BlurContext, EntityId, FocusContext};
-use warpui::{CursorInfo, ModelContext, SingletonEntity, TypedActionView};
+use crate::view_components::DismissibleToast;
+#[cfg(feature = "voice_input")]
+use crate::view_components::FeaturePopup;
+use crate::vim_registers::{RegisterContent, VimRegisters};
+use crate::workspace::{ToastStack, Workspace};
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_TAB_SIZE: usize = 4;
@@ -302,16 +295,12 @@ pub fn init(ctx: &mut AppContext) {
             EditorAction::Right,
             id!("EditorView") & !id!("IMEOpen"),
         ),
-        FixedBinding::new(
-            "home",
-            EditorAction::Home,
-            id!("EditorView") & !id!("IMEOpen"),
-        ),
-        FixedBinding::new(
-            "end",
-            EditorAction::End,
-            id!("EditorView") & !id!("IMEOpen"),
-        ),
+        // NOTE: physical `home`/`end` keys are bound via the editable
+        // `editor_view:home`/`editor_view:end` bindings below (linux/windows
+        // map them to the visual-line action; macOS maps them to document
+        // start/end). We intentionally do not register cross-platform
+        // `home`/`end` FixedBindings here, as they would conflict with the
+        // macOS document-navigation bindings.
         FixedBinding::new(
             "shift-up",
             EditorAction::SelectUp,
@@ -371,12 +360,16 @@ pub fn init(ctx: &mut AppContext) {
         FixedBinding::new(
             "pageup",
             EditorAction::PageUp,
-            id!("EditorView") & !id!("IMEOpen"),
+            id!("EditorView")
+                & !id!("IMEOpen")
+                & !id!(flags::TERMINAL_INPUT_PAGE_KEYS_HANDLED_BY_INPUT),
         ),
         FixedBinding::new(
             "pagedown",
             EditorAction::PageDown,
-            id!("EditorView") & !id!("IMEOpen"),
+            id!("EditorView")
+                & !id!("IMEOpen")
+                & !id!(flags::TERMINAL_INPUT_PAGE_KEYS_HANDLED_BY_INPUT),
         ),
         // Some editable bindings currently have more than 1 action.
         // Below's the list of those.
@@ -656,11 +649,15 @@ pub fn init(ctx: &mut AppContext) {
         .with_mac_key_binding("ctrl-e"),
         // Match the behavior of both VSCode and Intellij by using `cmd-left/right` on Mac and
         // `home/end` on Windows and Linux. See https://www.jetbrains.com/help/idea/reference-keymap-win-default.html#caret_navigation.
-        EditableBinding::new("editor_view:home", "Home", EditorAction::Home)
-            .with_context_predicate(id!("EditorView") & !id!("IMEOpen"))
-            .with_mac_key_binding("cmd-left")
-            .with_linux_or_windows_key_binding("home"),
-        EditableBinding::new("editor_view:end", "End", EditorAction::End)
+        EditableBinding::new(
+            "editor_view:home",
+            "Home",
+            EditorAction::MoveToVisualLineStart,
+        )
+        .with_context_predicate(id!("EditorView") & !id!("IMEOpen"))
+        .with_mac_key_binding("cmd-left")
+        .with_linux_or_windows_key_binding("home"),
+        EditableBinding::new("editor_view:end", "End", EditorAction::MoveToVisualLineEnd)
             .with_context_predicate(id!("EditorView") & !id!("IMEOpen"))
             .with_mac_key_binding("cmd-right")
             .with_linux_or_windows_key_binding("end"),
@@ -740,6 +737,24 @@ pub fn init(ctx: &mut AppContext) {
         )
         .with_context_predicate(id!("EditorView") & !id!("IMEOpen"))
         .with_key_binding("meta-shift->"),
+        // On macOS, the physical Home/End keys jump to the start/end of the
+        // document (matching the macOS convention), distinct from `cmd-left`/
+        // `cmd-right` which move to the visual-line start/end. On Linux/Windows
+        // the Home/End keys remain bound to the visual-line action above.
+        EditableBinding::new(
+            "editor_view:move_to_buffer_start",
+            "Move to the start of the buffer",
+            EditorAction::MoveToBufferStart,
+        )
+        .with_context_predicate(id!("EditorView") & !id!("IMEOpen"))
+        .with_mac_key_binding("home"),
+        EditableBinding::new(
+            "editor_view:move_to_buffer_end",
+            "Move to the end of the buffer",
+            EditorAction::MoveToBufferEnd,
+        )
+        .with_context_predicate(id!("EditorView") & !id!("IMEOpen"))
+        .with_mac_key_binding("end"),
         // Buffer modifications
         EditableBinding::new(
             "editor_view:backspace",
@@ -1019,8 +1034,8 @@ pub enum EditorAction {
     Down,
     Left,
     Right,
-    Home,
-    End,
+    MoveToVisualLineStart,
+    MoveToVisualLineEnd,
     PageUp,
     PageDown,
     CmdUp,
@@ -1182,7 +1197,7 @@ impl NewCursorDirection {
                     }
                 }
                 Err(err) => {
-                    log::error!("Error calling map#up {err:?}");
+                    report_error!(err.context("Error calling map#up"));
                     None
                 }
             },
@@ -1195,7 +1210,7 @@ impl NewCursorDirection {
                     }
                 }
                 Err(err) => {
-                    log::error!("Error calling map#down {err:?}");
+                    report_error!(err.context("Error calling map#down"));
                     None
                 }
             },
@@ -1397,6 +1412,8 @@ pub enum BaselinePositionComputationMethod {
 }
 
 // Re-export voice transcription types for backwards compatibility
+use warp_errors::report_error;
+
 pub use crate::voice::transcriber::{Transcriber, VoiceTranscriber};
 
 /// Similar to [`ImageContext`], but contains un-processed and un-resized image data.
@@ -2188,9 +2205,45 @@ impl VimHandler for EditorView {
         });
     }
 
-    fn replace_char(&mut self, c: char, char_count: u32, ctx: &mut ViewContext<Self>) {
-        if char_count <= self.distance_to_line_end(ctx) {
+    fn replace_char(
+        &mut self,
+        c: char,
+        char_count: u32,
+        advance: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if advance {
+            if self.distance_to_line_end(ctx) > 0 {
+                self.replace_characters(c, 1, ctx);
+                self.move_right(true, ctx);
+            } else {
+                self.user_insert(&c.to_string(), ctx);
+            }
+        } else if char_count <= self.distance_to_line_end(ctx) {
             self.replace_characters(c, char_count, ctx);
+        }
+    }
+
+    fn replace_text(
+        &mut self,
+        text: &str,
+        count: u32,
+        already_applied: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let repeat_count = count.saturating_sub(u32::from(already_applied));
+        for _ in 0..repeat_count {
+            for c in text.chars() {
+                if self.distance_to_line_end(ctx) > 0 {
+                    self.replace_characters(c, 1, ctx);
+                    self.move_right(true, ctx);
+                } else {
+                    self.user_insert(&c.to_string(), ctx);
+                }
+            }
+        }
+        if !text.is_empty() {
+            self.move_left(true, ctx);
         }
     }
 
@@ -2261,7 +2314,7 @@ impl VimHandler for EditorView {
                                 );
 
                                 if *motion_type == MotionType::Linewise {
-                                    let include_newline = *operator != VimOperator::Change;
+                                    let include_newline = operator.includes_trailing_newline();
                                     editor_model.extend_selection_linewise(include_newline, ctx);
                                 }
                             }
@@ -2269,7 +2322,7 @@ impl VimHandler for EditorView {
                                 editor_model
                                     .move_to_buffer_end(/* keep_selection */ true, ctx);
                                 if *motion_type == MotionType::Linewise {
-                                    let include_newline = *operator != VimOperator::Change;
+                                    let include_newline = operator.includes_trailing_newline();
                                     editor_model.extend_selection_linewise(include_newline, ctx);
                                 }
                             }
@@ -2281,17 +2334,27 @@ impl VimHandler for EditorView {
                                 editor_model.change_selections(new_selections, ctx);
 
                                 if *motion_type == MotionType::Linewise {
-                                    let include_newline = *operator != VimOperator::Change;
+                                    let include_newline = operator.includes_trailing_newline();
                                     editor_model.extend_selection_linewise(include_newline, ctx);
                                 }
                             }
-                            VimMotion::JumpToLine(_line_number) => {
-                                // Jumping to line number not supported
+                            VimMotion::JumpToLine(line_number) => {
+                                let max_row = editor_model.buffer(ctx).max_point().row;
+                                let row = (*line_number).saturating_sub(1).min(max_row);
+                                editor_model.move_cursor(
+                                    /* keep_selection */ true,
+                                    move |_, _| Point::new(row, 0),
+                                    ctx,
+                                );
+                                if *motion_type == MotionType::Linewise {
+                                    let include_newline = operator.includes_trailing_newline();
+                                    editor_model.extend_selection_linewise(include_newline, ctx);
+                                }
                             }
                         }
                     }
                     VimOperand::Line => {
-                        let include_newline = *operator != VimOperator::Change;
+                        let include_newline = operator.includes_trailing_newline();
                         editor_model.extend_selection_below(operand_count.saturating_sub(1), ctx);
                         editor_model.extend_selection_linewise(include_newline, ctx);
                     }
@@ -2306,13 +2369,7 @@ impl VimHandler for EditorView {
 
         let motion_type = match operand {
             VimOperand::Motion { motion_type, .. } => *motion_type,
-            VimOperand::TextObject(text_object) => match text_object {
-                VimTextObject {
-                    object_type: TextObjectType::Paragraph,
-                    ..
-                } => MotionType::Linewise,
-                _ => MotionType::Charwise,
-            },
+            VimOperand::TextObject(text_object) => text_object.motion_type(),
             VimOperand::Line => MotionType::Linewise,
         };
 
@@ -2382,6 +2439,7 @@ impl VimHandler for EditorView {
             VimOperator::ToggleComment => {
                 // Commenting is not enabled for the EditorView.
             }
+            VimOperator::Indent | VimOperator::Dedent => {}
         }
     }
 
@@ -2450,8 +2508,13 @@ impl VimHandler for EditorView {
         });
     }
 
-    fn jump_to_line(&mut self, _line_number: u32, _ctx: &mut ViewContext<Self>) {
-        // Jumping to line number not supported
+    fn jump_to_line(&mut self, line_number: u32, ctx: &mut ViewContext<Self>) {
+        self.change_selections(ctx, |editor_model, ctx| {
+            let max_row = editor_model.buffer(ctx).max_point().row;
+            let row = line_number.saturating_sub(1).min(max_row);
+            let point = Point::new(row, 0);
+            editor_model.reset_selections_to_point(&point, ctx);
+        });
     }
 
     fn jump_to_matching_bracket(&mut self, ctx: &mut ViewContext<Self>) {
@@ -2658,7 +2721,7 @@ impl VimHandler for EditorView {
     ) {
         let selection_change =
             |editor_model: &mut EditorModel, ctx: &mut ModelContext<EditorModel>| {
-                let include_newline = *operator != VimOperator::Change;
+                let include_newline = operator.includes_trailing_newline();
                 editor_model.vim_visual_selection_range(motion_type, include_newline, ctx);
             };
         match operator {
@@ -2718,6 +2781,7 @@ impl VimHandler for EditorView {
             VimOperator::ToggleComment => {
                 // Commenting is not enabled for the EditorView.
             }
+            VimOperator::Indent | VimOperator::Dedent => {}
         }
     }
 
@@ -2802,6 +2866,10 @@ impl VimHandler for EditorView {
                     (TextObjectType::Paragraph, TextObjectInclusion::Inner) => {
                         vim_inner_paragraph(buffer, offset).map(|range| range.start..range.end + 1)
                     }
+                    (TextObjectType::Line, TextObjectInclusion::Around) => vim_all_lines(buffer),
+                    (TextObjectType::Line, TextObjectInclusion::Inner) => {
+                        vim_inner_line(buffer, offset)
+                    }
                     (TextObjectType::Quote(quote_type), TextObjectInclusion::Around) => {
                         vim_a_quote(buffer, offset, *quote_type)
                     }
@@ -2824,8 +2892,11 @@ impl VimHandler for EditorView {
                 let Ok(mut end_point) = buffer.point_for_offset(end) else {
                     continue;
                 };
-                // Cursor always snaps to column 0 on paragraph text objects.
-                if let TextObjectType::Paragraph = text_object.object_type {
+                if matches!(
+                    (&text_object.object_type, text_object.inclusion),
+                    (TextObjectType::Paragraph, _)
+                        | (TextObjectType::Line, TextObjectInclusion::Around)
+                ) {
                     end_point.column = 0;
                 }
                 let Ok(new_head) = buffer.anchor_at(end_point, AnchorBias::Left) else {
@@ -3239,6 +3310,23 @@ impl EditorView {
         ctx.emit(Event::BufferReinitialized);
     }
 
+    /// Exits the ephemeral loading state created by `set_buffer_text_ignoring_undo`
+    /// without touching the CRDT buffer or emitting any `UpdatePeers` operations.
+    /// The editor switches back to displaying the regular collaborative buffer.
+    pub fn exit_ephemeral_loading_state(&mut self, ctx: &mut ViewContext<Self>) {
+        self.editor_model.update(ctx, |model, ctx| {
+            model.exit_ephemeral_loading_state(ctx);
+        });
+    }
+
+    /// Shows an empty display-only ephemeral overlay for immediate visual feedback.
+    /// See [`EditorModel::show_display_only_empty_buffer`] for the full contract.
+    pub fn show_display_only_empty_buffer(&mut self, ctx: &mut ViewContext<Self>) {
+        self.editor_model.update(ctx, |model, ctx| {
+            model.show_display_only_empty_buffer(ctx);
+        });
+    }
+
     pub fn register_remote_peer(
         &mut self,
         replica_id: ReplicaId,
@@ -3613,6 +3701,16 @@ impl EditorView {
         self.autogrow = autogrow;
     }
 
+    /// Replaces the editor's enter-key settings at runtime (effective next keystroke).
+    pub fn set_enter_settings(&mut self, settings: EnterSettings) {
+        self.enter_settings = settings;
+    }
+
+    /// Returns the current enter-key settings (for tests asserting applied settings).
+    pub fn enter_settings(&self) -> EnterSettings {
+        self.enter_settings.clone()
+    }
+
     /// Clears the transient editor-height shrink-delay state.
     ///
     /// The shrink-delay is useful when height briefly drops during autosuggestion churn, but
@@ -3849,7 +3947,7 @@ impl EditorView {
                                             .anchor_before(Point::new(position.row(), end_col))
                                             .expect("Anchor should exist")
                                     }
-                                    Err(_) => log::error!(
+                                    Err(_) => report_error!(
                                         "Update selection is called with invalid position"
                                     ),
                                 }
@@ -3914,7 +4012,7 @@ impl EditorView {
 
                 editor_model.change_selections(new_selections, ctx);
             } else {
-                log::error!("update_selection dispatched with no pending selection");
+                report_error!("update_selection dispatched with no pending selection");
             }
         });
 
@@ -3969,7 +4067,7 @@ impl EditorView {
                 new_selections.insert(ix, pending_selection.selection);
                 editor_model.change_selections(new_selections, ctx);
             } else {
-                log::error!("end_selection dispatched with no pending selection");
+                report_error!("end_selection dispatched with no pending selection");
             }
         });
     }
@@ -4013,7 +4111,7 @@ impl EditorView {
                     );
                 }
                 Err(_) => {
-                    log::error!("select_line is called with invalid position");
+                    report_error!("select_line is called with invalid position");
                 }
             }
         });
@@ -4073,7 +4171,7 @@ impl EditorView {
 
     /// This method is triggered by the initial double-click selection (not a drag). The way the
     /// selection range expands depends on user settings stored in SemanticSelection. Smart-select may
-    /// be enabled, and if not, the word-breaking characters may have been overriden.
+    /// be enabled, and if not, the word-breaking characters may have been overridden.
     pub fn select_word(&mut self, position: &DisplayPoint, ctx: &mut ViewContext<Self>) {
         let position = *position;
 
@@ -4236,7 +4334,7 @@ impl EditorView {
             .first_selection(ctx)
             .head()
             .to_byte_offset(buffer)
-            .expect("Selection must be convertable to byte offset")
+            .expect("Selection must be convertible to byte offset")
     }
 
     /// Finds the start byte of the token under the given point (the offset at
@@ -4343,14 +4441,13 @@ impl EditorView {
                 .is_some_and(|ai_block| {
                     let block = ai_block.as_ref(ctx);
                     // Ctrl+c should dismiss the passive ai block only if the keybindings for the block are not hidden.
-                    let is_pending_code_diff = block.find_undismissed_code_diff(ctx).is_some();
-                    let is_pending_suggested_prompt = block
-                        .pending_unit_test_suggestion(ctx)
-                        .is_some_and(|suggested_prompt| {
-                            !suggested_prompt.as_ref(ctx).is_keybindings_hidden()
-                        });
-                    block.is_passive_conversation(ctx)
-                        && (is_pending_code_diff || is_pending_suggested_prompt)
+                    block.is_passive_conversation()
+                        && (block.find_undismissed_code_diff(ctx).is_some()
+                            || block.pending_unit_test_suggestion(ctx).is_some_and(
+                                |suggested_prompt| {
+                                    !suggested_prompt.as_ref(ctx).is_keybindings_hidden()
+                                },
+                            ))
                 })
         });
 
@@ -4799,15 +4896,20 @@ impl EditorView {
                 |editor_model, ctx| {
                     // Convert ByteOffset to CharOffset properly to handle multi-byte characters
                     let buffer = editor_model.buffer(ctx);
-                    match (range.start.to_char_offset(buffer), range.end.to_char_offset(buffer)) {
+                    match (
+                        range.start.to_char_offset(buffer),
+                        range.end.to_char_offset(buffer),
+                    ) {
                         (Ok(start_char), Ok(end_char)) => {
                             let char_range = start_char..end_char;
                             if let Err(error) = editor_model.buffer_edit([char_range], "", ctx) {
-                                log::error!("error performing system delete: {error}");
+                                report_error!(error.context("error performing system delete"));
                             }
                         }
                         (Err(error), _) | (_, Err(error)) => {
-                            log::error!("error converting byte offset to char offset for system delete: {error}");
+                            report_error!(error.context(
+                                "error converting byte offset to char offset for system delete"
+                            ));
                         }
                     }
                 },
@@ -5706,7 +5808,13 @@ impl EditorView {
         });
     }
 
-    pub fn cursor_home(&mut self, ctx: &mut ViewContext<Self>) {
+    /// Moves each cursor to the start of the current visual (soft-wrapped) row,
+    /// toggling between the row's first non-whitespace character and the very
+    /// start of the row (classic "smart home" behavior, applied per visual row).
+    ///
+    /// When the soft-wrap layout has not been laid out yet, this falls back to
+    /// the logical-line start (column 0 / first non-whitespace toggle).
+    pub fn move_to_visual_line_start(&mut self, ctx: &mut ViewContext<Self>) {
         self.change_selections(ctx, |editor_model, ctx| {
             let map = editor_model.display_map(ctx);
             let buffer = editor_model.buffer(ctx);
@@ -5714,25 +5822,39 @@ impl EditorView {
             let mut new_selections = editor_model.selections(ctx).clone();
             for selection in new_selections.iter_mut() {
                 let start = selection.start().to_display_point(map, ctx).unwrap();
-                let string_start = buffer
+                // Resolve the current visual (soft-wrapped) row's start column,
+                // falling back to the logical-line start (column 0) when the
+                // soft-wrap layout hasn't been laid out yet. The same "smart
+                // home" toggle (row start <-> first non-whitespace) then runs in
+                // both cases; when bounds are known we only scan whitespace
+                // within the current visual row.
+                let bounds = map.soft_wrapped_row_bounds(start, selection.clamp_direction);
+                let row_start = bounds.as_ref().map_or(0, |bounds| bounds.start);
+                let whitespace_scan_limit = bounds
+                    .as_ref()
+                    .map(|bounds| (bounds.end - bounds.start) as usize);
+                let chars = buffer
                     .chars_at(
-                        DisplayPoint::new(start.row(), 0)
+                        DisplayPoint::new(start.row(), row_start)
                             .to_buffer_point(map, Bias::Left, ctx)
                             .unwrap(),
                     )
-                    .unwrap()
-                    .take_while(|c| c.is_whitespace())
-                    .count();
-                let cursor_start = {
-                    if string_start == start.column() as usize {
-                        0
-                    } else {
-                        string_start
+                    .unwrap();
+                let leading_whitespace = match whitespace_scan_limit {
+                    Some(limit) => {
+                        chars.take(limit).take_while(|c| c.is_whitespace()).count() as u32
                     }
+                    None => chars.take_while(|c| c.is_whitespace()).count() as u32,
+                };
+                let first_non_whitespace = row_start + leading_whitespace;
+                let cursor_start = if first_non_whitespace == start.column() {
+                    row_start
+                } else {
+                    first_non_whitespace
                 };
                 let cursor = map
                     .anchor_before(
-                        DisplayPoint::new(start.row(), cursor_start as u32),
+                        DisplayPoint::new(start.row(), cursor_start),
                         Bias::Left,
                         ctx,
                     )
@@ -5744,6 +5866,9 @@ impl EditorView {
                 });
                 selection.goal_start_column = None;
                 selection.goal_end_column = None;
+                // The caret now sits at the start of a visual row; clamp downward
+                // so subsequent vertical movement treats it as the row's start.
+                selection.clamp_direction = ClampDirection::Down;
             }
             editor_model.change_selections(new_selections, ctx);
         });
@@ -5950,7 +6075,11 @@ impl EditorView {
         );
     }
 
-    pub fn cursor_end(&mut self, ctx: &mut ViewContext<Self>) {
+    /// Moves each cursor to the end of the current visual (soft-wrapped) row.
+    ///
+    /// When the soft-wrap layout has not been laid out yet, this falls back to
+    /// the logical-line end.
+    pub fn move_to_visual_line_end(&mut self, ctx: &mut ViewContext<Self>) {
         if self.single_cursor_at_autosuggestion_beginning(ctx) {
             self.insert_full_autosuggestion(ctx);
         } else {
@@ -5962,14 +6091,19 @@ impl EditorView {
                         .end()
                         .to_display_point(map, ctx)
                         .expect("Should be able to get end point of selection.");
+                    // Use the end of the current visual (soft-wrapped) row,
+                    // falling back to the logical line end when the soft-wrap
+                    // layout isn't available.
+                    let cursor_column = map
+                        .soft_wrapped_row_bounds(end, selection.clamp_direction)
+                        .map(|bounds| bounds.end)
+                        .unwrap_or_else(|| {
+                            map.line_len(end.row(), ctx)
+                                .expect("Should be able to get length of line at selection end.")
+                        });
                     let cursor = map
                         .anchor_before(
-                            DisplayPoint::new(
-                                end.row(),
-                                map.line_len(end.row(), ctx).expect(
-                                    "Should be able to get length of line at selection end.",
-                                ),
-                            ),
+                            DisplayPoint::new(end.row(), cursor_column),
                             Bias::Right,
                             ctx,
                         )
@@ -5977,6 +6111,9 @@ impl EditorView {
                     selection.set_selection(Selection::single_cursor(cursor));
                     selection.goal_start_column = None;
                     selection.goal_end_column = None;
+                    // The caret now sits at the end of a visual row; clamp upward
+                    // so subsequent vertical movement treats it as the row's end.
+                    selection.clamp_direction = ClampDirection::Up;
                 }
                 editor_model.change_selections(new_selections, ctx);
             });
@@ -6149,7 +6286,10 @@ impl EditorView {
                             "",
                             ctx,
                         ) {
-                            log::error!("error deleting all (direction {direction:?}): {error}");
+                            report_error!(
+                                error.context("error deleting all"),
+                                extra: { "direction" => ?direction }
+                            );
                         };
                     },
                 ),
@@ -6228,7 +6368,7 @@ impl EditorView {
                         "",
                         ctx,
                     ) {
-                        log::error!("error clearing lines: {error}");
+                        report_error!(error.context("error clearing lines"));
                     }
                 },
             ),
@@ -6346,12 +6486,12 @@ impl EditorView {
                         selection
                             .head()
                             .to_point(buffer)
-                            .expect("Selection head must be convertable to a Point")
+                            .expect("Selection head must be convertible to a Point")
                     } else {
                         selection
                             .end()
                             .to_point(buffer)
-                            .expect("Selection end must be convertable to a Point")
+                            .expect("Selection end must be convertible to a Point")
                     };
                     if let Ok(mut boundaries) =
                         buffer.subword_ends_from_offset_exclusive(end_position)
@@ -6361,7 +6501,7 @@ impl EditorView {
                             .anchor_before(
                                 subword_start
                                     .to_display_point(map, ctx)
-                                    .expect("Subword start must be convertable to a DisplayPoint"),
+                                    .expect("Subword start must be convertible to a DisplayPoint"),
                                 Bias::Right,
                                 ctx,
                             )
@@ -6394,12 +6534,12 @@ impl EditorView {
                     selection
                         .head()
                         .to_point(buffer)
-                        .expect("Selection head must be convertable to a Point")
+                        .expect("Selection head must be convertible to a Point")
                 } else {
                     selection
                         .start()
                         .to_point(buffer)
-                        .expect("Selection start must be convertable to a Point")
+                        .expect("Selection start must be convertible to a Point")
                 };
                 if let Ok(mut boundaries) =
                     buffer.subword_backward_starts_from_offset_exclusive(start_position)
@@ -6409,7 +6549,7 @@ impl EditorView {
                         .anchor_before(
                             subword_start
                                 .to_display_point(map, ctx)
-                                .expect("Subword start must be convertable to a DisplayPoint"),
+                                .expect("Subword start must be convertible to a DisplayPoint"),
                             Bias::Left,
                             ctx,
                         )
@@ -6748,7 +6888,7 @@ impl EditorView {
                                 result.point_and_clamp_direction.clamp_direction;
                         }
                         Err(err) => {
-                            log::error!("Failed to call DisplayMap#up {err:?}");
+                            report_error!(err.context("Failed to call DisplayMap#up"));
                         }
                     }
                 }
@@ -6896,7 +7036,9 @@ impl EditorView {
                             selection.clamp_direction =
                                 result.point_and_clamp_direction.clamp_direction;
                         }
-                        Err(err) => log::error!("Failed to call DisplayMap#down {err:?}"),
+                        Err(err) => {
+                            report_error!(err.context("Failed to call DisplayMap#down"))
+                        }
                     }
                 }
                 editor_model.change_selections(new_selections, ctx);
@@ -7530,15 +7672,15 @@ impl EditorView {
     /// TODO: ideally, this wouldn't be treated as a separate 'edit' from the 'edit' that was
     /// produced by the initial user-action.
     fn vim_maybe_enforce_cursor_line_cap(&mut self, ctx: &mut ViewContext<Self>) {
-        if let Some(VimMode::Normal) = self.vim_mode(ctx) {
-            if self.editor_model.as_ref(ctx).vim_needs_line_capping(ctx) {
-                self.edit(
-                    ctx,
-                    Edits::new().with_change_selections(|model, ctx| {
-                        model.vim_enforce_cursor_line_cap(ctx);
-                    }),
-                );
-            }
+        if let Some(VimMode::Normal) = self.vim_mode(ctx)
+            && self.editor_model.as_ref(ctx).vim_needs_line_capping(ctx)
+        {
+            self.edit(
+                ctx,
+                Edits::new().with_change_selections(|model, ctx| {
+                    model.vim_enforce_cursor_line_cap(ctx);
+                }),
+            );
         }
     }
 
@@ -8392,8 +8534,8 @@ impl TypedActionView for EditorView {
             | EditorAction::MoveToBufferEnd
             | EditorAction::Left
             | EditorAction::Right
-            | EditorAction::Home
-            | EditorAction::End
+            | EditorAction::MoveToVisualLineStart
+            | EditorAction::MoveToVisualLineEnd
             | EditorAction::MoveForwardOneWord
             | EditorAction::MoveBackwardOneWord
             | EditorAction::MoveForwardOneSubword
@@ -8462,8 +8604,8 @@ impl TypedActionView for EditorView {
             Down => self.down(ctx),
             Left => self.move_left(/* stop at line start */ false, ctx),
             Right => self.right(ctx),
-            Home => self.cursor_home(ctx),
-            End => self.cursor_end(ctx),
+            MoveToVisualLineStart => self.move_to_visual_line_start(ctx),
+            MoveToVisualLineEnd => self.move_to_visual_line_end(ctx),
             PageUp => self.page_up(ctx),
             PageDown => self.page_down(ctx),
             CmdUp => self.cmd_up(ctx),
@@ -8655,15 +8797,16 @@ impl View for EditorView {
             .with_cursor(Cursor::IBeam)
             .finish();
 
-        if let Some(controls) = self.render_controls(ctx) {
-            let mut row = Flex::row()
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_cross_axis_alignment(CrossAxisAlignment::End);
-            row.add_child(Shrinkable::new(1., hoverable).finish());
-            row.add_child(controls);
-            row.finish()
-        } else {
-            hoverable
+        match self.render_controls(ctx) {
+            Some(controls) => {
+                let mut row = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_cross_axis_alignment(CrossAxisAlignment::End);
+                row.add_child(Shrinkable::new(1., hoverable).finish());
+                row.add_child(controls);
+                row.finish()
+            }
+            _ => hoverable,
         }
     }
 
@@ -8767,5 +8910,5 @@ pub fn position_id_for_first_cursor(editor_view_id: EntityId) -> String {
 }
 
 #[cfg(test)]
-#[path = "mod_test.rs"]
+#[path = "mod_tests.rs"]
 mod tests;

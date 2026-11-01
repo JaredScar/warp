@@ -1,20 +1,19 @@
+use std::collections::HashSet;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use chrono::Utc;
 #[cfg(feature = "local_fs")]
 use repo_metadata::Repository;
-use std::{
-    collections::HashSet,
-    hash::{DefaultHasher, Hash, Hasher},
-    path::{Path, PathBuf},
-    time::Duration,
-};
 #[cfg(feature = "local_fs")]
-use warpui::ModelHandle;
+use warpui_core::ModelHandle;
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "local_fs")] {
         use super::Error as CodebaseIndexError;
         use std::sync::Arc;
-        use warpui::ModelContext;
+        use warpui_core::ModelContext;
         use anyhow::Context;
         use warp_core::safe_info;
         use super::{store_client::StoreClient, CodebaseIndex, EmbeddingConfig};
@@ -33,11 +32,47 @@ const REPO_SNAPSHOT_SHELF_LIFE_DURATION: Duration =
 
 /// Subdirectory inside the app's statedirectory that holds snapshot files.
 const REPO_SNAPSHOT_SUBDIR_NAME: &str = "codebase_index_snapshots";
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotStorage {
+    dir: PathBuf,
+}
+
+impl SnapshotStorage {
+    /// Construct snapshot storage using the app's default secure snapshot directory.
+    pub fn app_default() -> Option<Self> {
+        snapshot_dir().map(|dir| Self { dir })
+    }
+
+    /// Construct snapshot storage rooted at the supplied directory, creating it if needed.
+    pub fn from_dir(dir: PathBuf) -> Option<Self> {
+        if !dir.is_dir() {
+            std::fs::create_dir_all(&dir).ok()?;
+        }
+        Some(Self { dir })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+    #[cfg(feature = "local_fs")]
+    pub(super) fn is_app_default(&self) -> bool {
+        self.dir == default_snapshot_dir_path()
+    }
+
+    pub(super) fn has_snapshot(&self, repo_path: &Path) -> bool {
+        self.snapshot_path(repo_path).is_file()
+    }
+
+    pub(super) fn snapshot_path(&self, repo_path: &Path) -> PathBuf {
+        snapshot_path(&self.dir, repo_path)
+    }
+}
 
 /// Splits a list of codebase indices into invalid and valid indices,
 /// based on their last write date and whether they have a corresponding snapshot file.
 pub(super) fn split_snapshot_metadata_by_validity(
     persisted_codebase_indices: Vec<WorkspaceMetadata>,
+    snapshot_storage: Option<&SnapshotStorage>,
 ) -> (Vec<WorkspaceMetadata>, Vec<WorkspaceMetadata>) {
     let now = Utc::now();
     persisted_codebase_indices
@@ -48,7 +83,8 @@ pub(super) fn split_snapshot_metadata_by_validity(
                 index_metadata.path
             );
             index_metadata.is_expired(now, REPO_SNAPSHOT_SHELF_LIFE_DAYS)
-                || !has_snapshot(&index_metadata.path)
+                || !snapshot_storage
+                    .is_some_and(|storage| storage.has_snapshot(&index_metadata.path))
         })
 }
 
@@ -68,15 +104,15 @@ pub(super) fn clean_up_snapshot_files(
             let path = fs_entry.path();
 
             // Check if this is a regular file with a snapshot_ prefix
-            if let Ok(fs_metadata) = fs_entry.metadata() {
-                if fs_metadata.is_file() {
-                    maybe_clean_up_snapshot_file(
-                        &path,
-                        &fs_metadata,
-                        &fs_now,
-                        &expected_snapshot_filenames,
-                    );
-                }
+            if let Ok(fs_metadata) = fs_entry.metadata()
+                && fs_metadata.is_file()
+            {
+                maybe_clean_up_snapshot_file(
+                    &path,
+                    &fs_metadata,
+                    &fs_now,
+                    &expected_snapshot_filenames,
+                );
             }
         }
     }
@@ -88,30 +124,27 @@ fn maybe_clean_up_snapshot_file(
     fs_now: &std::time::SystemTime,
     expected_snapshot_filenames: &HashSet<PathBuf>,
 ) {
-    if let Some(filename) = path.file_name() {
-        if filename.to_string_lossy().starts_with("snapshot_") {
-            let mut should_remove = false;
+    if let Some(filename) = path.file_name()
+        && filename.to_string_lossy().starts_with("snapshot_")
+    {
+        let mut should_remove = false;
 
-            // Check if file itself is expired
-            if let Ok(modified_time) = fs_metadata.modified() {
-                if let Ok(age) = fs_now.duration_since(modified_time) {
-                    if age >= REPO_SNAPSHOT_SHELF_LIFE_DURATION {
-                        should_remove = true;
-                    }
-                }
-            }
+        // Check if file itself is expired
+        if let Ok(modified_time) = fs_metadata.modified()
+            && let Ok(age) = fs_now.duration_since(modified_time)
+            && age >= REPO_SNAPSHOT_SHELF_LIFE_DURATION
+        {
+            should_remove = true;
+        }
 
-            // Check if file is not in alive_files set
-            if !expected_snapshot_filenames.contains(path) {
-                should_remove = true;
-            }
+        // Check if file is not in alive_files set
+        if !expected_snapshot_filenames.contains(path) {
+            should_remove = true;
+        }
 
-            // Remove file if either condition is true
-            if should_remove {
-                if let Err(e) = std::fs::remove_file(path) {
-                    log::warn!("Failed to remove stale snapshot file {path:?}: {e}");
-                }
-            }
+        // Remove file if either condition is true
+        if should_remove && let Err(e) = std::fs::remove_file(path) {
+            log::warn!("Failed to remove stale snapshot file {path:?}: {e}");
         }
     }
 }
@@ -159,12 +192,7 @@ pub(super) fn read_snapshot(
 }
 
 pub(super) fn has_snapshot(repo_path: &Path) -> bool {
-    let Some(snapshot_dir) = snapshot_dir() else {
-        return false;
-    };
-
-    let snapshot_path = snapshot_path(snapshot_dir.as_path(), repo_path);
-    snapshot_path.is_file()
+    SnapshotStorage::app_default().is_some_and(|storage| storage.has_snapshot(repo_path))
 }
 
 /// Construct a directory to store index snapshots, if it doesn't already exist,
@@ -175,9 +203,7 @@ pub(super) fn snapshot_dir() -> Option<PathBuf> {
 
     #[cfg(feature = "local_fs")]
     {
-        let base_dir =
-            warp_core::paths::secure_state_dir().unwrap_or_else(warp_core::paths::state_dir);
-        let snapshot_dir_path = base_dir.join(REPO_SNAPSHOT_SUBDIR_NAME);
+        let snapshot_dir_path = default_snapshot_dir_path();
 
         if !snapshot_dir_path.is_dir() {
             std::fs::create_dir_all(&snapshot_dir_path).ok()?;
@@ -186,9 +212,15 @@ pub(super) fn snapshot_dir() -> Option<PathBuf> {
     }
 }
 
+#[cfg(feature = "local_fs")]
+fn default_snapshot_dir_path() -> PathBuf {
+    warp_core::paths::secure_state_dir()
+        .unwrap_or_else(warp_core::paths::state_dir)
+        .join(REPO_SNAPSHOT_SUBDIR_NAME)
+}
 /// Constructs a snapshot path given a base directory and the codebase index's root path.
 pub(super) fn snapshot_path(snapshot_dir: &Path, repo_path: &Path) -> PathBuf {
-    // Use a hash the repo_path to create a unique filename
+    // Use a hash of the repo_path to create a unique filename
     let mut hasher = DefaultHasher::new();
     repo_path.hash(&mut hasher);
     let snapshot_file_name = format!("snapshot_{}", hasher.finish());

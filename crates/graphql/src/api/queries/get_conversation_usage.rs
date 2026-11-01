@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::{request_context::RequestContext, scalars::Time, schema};
+use crate::request_context::RequestContext;
+use crate::scalars::Time;
+use crate::schema;
 
 /*
 query GetConversationUsage(
@@ -23,6 +25,9 @@ query GetConversationUsage(
           usageMetadata {
             contextWindowUsage
             creditsSpent
+            platformCreditsSpent
+            totalBilledCostInCents
+            totalPlatformCostInCents
             summarized
             tokenUsage { modelId totalTokens }
             warpTokenUsage { modelId totalTokens tokenUsageByCategory { category tokens } }
@@ -111,7 +116,11 @@ pub struct ConversationUsage {
 #[derive(cynic::QueryFragment, Debug, Clone)]
 pub struct ConversationUsageMetadata {
     pub context_window_usage: f64,
+    pub context_window_segments: Vec<ContextWindowSegment>,
     pub credits_spent: f64,
+    pub platform_credits_spent: f64,
+    pub total_billed_cost_in_cents: Option<f64>,
+    pub total_platform_cost_in_cents: Option<f64>,
     pub summarized: bool,
     pub token_usage: Vec<ModelTokenUsage>,
     pub warp_token_usage: Vec<TokenUsage>,
@@ -119,7 +128,27 @@ pub struct ConversationUsageMetadata {
     pub tool_usage_metadata: ToolUsageMetadata,
 }
 
-fn convert_token_usage(
+#[derive(cynic::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextWindowSegmentType {
+    Unknown,
+    SystemPrompt,
+    ToolDefinitions,
+    ConversationHistory,
+    LatestInput,
+    Images,
+    Other,
+}
+
+#[derive(cynic::QueryFragment, Debug, Clone)]
+pub struct ContextWindowSegment {
+    pub segment_type: ContextWindowSegmentType,
+    pub token_count: i32,
+}
+
+/// Merges warp and byok per-model token usage rows into the persistence-layer
+/// `ModelTokenUsage` shape, preserving per-category breakdowns. Shared by the
+/// usage-history query and the conversation restore path (`crate::ai`).
+pub(crate) fn convert_token_usage(
     warp_token_usage: &[TokenUsage],
     byok_token_usage: &[TokenUsage],
 ) -> Vec<persistence::model::ModelTokenUsage> {
@@ -162,15 +191,59 @@ fn convert_token_usage(
     result
 }
 
+/// Combines the server's cumulative billed inference cents with its platform cents into the
+/// single total the client displays, matching what `ChargedUsageTotals::total_cost_in_cents`
+/// sums from the per-turn wire charges. `None` when the billed inference total is unknown,
+/// since a platform-only figure would understate the conversation's cost.
+pub(crate) fn total_billed_cost_in_cents(
+    billed_inference_cents: Option<f64>,
+    platform_cents: Option<f64>,
+) -> Option<f32> {
+    billed_inference_cents.map(|billed| (billed + platform_cents.unwrap_or_default()) as f32)
+}
+
 impl From<&ConversationUsageMetadata> for persistence::model::ConversationUsageMetadata {
     fn from(gql: &ConversationUsageMetadata) -> Self {
         Self {
             was_summarized: gql.summarized,
             context_window_usage: gql.context_window_usage as f32,
             credits_spent: gql.credits_spent as f32,
+            platform_credits_spent: gql.platform_credits_spent as f32,
+            total_billed_cost_in_cents: total_billed_cost_in_cents(
+                gql.total_billed_cost_in_cents,
+                gql.total_platform_cost_in_cents,
+            ),
             credits_spent_for_last_block: None,
+            // Not yet fetched by this GraphQL query (persisted-history
+            // vertical, milestone 3) -- left `None` rather than fabricated.
+            charged_usage_for_last_block: None,
+            total_charged_usage: None,
             token_usage: convert_token_usage(&gql.warp_token_usage, &gql.byok_token_usage),
             tool_usage_metadata: (&gql.tool_usage_metadata).into(),
+            context_window_segments: gql.context_window_segments.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<ContextWindowSegmentType> for persistence::model::ContextWindowSegmentType {
+    fn from(value: ContextWindowSegmentType) -> Self {
+        match value {
+            ContextWindowSegmentType::Unknown => Self::Unknown,
+            ContextWindowSegmentType::SystemPrompt => Self::SystemPrompt,
+            ContextWindowSegmentType::ToolDefinitions => Self::ToolDefinitions,
+            ContextWindowSegmentType::ConversationHistory => Self::ConversationHistory,
+            ContextWindowSegmentType::LatestInput => Self::LatestInput,
+            ContextWindowSegmentType::Images => Self::Images,
+            ContextWindowSegmentType::Other => Self::Other,
+        }
+    }
+}
+
+impl From<&ContextWindowSegment> for persistence::model::ContextWindowSegment {
+    fn from(gql: &ContextWindowSegment) -> Self {
+        Self {
+            segment_type: gql.segment_type.into(),
+            token_count: u32::try_from(gql.token_count).unwrap_or_default(),
         }
     }
 }

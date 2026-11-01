@@ -1,38 +1,39 @@
-use crate::server::telemetry::ImageProtocol;
-use crate::terminal::model::session::Sessions;
-
-use crate::terminal::event::{
-    AfterBlockCompletedEvent, BlockCompletedEvent, BlockMetadataReceivedEvent, Event,
-    ExecutedExecutorCommandEvent, InitSshEvent, InitSubshellEvent, SourcedRcFileInSubshellEvent,
-    TerminalMode,
-};
-
-use crate::terminal::ClipboardType;
-use async_channel::Receiver;
-use instant::Instant;
 use std::sync::Arc;
 
-use crate::remote_server::manager::RemoteServerManager;
-use warpui::SingletonEntity;
-use warpui::{Entity, ModelContext, ModelHandle};
+use async_channel::Receiver;
+use warpui::{Entity, ModelContext, ModelHandle, SingletonEntity};
 
-use super::event::SshLoginStatus;
-use super::model::ansi::{FinishUpdateValue, WarpificationUnavailableReason};
+use super::event::{BootstrappedEvent, SshLoginStatus};
+use super::model::ansi;
+use super::model::ansi::{ExternalShellWidgetSelectionValue, FinishUpdateValue};
 use super::model::block::BlockId;
 use super::model::completions::ShellCompletion;
-use super::model::terminal_model::{ExitReason, TmuxControlModeContext, TmuxInstallationState};
-use super::model::tmux::commands::TmuxCommand;
-use super::{
-    event::BootstrappedEvent,
-    model::{
-        ansi,
-        session::{IsLegacySSHSession, SessionId, SessionInfo},
-        terminal_model::{CommandType, HandlerEvent},
-    },
-};
+use super::model::lifecycle::LifecycleTelemetryEvent;
+use super::model::session::{IsSSHWrapperSession, SessionId, SessionInfo};
+use super::model::terminal_model::{CommandType, ExitReason, HandlerEvent};
 use crate::features::FeatureFlag;
+use crate::remote_server::manager::RemoteServerManager;
+use crate::server::telemetry::ImageProtocol;
+use crate::terminal::ClipboardType;
+use crate::terminal::event::{
+    AfterBlockCompletedEvent, BlockCompletedEvent, BlockMetadataReceivedEvent,
+    BlockWorkingDirectoryUpdatedEvent, Event, ExecutedExecutorCommandEvent, InitSubshellEvent,
+    ObservedExitStatus, SourcedRcFileInSubshellEvent, TerminalMode,
+};
+use crate::terminal::model::session::Sessions;
 use crate::terminal::shell::ShellType;
-use crate::{send_telemetry_from_ctx, TelemetryEvent};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SshRemoteServerSupport {
+    Enabled,
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    Disabled,
+}
+
+impl SshRemoteServerSupport {
+    fn should_use_remote_server(self, feature_enabled: bool, is_ssh_wrapper_session: bool) -> bool {
+        matches!(self, Self::Enabled) && feature_enabled && is_ssh_wrapper_session
+    }
+}
 
 /// Model that dispatches events that have been emitted by the [`crate::terminal::TerminalModel`],
 /// allowing other models/views to subscribe to `TerminalModel` events like it would any other
@@ -41,12 +42,27 @@ pub struct ModelEventDispatcher {
     last_start_prompt_marker: Option<PromptKind>,
     active_session_id: Option<SessionId>,
     sessions: ModelHandle<Sessions>,
+    ssh_remote_server_support: SshRemoteServerSupport,
 }
 
 impl ModelEventDispatcher {
     pub fn new(
         model_events_rx: Receiver<Event>,
         sessions: ModelHandle<Sessions>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Self {
+        Self::new_with_ssh_remote_server_support(
+            model_events_rx,
+            sessions,
+            SshRemoteServerSupport::Enabled,
+            ctx,
+        )
+    }
+
+    pub(crate) fn new_with_ssh_remote_server_support(
+        model_events_rx: Receiver<Event>,
+        sessions: ModelHandle<Sessions>,
+        ssh_remote_server_support: SshRemoteServerSupport,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
         ctx.spawn_stream_local(
@@ -58,7 +74,14 @@ impl ModelEventDispatcher {
             active_session_id: None,
             last_start_prompt_marker: None,
             sessions,
+            ssh_remote_server_support,
         }
+    }
+    fn should_use_ssh_remote_server(&self, is_ssh_wrapper_session: bool) -> bool {
+        self.ssh_remote_server_support.should_use_remote_server(
+            FeatureFlag::SshRemoteServer.is_enabled(),
+            is_ssh_wrapper_session,
+        )
     }
 
     /// Returns the active session to which the PTY is currently attached.
@@ -85,11 +108,11 @@ impl ModelEventDispatcher {
                 self.sessions.update(ctx, |sessions, ctx| {
                     sessions.register_pending_session(pending_session_info.as_ref(), ctx);
                 });
-                let is_legacy_ssh = matches!(
-                    pending_session_info.is_legacy_ssh_session,
-                    IsLegacySSHSession::Yes { .. }
+                let is_ssh_wrapper_session = matches!(
+                    pending_session_info.is_ssh_wrapper_session,
+                    IsSSHWrapperSession::Yes { .. }
                 );
-                if FeatureFlag::SshRemoteServer.is_enabled() && is_legacy_ssh {
+                if self.should_use_ssh_remote_server(is_ssh_wrapper_session) {
                     ModelEvent::SshInitShell {
                         pending_session_info,
                     }
@@ -178,39 +201,9 @@ impl ModelEventDispatcher {
             Event::Handler(HandlerEvent::UnsetMode {
                 mode: ansi::Mode::BracketedPaste,
             }) => ModelEvent::Handler(AnsiHandlerEvent::UnsetBracketedPaste),
-            Event::Handler(HandlerEvent::StartTmuxControlMode) => {
-                ModelEvent::Handler(AnsiHandlerEvent::StartTmuxControlMode)
+            Event::CompletionsFinished(res, replacement_span) => {
+                ModelEvent::CompletionsFinished(res, replacement_span)
             }
-            Event::Handler(HandlerEvent::EndTmuxControlMode) => {
-                ModelEvent::Handler(AnsiHandlerEvent::EndTmuxControlMode)
-            }
-            Event::Handler(HandlerEvent::TmuxControlModeReady {
-                primary_pane,
-                context,
-            }) => {
-                {
-                    if let Some(TmuxControlModeContext::WarpInitiatedForSsh(control_mode)) = context
-                    {
-                        let duration_ms = Instant::now()
-                            .duration_since(control_mode.start_time)
-                            .as_millis()
-                            // Clip large durations to u64::MAX
-                            .min(u64::MAX as u128) as u64;
-                        send_telemetry_from_ctx!(
-                            TelemetryEvent::SshTmuxWarpificationSuccess {
-                                duration_ms,
-                                tmux_installation: control_mode.tmux_installation,
-                            },
-                            ctx
-                        );
-                    }
-                }
-                ModelEvent::Handler(AnsiHandlerEvent::TmuxControlModeReady { primary_pane })
-            }
-            Event::Handler(HandlerEvent::RunTmuxCommand(command)) => {
-                ModelEvent::Handler(AnsiHandlerEvent::RunTmuxCommand(command))
-            }
-            Event::CompletionsFinished(res) => ModelEvent::CompletionsFinished(res),
             Event::MouseCursorDirty => ModelEvent::MouseCursorDirty,
             Event::Title(title) => ModelEvent::Title(title),
             Event::VisibleBootstrapBlock => ModelEvent::VisibleBootstrapBlock,
@@ -232,6 +225,9 @@ impl ModelEventDispatcher {
             Event::BlockMetadataReceived(block_metadata_received_event) => {
                 ModelEvent::BlockMetadataReceived(block_metadata_received_event)
             }
+            Event::BlockWorkingDirectoryUpdated(block_working_directory_updated_event) => {
+                ModelEvent::BlockWorkingDirectoryUpdated(block_working_directory_updated_event)
+            }
             Event::BackgroundBlockStarted => ModelEvent::BackgroundBlockStarted,
             Event::ClipboardStore(clipboard_type, text) => {
                 ModelEvent::ClipboardStore(clipboard_type, text)
@@ -243,22 +239,11 @@ impl ModelEventDispatcher {
                 ModelEvent::CursorBlinkingChange(is_blinking)
             }
             Event::TerminalClear => ModelEvent::TerminalClear,
-            Event::TmuxControlModeReady { primary_pane } => {
-                ModelEvent::TmuxControlModeReady { primary_pane }
-            }
             Event::DetectedEndOfSshLogin(check_type) => {
                 ModelEvent::DetectedEndOfSshLogin(check_type)
             }
-            Event::RemoteWarpificationIsUnavailable(reason) => {
-                ModelEvent::RemoteWarpificationIsUnavailable(reason)
-            }
-            Event::SshTmuxInstaller(tmux_installation) => {
-                ModelEvent::SshTmuxInstaller(tmux_installation)
-            }
-            Event::TmuxInstallFailed { line, command } => {
-                ModelEvent::TmuxInstallFailed { line, command }
-            }
             Event::Bell => ModelEvent::Bell,
+            Event::ShellExitObserved { status } => ModelEvent::ShellExitObserved { status },
             Event::Exit { reason } => ModelEvent::Exit { reason },
             Event::PreInteractiveSSHSession => ModelEvent::PreInteractiveSSHSession,
             Event::SSH(ssh) => ModelEvent::SSH(ssh),
@@ -275,14 +260,15 @@ impl ModelEventDispatcher {
             Event::SourcedRcFileInSubshell(sourced_rc_file_in_subshell_event) => {
                 ModelEvent::SourcedRcFileInSubshell(sourced_rc_file_in_subshell_event)
             }
-            Event::InitSsh(init_ssh_event) => ModelEvent::InitSsh(init_ssh_event),
             Event::PromptUpdated => ModelEvent::PromptUpdated,
             Event::HonorPS1OutOfSync => ModelEvent::HonorPS1OutOfSync,
             Event::Typeahead => ModelEvent::Typeahead,
             Event::FinishUpdate(data) => ModelEvent::FinishUpdate(data),
+            Event::ExternalShellWidgetSelection(data) => {
+                ModelEvent::ExternalShellWidgetSelection(data)
+            }
             Event::TextSelectionChanged => ModelEvent::SelectedTextChanged,
             Event::ShellSpawned(shell_type) => ModelEvent::ShellSpawned(shell_type),
-            Event::SendCompletionsPrompt => ModelEvent::SendCompletionsPrompt,
             Event::ImageReceived {
                 image_id,
                 image_data,
@@ -293,13 +279,21 @@ impl ModelEventDispatcher {
                 image_protocol,
             },
             Event::BootstrapPrecmdDone => ModelEvent::BootstrapPrecmdDone,
-            Event::AgentTaggedInChanged { is_tagged_in } => {
-                ModelEvent::AgentTaggedInChanged { is_tagged_in }
-            }
+            Event::AgentTaggedInChanged {
+                block_id,
+                is_tagged_in,
+            } => ModelEvent::AgentTaggedInChanged {
+                block_id,
+                is_tagged_in,
+            },
             Event::PluggableNotification { title, body } => {
                 ModelEvent::PluggableNotification { title, body }
             }
             Event::ExitShell { session_id } => ModelEvent::ExitShell { session_id },
+            Event::LifecycleRecovery(record) => {
+                crate::send_telemetry_from_ctx!(LifecycleTelemetryEvent::Recovery(record), ctx);
+                return;
+            }
             _ => return,
         };
 
@@ -308,9 +302,16 @@ impl ModelEventDispatcher {
 
     /// Finalizes session initialization by calling `Sessions::initialize_bootstrapped_session`.
     ///
-    /// For legacy SSH sessions with the `SshRemoteServer` flag, this also
+    /// For SSH wrapper sessions with the `SshRemoteServer` flag, this also
     /// sends the `SessionBootstrapped` notification to the remote server via
     /// the manager.
+    ///
+    /// The `SessionBootstrapped` notification is sent **before** initializing
+    /// the session so the daemon creates the `LocalCommandExecutor` before any
+    /// subscriber (e.g. `TerminalView::handle_session_bootstrapped`) can queue
+    /// a `RunCommand` request. Without this ordering, a race exists where the
+    /// daemon receives `RunCommand` before the executor is ready, producing
+    /// "No executor for RunCommand, session was never initialized" errors.
     fn complete_bootstrapped_session(
         &mut self,
         event: BootstrappedEvent,
@@ -323,15 +324,30 @@ impl ModelEventDispatcher {
             rcfiles_duration_seconds,
         } = event;
 
-        let (is_legacy_ssh, session_id, shell_type_name, shell_path) = (
+        let (is_ssh_wrapper_session, session_id, shell_type_name, shell_path) = (
             matches!(
-                session_info.is_legacy_ssh_session,
-                IsLegacySSHSession::Yes { .. }
+                session_info.is_ssh_wrapper_session,
+                IsSSHWrapperSession::Yes { .. }
             ),
             session_info.session_id,
             session_info.shell.shell_type().name().to_owned(),
             session_info.shell.shell_path().clone(),
         );
+
+        // Send the SessionBootstrapped notification to the daemon BEFORE
+        // initializing the session. `initialize_bootstrapped_session` emits
+        // `SessionsEvent::SessionBootstrapped`, which causes subscribers to
+        // immediately queue `RunCommand` requests (e.g. `load_external_commands`).
+        // The daemon must have the executor ready before those requests arrive.
+        if self.should_use_ssh_remote_server(is_ssh_wrapper_session) {
+            RemoteServerManager::handle(ctx).update(ctx, |mgr, _ctx| {
+                mgr.notify_session_bootstrapped(
+                    session_id,
+                    &shell_type_name,
+                    shell_path.as_deref(),
+                );
+            });
+        }
 
         self.sessions.update(ctx, |sessions, ctx| {
             sessions.initialize_bootstrapped_session(
@@ -342,16 +358,6 @@ impl ModelEventDispatcher {
                 ctx,
             );
         });
-
-        if FeatureFlag::SshRemoteServer.is_enabled() && is_legacy_ssh {
-            RemoteServerManager::handle(ctx).update(ctx, |mgr, _ctx| {
-                mgr.notify_session_bootstrapped(
-                    session_id,
-                    &shell_type_name,
-                    shell_path.as_deref(),
-                );
-            });
-        }
     }
 
     /// Emits an event so `TerminalView` can render the remote server block.
@@ -390,6 +396,9 @@ pub enum ModelEvent {
     },
     /// Sent when a new block is created.
     BlockMetadataReceived(BlockMetadataReceivedEvent),
+    /// Sent when an existing block's working directory has been updated
+    /// outside of the precmd path (e.g. via an OSC 7 escape sequence).
+    BlockWorkingDirectoryUpdated(BlockWorkingDirectoryUpdatedEvent),
     /// Sent after a background block is started and added to the block list.
     BackgroundBlockStarted,
     ClipboardStore(ClipboardType, String),
@@ -400,6 +409,11 @@ pub enum ModelEvent {
     CursorBlinkingChange(bool),
     TerminalClear,
     Bell,
+    /// The shell process exited but the terminal has not been finalized yet; the surface must
+    /// either recover the shell or call `TerminalModel::finalize_exit`.
+    ShellExitObserved {
+        status: ObservedExitStatus,
+    },
     Exit {
         reason: ExitReason,
     },
@@ -414,23 +428,13 @@ pub enum ModelEvent {
     SSHControlMasterError,
     TerminalModeSwapped(TerminalMode),
     ExecutedInBandCommand(ExecutedExecutorCommandEvent),
-    TmuxControlModeReady {
-        primary_pane: u32,
-    },
     /// Sent when a line of output from an interactive ssh session indicates login is complete.
     /// A line such as "Last login: Wed Oct 30" for example indicates login is complete. This is
     /// useful for detecting when an ssh session becomes ready for warpification.
     DetectedEndOfSshLogin(SshLoginStatus),
-    RemoteWarpificationIsUnavailable(WarpificationUnavailableReason),
-    SshTmuxInstaller(TmuxInstallationState),
-    TmuxInstallFailed {
-        line: String,
-        command: String,
-    },
     InitSubshell(InitSubshellEvent),
     /// Emitted when the user's RC file has been executed in a subshell.
     SourcedRcFileInSubshell(SourcedRcFileInSubshellEvent),
-    InitSsh(InitSshEvent),
     /// Emitted when the active block's prompt has been updated.
     PromptUpdated,
     /// Emitted when the honor_ps1 state of the shell is out-of-sync with Warp's settings.
@@ -452,10 +456,10 @@ pub enum ModelEvent {
     /// inaccessible to views/models.
     Handler(AnsiHandlerEvent),
     FinishUpdate(FinishUpdateValue),
+    ExternalShellWidgetSelection(ExternalShellWidgetSelectionValue),
     SelectedTextChanged,
     ShellSpawned(ShellType),
-    CompletionsFinished(Vec<ShellCompletion>),
-    SendCompletionsPrompt,
+    CompletionsFinished(Vec<ShellCompletion>, Option<warp_completer::meta::Span>),
     ImageReceived {
         image_id: u32,
         image_data: Vec<u8>,
@@ -463,6 +467,7 @@ pub enum ModelEvent {
     },
     BootstrapPrecmdDone,
     AgentTaggedInChanged {
+        block_id: BlockId,
         is_tagged_in: bool,
     },
     /// A pluggable notification triggered via OSC 9 or OSC 777 escape sequences.
@@ -508,14 +513,12 @@ pub enum AnsiHandlerEvent {
     EndRPrompt,
     SetBracketedPaste,
     UnsetBracketedPaste,
-    StartTmuxControlMode,
-    TmuxControlModeReady {
-        primary_pane: u32,
-    },
-    EndTmuxControlMode,
-    RunTmuxCommand(TmuxCommand),
 }
 
 impl Entity for ModelEventDispatcher {
     type Event = ModelEvent;
 }
+
+#[cfg(test)]
+#[path = "model_events_tests.rs"]
+mod tests;

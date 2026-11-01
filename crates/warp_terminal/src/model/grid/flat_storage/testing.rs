@@ -1,8 +1,9 @@
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::model::grid::{cell::Flags, row::Row};
-
-use super::{grapheme::Grapheme, FlatStorage};
+use super::FlatStorage;
+use super::grapheme::Grapheme;
+use crate::model::grid::cell::Flags;
+use crate::model::grid::row::Row;
 
 pub fn assert_rows_equal(actual: &[Row], expected: &[Row]) {
     assert_eq!(
@@ -121,7 +122,9 @@ impl ToRows for &str {
             cell.c = chars.next().unwrap();
             // Add any remaining chars in the grapheme to the cell as zero-width
             // characters.
-            chars.for_each(|c| cell.push_zerowidth(c, /* log_long_grapheme_warnings */ true));
+            chars.for_each(|c| {
+                cell.push_zerowidth(c, /* log_long_grapheme_warnings */ true);
+            });
 
             // If the grapheme takes up two cells, mark the following cell as
             // a spacer.

@@ -4,17 +4,16 @@ mod data_source;
 mod search_item;
 mod view;
 
-pub use view::{InlineConversationMenuEvent, InlineConversationMenuView};
-
 use pathfinder_color::ColorU;
+pub use view::{InlineConversationMenuEvent, InlineConversationMenuView};
 use warp_core::ui::appearance::Appearance;
-use warpui::{keymap::Keystroke, SingletonEntity};
+use warpui::SingletonEntity;
+use warpui::keymap::Keystroke;
 
-use crate::ai::active_agent_views_model::{ActiveAgentViewsModel, ConversationOrTaskId};
-use crate::ai::conversation_navigation::ConversationNavigationData;
+use crate::ai::agent_conversations_model::AgentConversationEntryId;
 use crate::terminal::input::inline_menu::{
-    default_navigation_message_items, InlineMenuAction, InlineMenuMessageArgs, InlineMenuRowAction,
-    InlineMenuType,
+    InlineMenuAction, InlineMenuMessageArgs, InlineMenuRowAction, InlineMenuType,
+    default_navigation_message_items,
 };
 use crate::terminal::input::message_bar::{Message, MessageItem};
 
@@ -30,7 +29,8 @@ pub enum InlineConversationMenuTab {
 /// Action emitted when enter is hit on a conversation the inline conversation menu.
 #[derive(Clone, Debug)]
 pub struct AcceptConversation {
-    pub navigation_data: ConversationNavigationData,
+    pub item_id: AgentConversationEntryId,
+    pub is_open_elsewhere: bool,
 }
 
 impl InlineMenuAction for AcceptConversation {
@@ -45,19 +45,14 @@ impl InlineMenuAction for AcceptConversation {
         let mut items = Vec::new();
 
         if let Some(item) = inline_menu_model.selected_item() {
-            let data = &item.navigation_data;
-
-            let active_ids =
-                ActiveAgentViewsModel::as_ref(app).get_all_active_conversation_ids(app);
-            let is_active = active_ids.contains(&ConversationOrTaskId::ConversationId(data.id));
-
-            let text = if is_active {
+            let text = if item.is_open_elsewhere {
                 " go to conversation"
             } else {
                 " continue in this pane"
             };
 
-            let navigation_data = data.clone();
+            let item_id = item.item_id;
+            let is_open_elsewhere = item.is_open_elsewhere;
             items.push(MessageItem::clickable(
                 vec![
                     MessageItem::keystroke(Keystroke {
@@ -69,7 +64,8 @@ impl InlineMenuAction for AcceptConversation {
                 move |ctx| {
                     ctx.dispatch_typed_action(InlineMenuRowAction::Accept {
                         item: AcceptConversation {
-                            navigation_data: navigation_data.clone(),
+                            item_id,
+                            is_open_elsewhere,
                         },
                         cmd_or_ctrl_enter: false,
                     });

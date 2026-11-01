@@ -1,13 +1,12 @@
 use serde::{Deserialize, Serialize};
+use settings::Setting as _;
+use warpui::{AppContext, SingletonEntity};
 
 use crate::auth::AuthStateProvider;
 use crate::features::FeatureFlag;
 use crate::settings::AISettings;
 use crate::ui_components::icons::Icon;
 use crate::workspace::tab_settings::TabSettings;
-
-use settings::Setting as _;
-use warpui::{AppContext, SingletonEntity};
 
 /// A configurable item in the vertical tabs header toolbar.
 ///
@@ -32,8 +31,6 @@ pub enum HeaderToolbarItemKind {
     AgentManagement,
     CodeReview,
     NotificationsMailbox,
-    ActionsAndTriggers,
-    KillAll,
 }
 
 impl HeaderToolbarItemKind {
@@ -44,8 +41,6 @@ impl HeaderToolbarItemKind {
             Self::AgentManagement => "Agent Management",
             Self::CodeReview => "Code Review",
             Self::NotificationsMailbox => "Notifications",
-            Self::ActionsAndTriggers => "Actions & Triggers",
-            Self::KillAll => "Kill All",
         }
     }
 
@@ -56,8 +51,6 @@ impl HeaderToolbarItemKind {
             Self::AgentManagement => Icon::Grid,
             Self::CodeReview => Icon::Diff,
             Self::NotificationsMailbox => Icon::Inbox,
-            Self::ActionsAndTriggers => Icon::Lightning,
-            Self::KillAll => Icon::XCircle,
         }
     }
 
@@ -82,8 +75,6 @@ impl HeaderToolbarItemKind {
             }
             Self::CodeReview => cfg!(feature = "local_fs"),
             Self::NotificationsMailbox => FeatureFlag::HOANotifications.is_enabled(),
-            Self::ActionsAndTriggers => true,
-            Self::KillAll => true,
         }
     }
 
@@ -96,8 +87,6 @@ impl HeaderToolbarItemKind {
         match self {
             Self::CodeReview => *TabSettings::as_ref(app).show_code_review_button.value(),
             Self::NotificationsMailbox => *AISettings::as_ref(app).show_agent_notifications,
-            Self::ActionsAndTriggers => true,
-            Self::KillAll => true,
             _ => true,
         }
     }
@@ -105,20 +94,11 @@ impl HeaderToolbarItemKind {
     /// Whether this item opens a side panel (as opposed to replacing the content
     /// area or opening a popover).
     pub fn is_panel(&self) -> bool {
-        matches!(
-            self,
-            Self::TabsPanel | Self::ToolsPanel | Self::CodeReview | Self::ActionsAndTriggers
-        )
+        matches!(self, Self::TabsPanel | Self::ToolsPanel | Self::CodeReview)
     }
 
     pub fn default_left() -> Vec<Self> {
-        vec![
-            Self::TabsPanel,
-            Self::ToolsPanel,
-            Self::ActionsAndTriggers,
-            Self::KillAll,
-            Self::AgentManagement,
-        ]
+        vec![Self::TabsPanel, Self::ToolsPanel, Self::AgentManagement]
     }
 
     pub fn default_right() -> Vec<Self> {
@@ -130,8 +110,6 @@ impl HeaderToolbarItemKind {
         vec![
             Self::TabsPanel,
             Self::ToolsPanel,
-            Self::ActionsAndTriggers,
-            Self::KillAll,
             Self::AgentManagement,
             Self::CodeReview,
             Self::NotificationsMailbox,

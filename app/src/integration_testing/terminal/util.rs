@@ -1,26 +1,25 @@
-use async_io::block_on;
-use command::blocking::Command;
 use std::borrow::Cow;
 use std::iter;
 use std::path::{Path, PathBuf};
+
+use async_io::block_on;
+use command::blocking::Command;
+use rand::distributions::Alphanumeric;
+use rand::{Rng, thread_rng};
+use regex::Regex;
 use warp_core::command::ExitCode;
 #[cfg(windows)]
 use warp_core::paths::base_config_dir;
 
-use rand::Rng;
-use rand::{distributions::Alphanumeric, thread_rng};
-use regex::Regex;
-
+use crate::terminal::local_tty::shell::{DirectShellStarter, ShellStarter, ShellStarterSource};
+use crate::terminal::shell;
 use crate::terminal::shell::ShellType;
-use crate::terminal::{
-    local_tty::shell::{DirectShellStarter, ShellStarter, ShellStarterSource},
-    shell,
-};
 
 /// Returns the shell starter along with the version of the shell about to be run.
 pub fn current_shell_starter_and_version() -> (DirectShellStarter, String) {
-    let shell_starter_or_wsl_name = ShellStarter::init(Default::default())
-        .expect("Could not create a shell starter or wsl name");
+    let shell_starter_or_wsl_name =
+        ShellStarter::init(crate::terminal::available_shells::AvailableShell::default())
+            .expect("Could not create a shell starter or wsl name");
     let shell_starter_source =
         block_on(async { shell_starter_or_wsl_name.to_shell_starter_source().await })
             .expect("Could not create a shell starter source");

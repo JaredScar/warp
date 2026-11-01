@@ -4,18 +4,23 @@ use std::path::{Path, PathBuf};
 use async_channel::unbounded;
 use warpui::{App, EntityId, ModelHandle};
 
+use super::*;
+use crate::LaunchMode;
 use crate::ai::agent::task::TaskId;
 use crate::ai::agent::{
     AIAgentAction, AIAgentActionId, AIAgentActionResultType, AIAgentActionType,
     UploadArtifactRequest, UploadArtifactResult,
 };
 use crate::ai::blocklist::{BlocklistAIHistoryModel, BlocklistAIPermissions};
-use crate::ai::execution_profiles::{profiles::AIExecutionProfilesModel, ActionPermission};
+use crate::ai::execution_profiles::ActionPermission;
+use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::mcp::templatable_manager::TemplatableMCPServerManager;
 use crate::auth::AuthStateProvider;
 use crate::cloud_object::model::persistence::CloudModel;
 use crate::network::NetworkStatus;
-use crate::server::{cloud_objects::update_manager::UpdateManager, sync_queue::SyncQueue};
+use crate::server::cloud_objects::update_manager::UpdateManager;
+use crate::server::sync_queue::SyncQueue;
+use crate::terminal::ShellLaunchData;
 use crate::terminal::event::BlockMetadataReceivedEvent;
 use crate::terminal::model::block::BlockMetadata;
 use crate::terminal::model::session::active_session::ActiveSession;
@@ -23,12 +28,9 @@ use crate::terminal::model::session::{SessionId, SessionInfo, Sessions};
 use crate::terminal::model::terminal_model::BlockIndex;
 use crate::terminal::model_events::{ModelEvent, ModelEventDispatcher};
 use crate::terminal::shell::ShellType;
-use crate::terminal::ShellLaunchData;
 use crate::test_util::settings::initialize_settings_for_tests;
-use crate::workspaces::{team_tester::TeamTesterStatus, user_workspaces::UserWorkspaces};
-use crate::LaunchMode;
-
-use super::*;
+use crate::workspaces::team_tester::TeamTesterStatus;
+use crate::workspaces::user_workspaces::UserWorkspaces;
 
 fn build_upload_artifact_action(file_path: &str) -> AIAgentAction {
     AIAgentAction {
@@ -68,7 +70,7 @@ fn initialize_upload_artifact_test(
 
     profiles.update(app, |profiles, ctx| {
         if let Some(profile_id) = profiles.create_profile(ctx) {
-            profiles.set_read_files(profile_id, &ActionPermission::AlwaysAsk, ctx);
+            profiles.set_read_files(&profile_id, &ActionPermission::AlwaysAsk, ctx);
             profiles.set_active_profile(terminal_view_id, profile_id, ctx);
         }
     });
@@ -125,6 +127,29 @@ fn test_shell_launch_data() -> ShellLaunchData {
 }
 
 #[test]
+fn format_upload_artifact_error_preserves_full_error_chain() {
+    let err = anyhow::anyhow!(
+        "Artifact upload limit reached: this conversation already has the maximum allowed number of file artifacts (10). Remove an existing artifact or upload fewer files."
+    )
+    .context("Failed to create file artifact upload target");
+
+    assert_eq!(
+        format_upload_artifact_error(&err),
+        "Artifact upload failed: Failed to create file artifact upload target: Artifact upload limit reached: this conversation already has the maximum allowed number of file artifacts (10). Remove an existing artifact or upload fewer files."
+    );
+}
+
+#[test]
+fn format_upload_artifact_error_keeps_single_layer_errors() {
+    let err = anyhow::anyhow!("Failed to open artifact file '/tmp/missing.txt'");
+
+    assert_eq!(
+        format_upload_artifact_error(&err),
+        "Failed to open artifact file '/tmp/missing.txt'"
+    );
+}
+
+#[test]
 fn should_autoexecute_honors_file_read_permissions_for_resolved_path() {
     let temp_dir = tempfile::tempdir().unwrap();
     let cwd = temp_dir.path().join("workspace");
@@ -140,16 +165,18 @@ fn should_autoexecute_honors_file_read_permissions_for_resolved_path() {
         let executor =
             app.add_model(|_| UploadArtifactExecutor::new(active_session, terminal_view_id));
         let conversation_id = history.update(&mut app, |history, ctx| {
-            history.start_new_conversation(terminal_view_id, false, false, ctx)
+            history.start_new_conversation(terminal_view_id, false, false, false, ctx)
         });
         let action = build_upload_artifact_action("reports/report.txt");
 
+        let team_context_resolver = UserWorkspaces::teamless_context_resolver_for_test();
         let should_autoexecute_before = executor.update(&mut app, |executor, ctx| {
             executor.should_autoexecute(
                 ExecuteActionInput {
                     action: &action,
                     conversation_id,
                 },
+                &team_context_resolver(ctx),
                 ctx,
             )
         });
@@ -168,6 +195,7 @@ fn should_autoexecute_honors_file_read_permissions_for_resolved_path() {
                     action: &action,
                     conversation_id,
                 },
+                &team_context_resolver(ctx),
                 ctx,
             )
         });
@@ -190,7 +218,7 @@ fn execute_returns_error_when_conversation_has_not_synced_to_server() {
         let executor =
             app.add_model(|_| UploadArtifactExecutor::new(active_session, terminal_view_id));
         let conversation_id = history.update(&mut app, |history, ctx| {
-            history.start_new_conversation(terminal_view_id, false, false, ctx)
+            history.start_new_conversation(terminal_view_id, false, false, false, ctx)
         });
         let action = build_upload_artifact_action(&artifact_path.display().to_string());
 

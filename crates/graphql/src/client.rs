@@ -1,16 +1,17 @@
 use std::borrow::Cow;
 
 use cynic::{GraphQlResponse, QueryFragment, QueryVariables};
-use http::StatusCode;
+use http::{HeaderValue, StatusCode};
 use instant::Duration;
 use reqwest::header::CONTENT_TYPE;
-use serde::{de::DeserializeOwned, Serialize};
-use warp_core::{channel::ChannelState, operating_system_info::OperatingSystemInfo};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use warp_core::channel::ChannelState;
+use warp_core::operating_system_info::OperatingSystemInfo;
+use warp_errors::{ErrorExt, register_error};
 
-use crate::{
-    error::{UserFacingError, UserFacingErrorInterface},
-    request_context::{ClientContext, OsContext, RequestContext},
-};
+use crate::error::{UserFacingError, UserFacingErrorInterface};
+use crate::request_context::{ClientContext, OsContext, RequestContext};
 
 #[cfg(not(target_family = "wasm"))]
 pub(crate) type BoxFuture<'a, T> =
@@ -45,11 +46,28 @@ pub enum GraphQLError {
     /// Not authorized to talk to the staging server.
     #[error("not authorized for staging")]
     StagingAccessBlocked,
+    /// The request was blocked by GCP Identity-Aware Proxy, indicating that
+    /// the IAP bearer token is stale or missing.
+    #[error("blocked by IAP challenge")]
+    IapChallengeBlocked,
     #[error("received non-OK response code {status}")]
     HttpError { status: StatusCode, body: String },
     #[error("Failed to deserialize GraphQL response: {0:?}")]
     ResponseError(#[source] reqwest::Error),
 }
+
+impl ErrorExt for GraphQLError {
+    fn is_actionable(&self) -> bool {
+        match self {
+            GraphQLError::RequestError(e) | GraphQLError::ResponseError(e) => e.is_actionable(),
+            GraphQLError::StagingAccessBlocked | GraphQLError::IapChallengeBlocked => false,
+            GraphQLError::HttpError { status, .. } => {
+                !matches!(status.as_u16(), 408 | 429 | 500..=599)
+            }
+        }
+    }
+}
+register_error!(GraphQLError);
 
 /// Options for sending a GraphQL request.
 #[derive(Default)]
@@ -100,7 +118,14 @@ where
         req = req.timeout(timeout);
     }
     for (header, value) in options.headers {
-        req = req.header(header, value);
+        if header.eq_ignore_ascii_case("X-Warp-Ambient-Workload-Token")
+            && let Ok(mut sensitive_value) = HeaderValue::from_str(&value)
+        {
+            sensitive_value.set_sensitive(true);
+            req = req.header(header, sensitive_value);
+        } else {
+            req = req.header(header, value);
+        }
     }
 
     Ok(Request {
@@ -132,6 +157,11 @@ where
             log::debug!("{operation_name} request to /graphql/v2 succeeded.");
         }
         status_code => {
+            // Check for IAP challenge first — IAP rejects with 302/401/403 and its own
+            // `x-goog-iap-generated-response` header.
+            if http_client::iap::is_iap_challenge(status_code, response.headers()) {
+                return Err(GraphQLError::IapChallengeBlocked);
+            }
             if status_code == StatusCode::FORBIDDEN && ChannelState::uses_staging_server() {
                 // Both our server and Cloud Armor can send back HTTP 403 errors.
                 // Since Cloud Armor sends back an HTML error page, check for that to determine
@@ -143,6 +173,9 @@ where
                     .is_some_and(|v| v.contains("text/html"));
 
                 if is_html {
+                    log::error!(
+                        "{operation_name} request to /graphql/v2 not authorized for staging"
+                    );
                     return Err(GraphQLError::StagingAccessBlocked);
                 }
             }
@@ -185,6 +218,7 @@ pub fn get_request_context() -> RequestContext {
 /// Returns a user-facing error message for the given [`UserFacingError`].
 pub fn get_user_facing_error_message(e: UserFacingError) -> String {
     match e.error {
+        UserFacingErrorInterface::PlatformError(e) => e.message,
         UserFacingErrorInterface::SharedObjectsLimitExceeded(e) => e.message,
         UserFacingErrorInterface::PersonalObjectsLimitExceeded(e) => e.message,
         UserFacingErrorInterface::AccountDelinquencyError(e) => e.message,

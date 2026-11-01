@@ -2,6 +2,7 @@
 
 use std::future::Future;
 
+use mcp::tool_call::call_tool_with_deadline;
 use uuid::Uuid;
 use warpui::ModelSpawner;
 
@@ -9,9 +10,8 @@ use super::TemplatableMCPServerManager;
 
 /// A wrapper around an MCP server connection that transparently handles reconnection.
 ///
-/// When making requests (e.g., `call_tool` or `read_resource`), this type checks if the
-/// underlying transport is closed and automatically triggers reconnection before retrying
-/// the request.
+/// Reconnects before dispatching requests. Only resource reads are retried after a
+/// transport failure; a tool may have executed even when its response was lost.
 #[derive(Clone)]
 pub struct ReconnectingPeer {
     installation_uuid: Uuid,
@@ -120,16 +120,19 @@ impl ReconnectingPeer {
     /// Calls a tool on the MCP server.
     pub async fn call_tool(
         &self,
-        params: rmcp::model::CallToolRequestParam,
+        params: rmcp::model::CallToolRequestParams,
+        operation_id: Uuid,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ServiceError> {
-        self.with_reconnect_retry(params, |peer, p| async move { peer.call_tool(p).await })
-            .await
+        call_tool_with_deadline(operation_id, self.installation_uuid, params, async {
+            self.get_connected_peer().await.map_err(Into::into)
+        })
+        .await
     }
 
     /// Reads a resource from the MCP server.
     pub async fn read_resource(
         &self,
-        params: rmcp::model::ReadResourceRequestParam,
+        params: rmcp::model::ReadResourceRequestParams,
     ) -> Result<rmcp::model::ReadResourceResult, rmcp::ServiceError> {
         self.with_reconnect_retry(params, |peer, p| async move { peer.read_resource(p).await })
             .await
